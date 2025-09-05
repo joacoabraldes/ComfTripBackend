@@ -8,7 +8,10 @@ const userRoutes = require('./controllers/user.controller');
 const tripRoutes = require('./controllers/trip.controller');
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: '*', 
+  credentials: true
+}));
 app.use(express.json());
 
 // prefijo /api para separar de las rutas de React
