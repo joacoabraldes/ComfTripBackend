@@ -66,4 +66,45 @@ router.get('/:id', auth, async (req, res) => {
   }
 });
 
+// editar perfil
+router.put('/:id', auth, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id, 10);
+    if (req.user.id !== userId) return res.status(403).json({ message: 'No autorizado' });
+    const { name, email, phone, nationality, birthdate } = req.body;
+    await pool.query(
+      'UPDATE users SET name=?, email=?, phone=?, nationality=?, birthdate=? WHERE id=?',
+      [name, email, phone || null, nationality || null, birthdate || null, userId]
+    );
+    res.json({ message: 'Perfil actualizado' });
+  } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') {
+      res.status(400).json({ error: 'El email ya está registrado' });
+    } else {
+      console.error(err);
+      res.status(500).json({ message: 'Error' });
+    }
+  }
+});
+
+// cambiar contraseña
+router.put('/:id/password', auth, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id, 10);
+    if (req.user.id !== userId) return res.status(403).json({ message: 'No autorizado' });
+    const { oldPassword, newPassword } = req.body;
+    if (!oldPassword || !newPassword) return res.status(400).json({ message: 'Faltan campos obligatorios' });
+    const [rows] = await pool.query('SELECT password_hash FROM users WHERE id = ?', [userId]);
+    if (!rows.length) return res.status(404).json({ message: 'Usuario no encontrado' });
+    const ok = await bcrypt.compare(oldPassword, rows[0].password_hash);
+    if (!ok) return res.status(400).json({ message: 'Contraseña actual incorrecta' });
+    const newHash = await bcrypt.hash(newPassword, 10);
+    await pool.query('UPDATE users SET password_hash=? WHERE id=?', [newHash, userId]);
+    res.json({ message: 'Contraseña actualizada' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Error' });
+  }
+});
+
 module.exports = router;
