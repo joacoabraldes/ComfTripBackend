@@ -1,149 +1,80 @@
-// controllers/user.controller.js
+// controllers/auth.controller.js
 const express = require('express');
-const pool = require('../db');
-const auth = require('../middleware/auth');
 const bcrypt = require('bcrypt');
-
+const jwt = require('jsonwebtoken');
+const pool = require('../db');
 const router = express.Router();
+const JWT_SECRET = process.env.JWT_SECRET || 'devsecret';
 
-// List predefined interests
-router.get('/interests', async (req, res) => {
+router.post('/register', async (req, res) => {
   try {
-    const [rows] = await pool.query('SELECT id, slug, title, description FROM interests');
-    res.json(rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Error' });
-  }
-});
+    const { name, email, phone, password, nationality, birthdate } = req.body;
 
-/*
-  GET /users/:id
-  - auth required
-  - returns profile (id, name, email, phone, nationality, birthdate) and interests array
-*/
-router.get('/:id', auth, async (req, res) => {
-  try {
-    const userId = parseInt(req.params.id, 10);
-    if (req.user.id !== userId) return res.status(403).json({ message: 'No autorizado' });
-
-    const [userRows] = await pool.query(
-      'SELECT id, name, email, phone, nationality, birthdate, created_at FROM users WHERE id = ?',
-      [userId]
-    );
-    if (!userRows.length) return res.status(404).json({ message: 'No encontrado' });
-
-    const [interests] = await pool.query(`
-      SELECT i.id, i.title FROM interests i
-      JOIN user_interests ui ON i.id = ui.interest_id
-      WHERE ui.user_id = ?`, [userId]);
-
-    res.json({ user: userRows[0], interests });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Error' });
-  }
-});
-
-/*
-  PUT /users/:id
-  - auth required
-  - fields accepted in body: { name, email, phone, nationality, birthdate }
-  - prevents updating another user's profile
-  - checks email uniqueness if email is being changed
-*/
-router.put('/:id', auth, async (req, res) => {
-  try {
-    const userId = parseInt(req.params.id, 10);
-    if (req.user.id !== userId) return res.status(403).json({ message: 'No autorizado' });
-
-    const { name, email, phone, nationality, birthdate } = req.body;
-
-    // If email changed, ensure uniqueness
-    if (email) {
-      const [rows] = await pool.query('SELECT id FROM users WHERE email = ? AND id <> ?', [email, userId]);
-      if (rows.length) return res.status(400).json({ message: 'Email en uso' });
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: 'Faltan campos obligatorios' });
     }
 
-    await pool.query(
-      `UPDATE users SET 
-         name = ?, 
-         email = ?, 
-         phone = ?, 
-         nationality = ?, 
-         birthdate = ?
-       WHERE id = ?`,
-      [
-        name || null,
-        email || null,
-        phone || null,
-        nationality || null,
-        birthdate || null,
-        userId
-      ]
+    const [existing] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
+    if (existing.length) return res.status(400).json({ message: 'Email en uso' });
+
+    const hash = await bcrypt.hash(password, 10);
+
+    // IMPORTANT: here we have 6 placeholders to match 6 columns
+    const [result] = await pool.query(
+      'INSERT INTO users (name, email, phone, password_hash, nationality, birthdate) VALUES (?, ?, ?, ?, ?, ?)',
+      [name, email, phone || null, hash, nationality || null, birthdate || null]
     );
 
-    // return updated user (fresh)
-    const [updated] = await pool.query('SELECT id, name, email, phone, nationality, birthdate FROM users WHERE id = ?', [userId]);
-    res.json({ message: 'Perfil actualizado', user: updated[0] });
+    const userId = result.insertId;
+    const token = jwt.sign({ id: userId, email }, JWT_SECRET, { expiresIn: '7d' });
+
+    res.json({
+      token,
+      user: {
+        id: userId,
+        name,
+        email,
+        phone: phone || null,
+        nationality: nationality || null,
+        birthdate: birthdate || null
+      }
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: 'Error' });
+    res.status(500).json({ message: 'Error del servidor' });
   }
 });
 
-/*
-  PATCH /users/:id/password
-  - auth required
-  - body: { currentPassword, newPassword }
-  - verifies currentPassword, then replaces with hashed newPassword
-*/
-router.patch('/:id/password', auth, async (req, res) => {
+router.post('/login', async (req, res) => {
   try {
-    const userId = parseInt(req.params.id, 10);
-    if (req.user.id !== userId) return res.status(403).json({ message: 'No autorizado' });
+    const { email, password } = req.body;
+    // include phone/nationality/birthdate so frontend receives the full profile
+    const [rows] = await pool.query(
+      'SELECT id, name, email, phone, nationality, birthdate, password_hash FROM users WHERE email = ?',
+      [email]
+    );
+    if (!rows.length) return res.status(400).json({ message: 'Credenciales inválidas' });
 
-    const { currentPassword, newPassword } = req.body;
-    if (!currentPassword || !newPassword) return res.status(400).json({ message: 'Faltan campos' });
+    const user = rows[0];
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) return res.status(400).json({ message: 'Credenciales inválidas' });
 
-    const [rows] = await pool.query('SELECT password_hash FROM users WHERE id = ?', [userId]);
-    if (!rows.length) return res.status(404).json({ message: 'Usuario no encontrado' });
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
 
-    const ok = await bcrypt.compare(currentPassword, rows[0].password_hash);
-    if (!ok) return res.status(400).json({ message: 'Contraseña actual incorrecta' });
-
-    const hash = await bcrypt.hash(newPassword, 10);
-    await pool.query('UPDATE users SET password_hash = ? WHERE id = ?', [hash, userId]);
-
-    res.json({ message: 'Contraseña actualizada' });
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone || null,
+        nationality: user.nationality || null,
+        birthdate: user.birthdate || null
+      }
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: 'Error' });
-  }
-});
-
-/*
-  Save interests: POST /users/:id/interests
-  expects { interestIds: [1,2,3] }
-*/
-router.post('/:id/interests', auth, async (req, res) => {
-  try {
-    const userId = parseInt(req.params.id, 10);
-    if (req.user.id !== userId) return res.status(403).json({ message: 'No autorizado' });
-    const { interestIds } = req.body;
-
-    await pool.query('DELETE FROM user_interests WHERE user_id = ?', [userId]);
-
-    if (interestIds && interestIds.length) {
-      // Build values for bulk insert
-      const values = interestIds.map(i => [userId, i]);
-      await pool.query('INSERT INTO user_interests (user_id, interest_id) VALUES ?', [values]);
-    }
-
-    res.json({ message: 'Intereses actualizados' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Error' });
+    res.status(500).json({ message: 'Error del servidor' });
   }
 });
 
