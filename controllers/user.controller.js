@@ -54,7 +54,7 @@ router.get('/:id', auth, async (req, res) => {
   try {
     const userId = parseInt(req.params.id, 10);
     if (req.user.id !== userId) return res.status(403).json({ message: 'No autorizado' });
-    const [userRows] = await pool.query('SELECT id, name, email, nationality, birthdate FROM users WHERE id = ?', [userId]);
+    const [userRows] = await pool.query('SELECT id, name, email, phone, nationality, birthdate FROM users WHERE id = ?', [userId]);
     const [interests] = await pool.query(`
       SELECT i.id, i.title FROM interests i
       JOIN user_interests ui ON i.id = ui.interest_id
