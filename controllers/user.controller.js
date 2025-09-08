@@ -87,7 +87,7 @@ router.put('/:id', auth, async (req, res) => {
   }
 });
 
-// cambiar contraseña
+// cambiar contraseña z
 router.put('/:id/password', auth, async (req, res) => {
   try {
     const userId = parseInt(req.params.id, 10);
