@@ -8,18 +8,18 @@ const JWT_SECRET = process.env.JWT_SECRET || 'devsecret';
 
 router.post('/register', async (req, res) => {
   try {
-    const { name, email, password, nationality, birthdate } = req.body;
+    const { name, email, phone, password, nationality, birthdate } = req.body;
     const [existing] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
     if (existing.length) return res.status(400).json({ message: 'Email en uso' });
 
     const hash = await bcrypt.hash(password, 10);
     const [result] = await pool.query(
-      'INSERT INTO users (name, email, password_hash, nationality, birthdate) VALUES (?, ?, ?, ?, ?)',
-      [name, email, hash, nationality, birthdate || null]
+      'INSERT INTO users (name, email, phone, password_hash, nationality, birthdate) VALUES (?, ?, ?, ?, ?)',
+      [name, email, phone, hash, nationality, birthdate || null]
     );
     const userId = result.insertId;
     const token = jwt.sign({ id: userId, email }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user: { id: userId, name, email, nationality, birthdate }});
+    res.json({ token, user: { id: userId, name, email, phone, nationality, birthdate }});
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Error del servidor' });
