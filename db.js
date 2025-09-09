@@ -1,15 +1,10 @@
-// db.js
-// PostgreSQL pool supporting:
-//  - full DATABASE_URL (recommended for Supabase)
-//  - or individual PGHOST/PGUSER/PGPASSWORD/PGDATABASE/PGPORT env vars
-//
-// Exports: Pool instance (compatible with pool.query(...))
+
 
 const { Pool } = require('pg');
 
 const connectionString = process.env.DATABASE_URL || process.env.SUPABASE_DB_URL || null;
 
-// build pool from full connection string (DATABASE_URL)
+
 function buildPoolFromConnectionString(connStr) {
   return new Pool({
     connectionString: connStr,

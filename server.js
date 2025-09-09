@@ -19,5 +19,5 @@ app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/trips', tripRoutes);
 
-const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT || 5432;
 app.listen(PORT, () => console.log(`Backend escuchando en http://localhost:${PORT}`));
