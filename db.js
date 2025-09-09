@@ -1,28 +1,26 @@
 // db.js
-// PostgreSQL pool that supports either a full DATABASE_URL (recommended for Supabase)
-// or individual PGHOST/PGUSER/PGPASSWORD/PGDATABASE/PGPORT env vars.
-// Enables SSL for hosted DBs (Supabase requires SSL).
+// PostgreSQL pool supporting:
+//  - full DATABASE_URL (recommended for Supabase)
+//  - or individual PGHOST/PGUSER/PGPASSWORD/PGDATABASE/PGPORT env vars
 //
-// Usage: const pool = require('./db');
-// then use pool.query(...) everywhere like before.
+// Exports: Pool instance (compatible with pool.query(...))
 
 const { Pool } = require('pg');
 
 const connectionString = process.env.DATABASE_URL || process.env.SUPABASE_DB_URL || null;
 
+// build pool from full connection string (DATABASE_URL)
 function buildPoolFromConnectionString(connStr) {
-  // Use ssl with rejectUnauthorized=false for serverless environments (Supabase)
-  const pool = new Pool({
+  return new Pool({
     connectionString: connStr,
+    // For many serverless environments + Supabase you want to allow the hosted SSL cert:
+    ssl: { rejectUnauthorized: false },
     max: Number(process.env.DB_POOL_MAX) || 10,
-    idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS) || 30000,
-    // When using a hosted postgres (supabase), enable SSL. We set rejectUnauthorized:false
-    // because many serverless environments can't verify the cert chain.
-    ssl: { rejectUnauthorized: false }
+    idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS) || 30000
   });
-  return pool;
 }
 
+// build pool from separate PG* env vars
 function buildPoolFromParts() {
   const host = process.env.PGHOST || process.env.DB_HOST || '127.0.0.1';
   const port = process.env.PGPORT ? Number(process.env.PGPORT) : (process.env.DB_PORT ? Number(process.env.DB_PORT) : 5432);
@@ -30,11 +28,10 @@ function buildPoolFromParts() {
   const password = process.env.PGPASSWORD || process.env.DB_PASS || '';
   const database = process.env.PGDATABASE || process.env.DB_NAME || 'comftrip';
 
-  const sslEnv = (process.env.DB_SSL || process.env.PGSSLMODE || '').toLowerCase();
-  // treat "true", "require", "1" as SSL enabled
+  const sslEnv = (process.env.DB_SSL || process.env.PGSSLMODE || '').toString().toLowerCase();
   const useSsl = sslEnv === 'true' || sslEnv === 'require' || sslEnv === '1';
 
-  const pool = new Pool({
+  return new Pool({
     host,
     port,
     user,
@@ -44,8 +41,6 @@ function buildPoolFromParts() {
     idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS) || 30000,
     ssl: useSsl ? { rejectUnauthorized: false } : false
   });
-
-  return pool;
 }
 
 let pool;
@@ -55,12 +50,12 @@ if (connectionString) {
   pool = buildPoolFromParts();
 }
 
-// Optional lightweight connection check to surface DNS/SSL errors early in logs.
-// It does a single simple query and will log a helpful message on failure.
+// lightweight connection check to surface DNS/auth/SSL errors early in logs.
+// This does not throw (so your app can still start); it logs helpful info.
 (async () => {
   try {
-    // Get an informative "host" for logs without printing secrets
-    let hostInfo = 'unknown host';
+    // determine a host string to print (without revealing secrets)
+    let hostInfo = 'unknown';
     try {
       if (connectionString) {
         const parsed = new URL(connectionString);
@@ -69,34 +64,22 @@ if (connectionString) {
         hostInfo = `${process.env.PGHOST || process.env.DB_HOST || 'localhost'}:${process.env.PGPORT || process.env.DB_PORT || 5432}`;
       }
     } catch (e) {
-      hostInfo = 'unknown host';
+      hostInfo = 'unknown';
     }
 
-    // run a very short query with a short statement_timeout (works in pg via query)
-    const res = await pool.query({ text: 'SELECT now() as now', rowMode: 'array' });
-    // success: useful for debugging during startup
-    // Note: don't print credentials in logs.
-    // (This log helps you know the DB host that was attempted.)
-    // In production you may want to remove this log or set NODE_ENV check.
+    // run a short, quick query
+    // use a very small timeout via statement_timeout to avoid long hangs if needed (optional)
+    const res = await pool.query({ text: 'SELECT now() as now', values: [], rowMode: 'array' });
     if (res && res.rows) {
-      // don't print the whole row to avoid potential timestamp formatting differences
       console.log(`[db] connected to database host=${hostInfo}`);
     }
   } catch (err) {
-    // Common causes:
-    // - ENOTFOUND -> DNS problem / wrong host name
-    // - authentication error -> wrong user/password
-    // - SSL error -> ssl required/disabled mismatch
     console.error('[db] database connection check failed. Please verify your DATABASE_URL / PG* env vars.');
-    // show the friendly error and host for easier debugging (no secrets)
-    if (err && err.code) {
-      console.error('[db] error code:', err.code);
-    }
-    if (err && err.hostname) {
-      console.error('[db] hostname:', err.hostname);
-    }
+    if (err && err.code) console.error('[db] error code:', err.code);
+    if (err && err.hostname) console.error('[db] hostname:', err.hostname);
+    // print only the message - avoid logging credentials
     console.error('[db] full error:', err && err.message ? err.message : err);
-    // do not throw here - letting the app try to handle query errors later.
+    // do not re-throw so server can still start and surface errors on individual queries
   }
 })();
 
