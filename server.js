@@ -6,6 +6,7 @@ const cors = require('cors');
 const authRoutes = require('./controllers/auth.controller');
 const userRoutes = require('./controllers/user.controller');
 const tripRoutes = require('./controllers/trip.controller');
+const locationRoutes = require('./controllers/location.controller');
 
 const app = express();
 app.use(cors({
@@ -18,6 +19,7 @@ app.use(express.json());
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/trips', tripRoutes);
+app.use('/api/locations', locationRoutes);
 
 const PORT = process.env.PORT || 5432;
 app.listen(PORT, () => console.log(`Backend escuchando en http://localhost:${PORT}`));
