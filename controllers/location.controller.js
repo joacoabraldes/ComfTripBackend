@@ -1,9 +1,26 @@
-// controllers/locations.controller.js
+// controllers/location.controller.js
 const express = require('express');
 const pool = require('../db');
 const auth = require('../middleware/auth');
 
 const router = express.Router();
+
+/**
+ * Helper: normalize DB row to API shape
+ * We map latitud -> latitude and longitud -> longitude
+ */
+function normalizeRow(row) {
+  return {
+    id: row.id,
+    titulo: row.titulo,
+    fk_interest: row.fk_interest,
+    descripcion: row.descripcion,
+    // alias DB latin names to english keys used on client
+    latitude: row.latitude !== undefined ? Number(row.latitude) : (row.latitud !== undefined ? Number(row.latitud) : null),
+    longitude: row.longitude !== undefined ? Number(row.longitude) : (row.longitud !== undefined ? Number(row.longitud) : null),
+    imagenes: row.imagenes,
+  };
+}
 
 /**
  * GET /locations
@@ -14,48 +31,55 @@ const router = express.Router();
 router.get('/', async (req, res) => {
   try {
     const { interest, limit = 50, offset = 0 } = req.query;
-    const params = [limit, offset];
-    let sql = `SELECT id, titulo, fk_interest, descripcion, latitude, longitude, imagenes
-               FROM locations
-               ORDER BY id
-               LIMIT $1 OFFSET $2`;
 
     if (interest) {
-      // try matching by fk_interest value (slug or id)
-      params.unshift(interest); // becomes $1
-      // shift previous params' numbers by 1
-      sql = `SELECT id, titulo, fk_interest, descripcion, latitude, longitude, imagenes
-             FROM locations
-             WHERE fk_interest = $1
-             ORDER BY id
-             LIMIT $2 OFFSET $3`;
+      // interest supplied (likely a slug like "naturaleza")
+      // params: interest, limit, offset
+      const sql = `
+        SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes
+        FROM locations
+        WHERE fk_interest = $1
+        ORDER BY id
+        LIMIT $2 OFFSET $3
+      `;
+      const result = await pool.query(sql, [interest, limit, offset]);
+      const rows = result.rows.map(normalizeRow);
+      return res.json(rows);
+    } else {
+      // no interest filter
+      const sql = `
+        SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes
+        FROM locations
+        ORDER BY id
+        LIMIT $1 OFFSET $2
+      `;
+      const result = await pool.query(sql, [limit, offset]);
+      const rows = result.rows.map(normalizeRow);
+      return res.json(rows);
     }
-
-    const result = await pool.query(sql, params);
-    res.json(result.rows);
   } catch (err) {
-    console.error('GET /locations error:', err);
-    res.status(500).json({ message: 'Error' });
+    console.error('GET /locations error:', err?.message || err);
+    // include error detail to help debugging locally (remove in production)
+    return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
   }
 });
 
 /**
  * GET /locations/:id
- * Get single location by id
  */
 router.get('/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     const result = await pool.query(
-      `SELECT id, titulo, fk_interest, descripcion, latitude, longitude, imagenes
+      `SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes
        FROM locations WHERE id = $1`,
       [id]
     );
     if (!result.rows.length) return res.status(404).json({ message: 'No encontrado' });
-    res.json(result.rows[0]);
+    return res.json(normalizeRow(result.rows[0]));
   } catch (err) {
-    console.error('GET /locations/:id error:', err);
-    res.status(500).json({ message: 'Error' });
+    console.error('GET /locations/:id error:', err?.message || err);
+    return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
   }
 });
 
@@ -63,38 +87,39 @@ router.get('/:id', async (req, res) => {
  * POST /locations
  * Create a location (protected)
  * Body: { titulo, fk_interest, descripcion, latitude, longitude, imagenes }
- * imagenes can be an array (will be stored as JSON) or JSON object/string
+ * Note: client may send latitude/longitude; we store to latitud/longitud columns
  */
 router.post('/', auth, async (req, res) => {
   try {
     const { titulo, fk_interest, descripcion, latitude, longitude, imagenes } = req.body;
     if (!titulo || !fk_interest) return res.status(400).json({ message: 'Faltan campos obligatorios' });
 
+    const lat = latitude !== undefined ? latitude : req.body.latitud;
+    const lng = longitude !== undefined ? longitude : req.body.longitud;
+
     const imagenesJson = imagenes ? (typeof imagenes === 'string' ? imagenes : JSON.stringify(imagenes)) : null;
 
     const result = await pool.query(
-      `INSERT INTO locations (titulo, fk_interest, descripcion, latitude, longitude, imagenes)
+      `INSERT INTO locations (titulo, fk_interest, descripcion, latitud, longitud, imagenes)
        VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, titulo, fk_interest, descripcion, latitude, longitude, imagenes`,
-      [titulo, fk_interest, descripcion || null, latitude || null, longitude || null, imagenesJson]
+       RETURNING id, titulo, fk_interest, descripcion, latitud, longitud, imagenes`,
+      [titulo, fk_interest, descripcion || null, lat || null, lng || null, imagenesJson]
     );
 
-    res.status(201).json({ message: 'Localidad creada', location: result.rows[0] });
+    return res.status(201).json({ message: 'Localidad creada', location: normalizeRow(result.rows[0]) });
   } catch (err) {
-    console.error('POST /locations error:', err);
-    res.status(500).json({ message: 'Error' });
+    console.error('POST /locations error:', err?.message || err);
+    return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
   }
 });
 
 /**
  * PUT /locations/:id
- * Update an existing location (protected)
- * Body same as POST. Partial updates are allowed.
+ * Partial updates allowed. Accepts latitude/longitude or latitud/longitud in body.
  */
 router.put('/:id', auth, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
-    // fetch existing to allow partial update
     const existing = await pool.query('SELECT * FROM locations WHERE id = $1', [id]);
     if (!existing.rows.length) return res.status(404).json({ message: 'No encontrado' });
 
@@ -102,41 +127,44 @@ router.put('/:id', auth, async (req, res) => {
       titulo = existing.rows[0].titulo,
       fk_interest = existing.rows[0].fk_interest,
       descripcion = existing.rows[0].descripcion,
-      latitude = existing.rows[0].latitude,
-      longitude = existing.rows[0].longitude,
+      latitude,
+      longitude,
       imagenes = existing.rows[0].imagenes,
     } = req.body;
+
+    // prefer new latitude/longitude if provided, else keep existing latitud/longitud
+    const lat = latitude !== undefined ? latitude : (existing.rows[0].latitud ?? existing.rows[0].latitude);
+    const lng = longitude !== undefined ? longitude : (existing.rows[0].longitud ?? existing.rows[0].longitude);
 
     const imagenesJson = imagenes && typeof imagenes !== 'string' ? JSON.stringify(imagenes) : imagenes;
 
     const updated = await pool.query(
       `UPDATE locations
-       SET titulo = $1, fk_interest = $2, descripcion = $3, latitude = $4, longitude = $5, imagenes = $6
+       SET titulo = $1, fk_interest = $2, descripcion = $3, latitud = $4, longitud = $5, imagenes = $6
        WHERE id = $7
-       RETURNING id, titulo, fk_interest, descripcion, latitude, longitude, imagenes`,
-      [titulo, fk_interest, descripcion || null, latitude || null, longitude || null, imagenesJson || null, id]
+       RETURNING id, titulo, fk_interest, descripcion, latitud, longitud, imagenes`,
+      [titulo, fk_interest, descripcion || null, lat || null, lng || null, imagenesJson || null, id]
     );
 
-    res.json({ message: 'Localidad actualizada', location: updated.rows[0] });
+    return res.json({ message: 'Localidad actualizada', location: normalizeRow(updated.rows[0]) });
   } catch (err) {
-    console.error('PUT /locations/:id error:', err);
-    res.status(500).json({ message: 'Error' });
+    console.error('PUT /locations/:id error:', err?.message || err);
+    return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
   }
 });
 
 /**
  * DELETE /locations/:id
- * Delete location (protected)
  */
 router.delete('/:id', auth, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     const del = await pool.query('DELETE FROM locations WHERE id = $1 RETURNING id', [id]);
     if (!del.rows.length) return res.status(404).json({ message: 'No encontrado' });
-    res.json({ message: 'Localidad eliminada' });
+    return res.json({ message: 'Localidad eliminada' });
   } catch (err) {
-    console.error('DELETE /locations/:id error:', err);
-    res.status(500).json({ message: 'Error' });
+    console.error('DELETE /locations/:id error:', err?.message || err);
+    return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
   }
 });
 
