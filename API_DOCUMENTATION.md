@@ -4,13 +4,14 @@
 
 ### Register
 - **POST** `/api/auth/register`
-- Body: `{ name, email, phone, password, nationality, birthdate }`
-- Response: `{ token, user: { id, name, email, phone, nationality, birthdate } }`
+- Body: `{ name, username, email, phone, password, nationality, birthdate }`
+- Response: `{ token, user: { id, name, username, email, phone, nationality, birthdate } }`
 
 ### Login
 - **POST** `/api/auth/login`
-- Body: `{ email, password }`
-- Response: `{ token, user: { id, name, email, phone, nationality, birthdate } }`
+- Body: `{ identifier, password }`  
+  `identifier` can be either username or email.
+- Response: `{ token, user: { id, name, username, email } }`
 
 ---
 
@@ -34,18 +35,48 @@
 ### Get Profile
 - **GET** `/api/users/:id`
 - Auth required
-- Response: `{ user: { id, name, email, nationality, birthdate }, interests: [{ id, title }] }`
+- Response: `{ user: { id, name, email, phone, nationality, birthdate }, interests: [{ id, title }] }`
 
 ### Edit Profile
 - **PUT** `/api/users/:id`
 - Auth required
 - Body: `{ name, email, phone, nationality, birthdate }`
-- Response: `{ message }`
+- Response: `{ message, user }`
 
 ### Change Password
 - **PUT** `/api/users/:id/password`
 - Auth required
 - Body: `{ oldPassword, newPassword }`
+- Response: `{ message }`
+
+---
+
+## Location Endpoints
+
+### List Locations
+- **GET** `/api/locations`
+- Query params (optional): `interest`, `limit`, `offset`
+- Response: `[{ id, titulo, fk_interest, descripcion, latitude, longitude, imagenes }]`
+
+### Get Location
+- **GET** `/api/locations/:id`
+- Response: `{ id, titulo, fk_interest, descripcion, latitude, longitude, imagenes }`
+
+### Create Location
+- **POST** `/api/locations`
+- Auth required
+- Body: `{ titulo, fk_interest, descripcion, latitude, longitude, imagenes }`
+- Response: `{ message, location }`
+
+### Edit Location
+- **PUT** `/api/locations/:id`
+- Auth required
+- Body: `{ titulo, fk_interest, descripcion, latitude, longitude, imagenes }`
+- Response: `{ message, location }`
+
+### Delete Location
+- **DELETE** `/api/locations/:id`
+- Auth required
 - Response: `{ message }`
 
 ---
