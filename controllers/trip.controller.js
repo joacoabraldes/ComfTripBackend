@@ -21,6 +21,33 @@ function normalizeTripRow(row) {
 }
 
 /**
+ * SQL fragment used to aggregate trip_places + basic location info as JSON array.
+ * We'll inject this as a LEFT JOIN subquery in queries below.
+ */
+const PLACES_AGG_SUBQUERY = `
+  SELECT fk_trips,
+         json_agg(json_build_object(
+           'id', tp.id,
+           'fk_location', tp.fk_locations,
+           'date', tp.date,
+           'start_hour', tp.start_hour,
+           'end_hour', tp.end_hour,
+           'notes', tp.notes,
+           'location', json_build_object(
+             'id', l.id,
+             'titulo', l.titulo,
+             'fk_interest', l.fk_interest,
+             'latitude', l.latitud,
+             'longitude', l.longitud,
+             'imagenes', l.imagenes
+           )
+         ) ORDER BY tp.date, tp.start_hour) AS places
+  FROM trip_places tp
+  JOIN locations l ON l.id = tp.fk_locations
+  GROUP BY fk_trips
+`;
+
+/**
  * GET /trips
  * List trips for the authenticated user, including places as JSON array
  */
@@ -28,33 +55,13 @@ router.get('/', auth, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // for each trip aggregate its trip_places and join basic location info
     const sql = `
       SELECT
         t.id, t.user_id, t.destination, t.start_date, t.end_date, t.budget, t.notes, t.created_at,
         COALESCE(tp.places, '[]') AS places
       FROM trips t
       LEFT JOIN (
-        SELECT fk_trips,
-               json_agg(json_build_object(
-                 'id', tp.id,
-                 'fk_location', tp.fk_locations,
-                 'date', tp.date,
-                 'start_hour', tp.start_hour,
-                 'end_hour', tp.end_hour,
-                 'notes', tp.notes,
-                 'location', json_build_object(
-                   'id', l.id,
-                   'titulo', l.titulo,
-                   'fk_interest', l.fk_interest,
-                   'latitude', l.latitud,
-                   'longitude', l.longitud,
-                   'imagenes', l.imagenes
-                 )
-               ) ORDER BY tp.date, tp.start_hour) AS places
-        FROM trip_places tp
-        JOIN locations l ON l.id = tp.fk_locations
-        GROUP BY fk_trips
+        ${PLACES_AGG_SUBQUERY}
       ) tp ON tp.fk_trips = t.id
       WHERE t.user_id = $1
       ORDER BY t.start_date DESC
@@ -77,8 +84,6 @@ router.get('/', auth, async (req, res) => {
 /**
  * POST /trips
  * Create a trip. Optionally provide `places` array in body to insert trip_places in same transaction.
- * Body:
- *  { destination, start_date, end_date, budget, notes, places: [{ fk_location | locationId, date, start_hour, end_hour, notes }, ...] }
  */
 router.post('/', auth, async (req, res) => {
   const client = await pool.connect();
@@ -108,7 +113,6 @@ router.post('/', auth, async (req, res) => {
         'INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, fk_locations, fk_trips, date, start_hour, end_hour, notes, created_at';
 
       for (const p of places) {
-        // accept either fk_location or locationId naming
         const fk_location = p.fk_location ?? p.locationId ?? p.location_id ?? p.fk_locations;
         if (!fk_location) {
           await client.query('ROLLBACK');
@@ -128,7 +132,6 @@ router.post('/', auth, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // return created trip + inserted places
     const response = {
       trip: normalizeTripRow(tripRow),
       places: createdPlaces
@@ -158,26 +161,7 @@ router.get('/:id', auth, async (req, res) => {
         COALESCE(tp.places, '[]') AS places
       FROM trips t
       LEFT JOIN (
-        SELECT fk_trips,
-               json_agg(json_build_object(
-                 'id', tp.id,
-                 'fk_location', tp.fk_locations,
-                 'date', tp.date,
-                 'start_hour', tp.start_hour,
-                 'end_hour', tp.end_hour,
-                 'notes', tp.notes,
-                 'location', json_build_object(
-                   'id', l.id,
-                   'titulo', l.titulo,
-                   'fk_interest', l.fk_interest,
-                   'latitude', l.latitud,
-                   'longitude', l.longitud,
-                   'imagenes', l.imagenes
-                 )
-               ) ORDER BY tp.date, tp.start_hour) AS places
-        FROM trip_places tp
-        JOIN locations l ON l.id = tp.fk_locations
-        GROUP BY fk_trips
+        ${PLACES_AGG_SUBQUERY}
       ) tp ON tp.fk_trips = t.id
       WHERE t.id = $1 AND t.user_id = $2
       LIMIT 1
@@ -198,9 +182,67 @@ router.get('/:id', auth, async (req, res) => {
 });
 
 /**
+ * NEW: GET /trips/next
+ * Return the next (nearest upcoming) trip for the authenticated user.
+ * If no upcoming trips (start_date >= today) exist, return the most recent past trip.
+ */
+router.get('/next', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // 1) Try to find the next upcoming trip (start_date >= today), earliest start_date
+    const upcomingSql = `
+      SELECT
+        t.id, t.user_id, t.destination, t.start_date, t.end_date, t.budget, t.notes, t.created_at,
+        COALESCE(tp.places, '[]') AS places
+      FROM trips t
+      LEFT JOIN (
+        ${PLACES_AGG_SUBQUERY}
+      ) tp ON tp.fk_trips = t.id
+      WHERE t.user_id = $1 AND t.start_date >= CURRENT_DATE
+      ORDER BY t.start_date ASC
+      LIMIT 1
+    `;
+    let result = await pool.query(upcomingSql, [userId]);
+    if (result.rows.length) {
+      const row = result.rows[0];
+      const trip = normalizeTripRow(row);
+      trip.places = row.places || [];
+      return res.json({ trip });
+    }
+
+    // 2) If no upcoming trips, return the most recent past trip (latest start_date < today)
+    const pastSql = `
+      SELECT
+        t.id, t.user_id, t.destination, t.start_date, t.end_date, t.budget, t.notes, t.created_at,
+        COALESCE(tp.places, '[]') AS places
+      FROM trips t
+      LEFT JOIN (
+        ${PLACES_AGG_SUBQUERY}
+      ) tp ON tp.fk_trips = t.id
+      WHERE t.user_id = $1
+      ORDER BY t.start_date DESC
+      LIMIT 1
+    `;
+    result = await pool.query(pastSql, [userId]);
+    if (result.rows.length) {
+      const row = result.rows[0];
+      const trip = normalizeTripRow(row);
+      trip.places = row.places || [];
+      return res.json({ trip });
+    }
+
+    // no trips at all
+    return res.status(404).json({ message: 'No se encontraron viajes para el usuario' });
+  } catch (err) {
+    console.error('GET /trips/next error:', err);
+    res.status(500).json({ message: 'Error' });
+  }
+});
+
+/**
  * PUT /trips/:id
  * Update trip fields. Optionally include `places` array to replace existing places (atomic).
- * If places is provided, existing trip_places for that trip will be deleted and replaced.
  */
 router.put('/:id', auth, async (req, res) => {
   const client = await pool.connect();
@@ -297,7 +339,6 @@ router.delete('/:id', auth, async (req, res) => {
 /**
  * POST /trips/:id/places
  * Add one or more places to an existing trip.
- * Body: { places: [{ fk_location | locationId, date, start_hour, end_hour, notes }, ...] }
  */
 router.post('/:id/places', auth, async (req, res) => {
   const client = await pool.connect();
