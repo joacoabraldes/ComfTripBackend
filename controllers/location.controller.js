@@ -33,8 +33,6 @@ router.get('/', async (req, res) => {
     const { interest, limit = 50, offset = 0 } = req.query;
 
     if (interest) {
-      // interest supplied (likely a slug like "naturaleza")
-      // params: interest, limit, offset
       const sql = `
         SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes
         FROM locations
@@ -46,7 +44,6 @@ router.get('/', async (req, res) => {
       const rows = result.rows.map(normalizeRow);
       return res.json(rows);
     } else {
-      // no interest filter
       const sql = `
         SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes
         FROM locations
@@ -59,7 +56,36 @@ router.get('/', async (req, res) => {
     }
   } catch (err) {
     console.error('GET /locations error:', err?.message || err);
-    // include error detail to help debugging locally (remove in production)
+    return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+  }
+});
+
+/**
+ * NEW: GET /locations/interests
+ * Returns list of distinct fk_interest values present in locations with a count.
+ * Public endpoint to populate categories.
+ */
+router.get('/interests', async (req, res) => {
+  try {
+    const sql = `
+      SELECT fk_interest, COUNT(*) AS count
+      FROM locations
+      GROUP BY fk_interest
+      ORDER BY COUNT(*) DESC, fk_interest
+    `;
+    const result = await pool.query(sql);
+    // generate a displayName (capitalized) and return id/name/count
+    const rows = result.rows.map(r => {
+      const id = r.fk_interest;
+      const count = Number(r.count || 0);
+      const displayName = typeof id === 'string' && id.length > 0
+        ? id.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+        : id;
+      return { id, name: displayName, count };
+    });
+    return res.json(rows);
+  } catch (err) {
+    console.error('GET /locations/interests error:', err?.message || err);
     return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
   }
 });
@@ -132,7 +158,6 @@ router.put('/:id', auth, async (req, res) => {
       imagenes = existing.rows[0].imagenes,
     } = req.body;
 
-    // prefer new latitude/longitude if provided, else keep existing latitud/longitud
     const lat = latitude !== undefined ? latitude : (existing.rows[0].latitud ?? existing.rows[0].latitude);
     const lng = longitude !== undefined ? longitude : (existing.rows[0].longitud ?? existing.rows[0].longitude);
 
