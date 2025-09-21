@@ -16,11 +16,45 @@ function normalizeRow(row) {
     fk_interest: row.fk_interest,
     descripcion: row.descripcion,
     // alias DB latin names to english keys used on client
-    latitude: row.latitude !== undefined ? Number(row.latitude) : (row.latitud !== undefined ? Number(row.latitud) : null),
-    longitude: row.longitude !== undefined ? Number(row.longitude) : (row.longitud !== undefined ? Number(row.longitud) : null),
+    latitude:
+      row.latitude !== undefined
+        ? Number(row.latitude)
+        : row.latitud !== undefined
+        ? Number(row.latitud)
+        : null,
+    longitude:
+      row.longitude !== undefined
+        ? Number(row.longitude)
+        : row.longitud !== undefined
+        ? Number(row.longitud)
+        : null,
     imagenes: row.imagenes,
   };
 }
+
+/**
+ * GET /locations/interests
+ * Devuelve los fk_interest que hay en la tabla locations con su count.
+ * Ejemplo de respuesta: [{ id: 'naturaleza', count: 12 }, { id: 'cultura', count: 7 }, ...]
+ */
+router.get('/interests', async (req, res) => {
+  try {
+    const sql = `
+      SELECT fk_interest AS id, COUNT(*)::int AS count
+      FROM locations
+      WHERE fk_interest IS NOT NULL AND fk_interest <> ''
+      GROUP BY fk_interest
+      ORDER BY count DESC
+    `;
+    const result = await pool.query(sql);
+    // normalizamos id como string y count como int
+    const rows = result.rows.map((r) => ({ id: String(r.id), count: Number(r.count) }));
+    return res.json(rows);
+  } catch (err) {
+    console.error('GET /locations/interests error:', err?.message || err);
+    return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+  }
+});
 
 /**
  * GET /locations
@@ -33,6 +67,8 @@ router.get('/', async (req, res) => {
     const { interest, limit = 50, offset = 0 } = req.query;
 
     if (interest) {
+      // interest supplied (likely a slug like "naturaleza")
+      // params: interest, limit, offset
       const sql = `
         SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes
         FROM locations
@@ -44,6 +80,7 @@ router.get('/', async (req, res) => {
       const rows = result.rows.map(normalizeRow);
       return res.json(rows);
     } else {
+      // no interest filter
       const sql = `
         SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes
         FROM locations
@@ -56,36 +93,7 @@ router.get('/', async (req, res) => {
     }
   } catch (err) {
     console.error('GET /locations error:', err?.message || err);
-    return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
-  }
-});
-
-/**
- * NEW: GET /locations/interests
- * Returns list of distinct fk_interest values present in locations with a count.
- * Public endpoint to populate categories.
- */
-router.get('/interests', async (req, res) => {
-  try {
-    const sql = `
-      SELECT fk_interest, COUNT(*) AS count
-      FROM locations
-      GROUP BY fk_interest
-      ORDER BY COUNT(*) DESC, fk_interest
-    `;
-    const result = await pool.query(sql);
-    // generate a displayName (capitalized) and return id/name/count
-    const rows = result.rows.map(r => {
-      const id = r.fk_interest;
-      const count = Number(r.count || 0);
-      const displayName = typeof id === 'string' && id.length > 0
-        ? id.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
-        : id;
-      return { id, name: displayName, count };
-    });
-    return res.json(rows);
-  } catch (err) {
-    console.error('GET /locations/interests error:', err?.message || err);
+    // include error detail to help debugging locally (remove in production)
     return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
   }
 });
@@ -158,6 +166,7 @@ router.put('/:id', auth, async (req, res) => {
       imagenes = existing.rows[0].imagenes,
     } = req.body;
 
+    // prefer new latitude/longitude if provided, else keep existing latitud/longitud
     const lat = latitude !== undefined ? latitude : (existing.rows[0].latitud ?? existing.rows[0].latitude);
     const lng = longitude !== undefined ? longitude : (existing.rows[0].longitud ?? existing.rows[0].longitude);
 
