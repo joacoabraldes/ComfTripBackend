@@ -22,6 +22,7 @@ function normalizeTripRow(row) {
 
 /**
  * SQL fragment used to aggregate trip_places + basic location info as JSON array.
+ * We'll inject this as a LEFT JOIN subquery in queries below.
  */
 const PLACES_AGG_SUBQUERY = `
   SELECT fk_trips,
@@ -39,7 +40,8 @@ const PLACES_AGG_SUBQUERY = `
              'latitude', l.latitud,
              'longitude', l.longitud,
              'imagenes', l.imagenes,
-             'relevancia', l.relevancia
+             'relevancia', l.relevancia,
+             'country', l.country
            )
          ) ORDER BY tp.date, tp.start_hour) AS places
   FROM trip_places tp
@@ -47,321 +49,106 @@ const PLACES_AGG_SUBQUERY = `
   GROUP BY fk_trips
 `;
 
+/* ---------- small helpers for itinerary generation ---------- */
+
 /**
- * Utility: Haversine distance (meters)
+ * Haversine distance in kilometers
  */
-function haversineMeters(lat1, lon1, lat2, lon2) {
-  if (
-    lat1 === null ||
-    lat2 === null ||
-    lon1 === null ||
-    lon2 === null ||
-    Number.isNaN(lat1) ||
-    Number.isNaN(lat2) ||
-    Number.isNaN(lon1) ||
-    Number.isNaN(lon2)
-  ) {
-    return Number.POSITIVE_INFINITY;
-  }
+function haversineKm(aLat, aLon, bLat, bLon) {
   const toRad = (v) => (v * Math.PI) / 180;
-  const R = 6371000; // earth radius meters
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-    Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
+  const R = 6371;
+  const dLat = toRad(bLat - aLat);
+  const dLon = toRad(bLon - aLon);
+  const lat1 = toRad(aLat);
+  const lat2 = toRad(bLat);
+  const sinDlat = Math.sin(dLat / 2) ** 2;
+  const sinDlon = Math.sin(dLon / 2) ** 2;
+  const inner = sinDlat + Math.cos(lat1) * Math.cos(lat2) * sinDlon;
+  return 2 * R * Math.asin(Math.sqrt(inner));
 }
 
 /**
- * Build a simple itinerary for a trip:
- * - choose locations matching the user's interests and (preferably) the trip country
- * - greedily group nearby locations per day
- * - allocate times: start at 09:00, durationPerPlace (default 2h), gap (default 1h)
+ * Simple greedy clustering by proximity that returns ordered arrays per day.
+ * - places: array of { id, titulo, latitude, longitude, relevancia, fk_interest }
+ * - days: integer (>0)
  *
- * Query: GET /trips/:id/itinerary
- * Query params:
- *   - save=true  => persist generated itinerary (replace existing trip_places)
- *   - placesPerDay (optional, default 3)
+ * Strategy:
+ *  - pick highest relevancia as seed for day 1, then greedily pick nearest unassigned to fill day
+ *  - limit visits per day to roughly ceil(total / days) with min 1 and max 6
  */
-router.get('/:id/itinerary', auth, async (req, res) => {
-  const tripId = Number(req.params.id);
-  const userId = req.user.id;
-  const save = req.query.save === 'true' || req.query.save === '1';
-  const placesPerDay = Number(req.query.placesPerDay) || 3;
+function clusterByProximity(places, days) {
+  if (!Array.isArray(places) || places.length === 0) return Array.from({ length: days }, () => []);
+  const total = places.length;
+  const perDayBase = Math.max(1, Math.ceil(total / days));
+  const maxPerDay = Math.min(6, perDayBase + 1);
 
-  if (!Number.isFinite(tripId) || tripId <= 0) {
-    return res.status(400).json({ message: 'Invalid trip id' });
+  // copy and sort by relevancia desc
+  const pool = places
+    .map((p) => ({
+      ...p,
+      latitude: p.latitude !== undefined && p.latitude !== null ? Number(p.latitude) : null,
+      longitude: p.longitude !== undefined && p.longitude !== null ? Number(p.longitude) : null,
+    }))
+    .slice()
+    .sort((a, b) => (Number(b.relevancia || 0) - Number(a.relevancia || 0)));
+
+  const daysArr = Array.from({ length: days }, () => []);
+  const assigned = new Set();
+
+  // seeds: use top `days` relevancia items as day seeds
+  for (let d = 0; d < days; d++) {
+    let seed = pool.find((p) => !assigned.has(p.id));
+    if (!seed) break;
+    daysArr[d].push(seed);
+    assigned.add(seed.id);
   }
 
-  let client;
-  try {
-    // fetch trip + ownership
-    const tripRes = await pool.query('SELECT * FROM trips WHERE id = $1', [tripId]);
-    if (!tripRes.rows.length) return res.status(404).json({ message: 'Trip not found' });
-    const trip = tripRes.rows[0];
-    if (trip.user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
-
-    // require start and end dates
-    if (!trip.start_date || !trip.end_date) {
-      return res.status(400).json({ message: 'Trip needs start_date and end_date' });
-    }
-
-    // get user interests (slugs)
-    const uiRes = await pool.query(
-      `SELECT i.slug
-       FROM interests i
-       JOIN user_interests ui ON i.id = ui.interest_id
-       WHERE ui.user_id = $1`,
-      [userId]
-    );
-    const interestSlugs = uiRes.rows.map(r => r.slug);
-
-    // derive country from trip.destination if possible (expected "Province, Country" or "... , Country")
-    let country = null;
-    if (typeof trip.destination === 'string' && trip.destination.includes(',')) {
-      const parts = trip.destination.split(',');
-      country = parts[parts.length - 1].trim();
-    } else if (typeof trip.destination === 'string') {
-      // fallback attempt: last word
-      const parts = trip.destination.trim().split(' ');
-      country = parts.length > 1 ? parts[parts.length - 1] : trip.destination.trim();
-    }
-
-    // fetch candidate locations:
-    // prefer country + interest matches, ordered by relevancia desc
-    // keep a reasonable max (200)
-    let candidates = [];
-    if (interestSlugs.length > 0) {
-      if (country) {
-        const rows = await pool.query(
-          `SELECT id, titulo, fk_interest, latitud, longitud, imagenes, relevancia, country
-           FROM locations
-           WHERE country ILIKE $1 AND fk_interest = ANY($2)
-           ORDER BY relevancia DESC NULLS LAST
-           LIMIT 200`,
-          [country, interestSlugs]
-        );
-        candidates = rows.rows;
-      }
-      // fallback: if none found or country not provided, fetch by interests globally
-      if (!candidates.length) {
-        const rows = await pool.query(
-          `SELECT id, titulo, fk_interest, latitud, longitud, imagenes, relevancia, country
-           FROM locations
-           WHERE fk_interest = ANY($1)
-           ORDER BY relevancia DESC NULLS LAST
-           LIMIT 300`,
-          [interestSlugs]
-        );
-        candidates = rows.rows;
-      }
-    }
-
-    // last resort: if still empty, fetch top locations by relevancia optionally filtered by country
-    if (!candidates.length) {
-      if (country) {
-        const rows = await pool.query(
-          `SELECT id, titulo, fk_interest, latitud, longitud, imagenes, relevancia, country
-           FROM locations
-           WHERE country ILIKE $1
-           ORDER BY relevancia DESC NULLS LAST
-           LIMIT 300`,
-          [country]
-        );
-        candidates = rows.rows;
-      } else {
-        const rows = await pool.query(
-          `SELECT id, titulo, fk_interest, latitud, longitud, imagenes, relevancia, country
-           FROM locations
-           ORDER BY relevancia DESC NULLS LAST
-           LIMIT 300`
-        );
-        candidates = rows.rows;
-      }
-    }
-
-    // normalize numeric coords and relevancia
-    candidates = candidates.map(c => ({
-      id: c.id,
-      titulo: c.titulo,
-      fk_interest: c.fk_interest,
-      lat: c.latitud !== null && c.latitud !== undefined ? Number(c.latitud) : null,
-      lng: c.longitud !== null && c.longitud !== undefined ? Number(c.longitud) : null,
-      imagenes: c.imagenes,
-      relevancia: c.relevancia !== null && c.relevancia !== undefined ? Number(c.relevancia) : 0,
-      country: c.country || null
-    }));
-
-    // sort initial candidates by relevancia desc (stable)
-    candidates.sort((a, b) => (b.relevancia || 0) - (a.relevancia || 0));
-
-    // Build days array (inclusive)
-    const startDate = new Date(trip.start_date);
-    const endDate = new Date(trip.end_date);
-    const days = [];
-    for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
-      days.push(new Date(d)); // copy
-    }
-
-    // Greedy grouping: for each day pick up to placesPerDay locations,
-    // choose highest relevance first, then pick nearest remaining
-    const usedIds = new Set();
-    const itinerary = [];
-
-    // We'll keep a working list of candidates we can remove from
-    let poolCandidates = candidates.slice();
-
-    for (const day of days) {
-      if (!poolCandidates.length) {
-        // nothing left
-        itinerary.push({ date: new Date(day), places: [] });
-        continue;
-      }
-
-      const dayPlaces = [];
-
-      // pick the top relevance location as seed for the day
-      // find next candidate not used
-      let seedIndex = poolCandidates.findIndex(c => !usedIds.has(c.id));
-      if (seedIndex === -1) {
-        itinerary.push({ date: new Date(day), places: [] });
-        continue;
-      }
-
-      // take seed
-      const seed = poolCandidates.splice(seedIndex, 1)[0];
-      usedIds.add(seed.id);
-      dayPlaces.push(seed);
-
-      // greedily add nearest neighbors up to placesPerDay
-      while (dayPlaces.length < placesPerDay && poolCandidates.length) {
-        const prev = dayPlaces[dayPlaces.length - 1];
-        // compute distance to all remaining
-        let bestIdx = -1;
-        let bestDist = Number.POSITIVE_INFINITY;
-        for (let i = 0; i < poolCandidates.length; i++) {
-          const c = poolCandidates[i];
-          const dist = haversineMeters(prev.lat, prev.lng, c.lat, c.lng);
-          // tie-breaker: prefer higher relevance if distances similar
-          const tieScore = (c.relevancia || 0) * 0.0001;
-          const effective = dist - tieScore;
-          if (effective < bestDist) {
-            bestDist = effective;
-            bestIdx = i;
-          }
+  // now greedily fill each day
+  for (let d = 0; d < days; d++) {
+    while (daysArr[d].length < maxPerDay && assigned.size < pool.length) {
+      // find candidate closest to the last placed item in this day
+      const last = daysArr[d][daysArr[d].length - 1];
+      let bestIdx = -1;
+      let bestDist = Infinity;
+      for (let i = 0; i < pool.length; i++) {
+        const p = pool[i];
+        if (assigned.has(p.id)) continue;
+        // if last has coords use distance, else use -relevancia to prefer relevant places
+        let dist = 0;
+        if (last && last.latitude != null && last.longitude != null && p.latitude != null && p.longitude != null) {
+          dist = haversineKm(last.latitude, last.longitude, p.latitude, p.longitude);
+        } else {
+          // fallback: sort by negative relevancia to prefer more relevant
+          dist = -Number(p.relevancia || 0);
         }
-        if (bestIdx === -1) break;
-        const chosen = poolCandidates.splice(bestIdx, 1)[0];
-        usedIds.add(chosen.id);
-        dayPlaces.push(chosen);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestIdx = i;
+        }
       }
-
-      itinerary.push({ date: new Date(day), places: dayPlaces });
+      if (bestIdx === -1) break;
+      daysArr[d].push(pool[bestIdx]);
+      assigned.add(pool[bestIdx].id);
     }
-
-    // assign times to places (per day):
-    // startAt 09:00, durationPerPlace 2h, gap 1h (configurable constants)
-    const durationHours = 2;
-    const gapHours = 1;
-    function hhmmssFromHourFloat(h) {
-      const hh = String(Math.floor(h)).padStart(2, '0');
-      const mm = String(Math.round((h - Math.floor(h)) * 60)).padStart(2, '0');
-      return `${hh}:${mm}:00`;
-    }
-
-    const itineraryWithTimes = itinerary.map(dayBlock => {
-      const dateOnly = dayBlock.date.toISOString().slice(0, 10); // YYYY-MM-DD
-      let currentStart = 9; // 9:00
-      const placesWithTimes = (dayBlock.places || []).map((loc, idx) => {
-        const start_hr = hhmmssFromHourFloat(currentStart);
-        const end_hr = hhmmssFromHourFloat(currentStart + durationHours);
-        currentStart = currentStart + durationHours + gapHours;
-        return {
-          id: loc.id,
-          titulo: loc.titulo,
-          fk_interest: loc.fk_interest,
-          latitude: loc.lat,
-          longitude: loc.lng,
-          imagenes: loc.imagenes,
-          relevancia: loc.relevancia,
-          start_hour: start_hr,
-          end_hour: end_hr,
-          date: dateOnly
-        };
-      });
-      return {
-        date: dateOnly,
-        places: placesWithTimes
-      };
-    });
-
-    // If save=true persist the itinerary (replace existing trip_places)
-    let insertedPlaces = [];
-    if (save) {
-      client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-
-        // Ensure trip exists and belongs to user (again, using client)
-        const check = await client.query('SELECT user_id FROM trips WHERE id = $1 FOR UPDATE', [tripId]);
-        if (!check.rows.length) {
-          await client.query('ROLLBACK');
-          return res.status(404).json({ message: 'Trip not found' });
-        }
-        if (check.rows[0].user_id !== userId) {
-          await client.query('ROLLBACK');
-          return res.status(403).json({ message: 'No autorizado' });
-        }
-
-        // delete existing trip_places for trip
-        await client.query('DELETE FROM trip_places WHERE fk_trips = $1', [tripId]);
-
-        const insertSQL =
-          'INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, fk_locations, fk_trips, date, start_hour, end_hour, notes, created_at';
-
-        for (const day of itineraryWithTimes) {
-          for (const p of day.places) {
-            // p.id is location id
-            const r = await client.query(insertSQL, [
-              p.id,
-              tripId,
-              p.date, // Postgres will cast date string to timestamp
-              p.start_hour,
-              p.end_hour,
-              null
-            ]);
-            insertedPlaces.push(r.rows[0]);
-          }
-        }
-
-        await client.query('COMMIT');
-      } catch (e) {
-        await client.query('ROLLBACK').catch(()=>{});
-        throw e;
-      } finally {
-        client.release();
-        client = null;
-      }
-    }
-
-    return res.json({
-      itinerary: itineraryWithTimes,
-      saved: !!save,
-      insertedCount: insertedPlaces.length,
-      insertedPlaces
-    });
-  } catch (err) {
-    if (client) {
-      await client.query('ROLLBACK').catch(()=>{});
-      client.release();
-    }
-    console.error('GET /trips/:id/itinerary error:', err);
-    return res.status(500).json({ message: 'Error generating itinerary', detail: err?.message || String(err) });
   }
-});
+
+  // If still unassigned (very rare), spread them round robin
+  for (const p of pool) {
+    if (!assigned.has(p.id)) {
+      for (let d = 0; d < days; d++) {
+        if (daysArr[d].length < maxPerDay) {
+          daysArr[d].push(p);
+          assigned.add(p.id);
+          break;
+        }
+      }
+    }
+  }
+
+  return daysArr;
+}
+
+/* ---------- Trip endpoints ---------- */
 
 /**
  * GET /trips
@@ -400,12 +187,28 @@ router.get('/', auth, async (req, res) => {
 /**
  * POST /trips
  * Create a trip. Optionally provide `places` array in body to insert trip_places in same transaction.
+ *
+ * If no places are provided, we'll attempt to auto-generate a simple itinerary
+ * based on the user's interests and locations in the destination country.
+ *
+ * Body:
+ *  { destination, start_date, end_date, budget, notes, places: [{ fk_location | locationId, date, start_hour, end_hour, notes }, ...] }
  */
 router.post('/', auth, async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = req.user.id;
-    const { destination, start_date, end_date, budget, notes, places } = req.body;
+    let { destination, start_date, end_date, budget, notes, places } = req.body;
+
+    // normalize destination: sometimes front sends "Province, Country"
+    // extract country heuristically (last token after comma)
+    let countryName = null;
+    if (typeof destination === 'string') {
+      const parts = destination.split(',').map((s) => s.trim()).filter(Boolean);
+      if (parts.length) countryName = parts[parts.length - 1];
+    }
+    // fallback: if destination equals country
+    if (!countryName && typeof destination === 'string') countryName = destination.trim();
 
     await client.query('BEGIN');
 
@@ -424,10 +227,12 @@ router.post('/', auth, async (req, res) => {
 
     const createdPlaces = [];
 
-    if (Array.isArray(places) && places.length > 0) {
-      const insertPlaceSQL =
-        'INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, fk_locations, fk_trips, date, start_hour, end_hour, notes, created_at';
+    // helper SQL for inserting a place
+    const insertPlaceSQL =
+      'INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, fk_locations, fk_trips, date, start_hour, end_hour, notes, created_at';
 
+    // If client provided explicit places -> insert them
+    if (Array.isArray(places) && places.length > 0) {
       for (const p of places) {
         const fk_location = p.fk_location ?? p.locationId ?? p.location_id ?? p.fk_locations;
         if (!fk_location) {
@@ -444,10 +249,151 @@ router.post('/', auth, async (req, res) => {
         ]);
         createdPlaces.push(placeRes.rows[0]);
       }
+    } else {
+      // No places provided -> attempt to generate an itinerary
+      // Determine number of days
+      let days = 1;
+      try {
+        if (start_date && end_date) {
+          const s = new Date(start_date);
+          const e = new Date(end_date);
+          const diff = Math.ceil((e - s) / (1000 * 60 * 60 * 24));
+          days = Math.max(1, diff + 1);
+        }
+      } catch (e) {
+        days = 1;
+      }
+
+      // 1) fetch user interests (slugs)
+      const interestsRes = await client.query(`
+        SELECT i.slug
+        FROM interests i
+        JOIN user_interests ui ON ui.interest_id = i.id
+        WHERE ui.user_id = $1
+      `, [userId]);
+      const interestSlugs = interestsRes.rows.map(r => r.slug).filter(Boolean);
+
+      // 2) fetch candidate locations: try country + user interests first
+      let candidateSql = null;
+      let candidateParams = null;
+
+      if (countryName && interestSlugs.length) {
+        candidateSql = `
+          SELECT id, titulo, fk_interest, latitud AS latitude, longitud AS longitude, COALESCE(relevancia,0) AS relevancia
+          FROM locations
+          WHERE (country ILIKE $1 OR titulo ILIKE $1)
+            AND fk_interest = ANY($2::text[])
+          ORDER BY relevancia DESC NULLS LAST
+          LIMIT 80
+        `;
+        candidateParams = [`%${countryName}%`, interestSlugs];
+      } else if (countryName) {
+        candidateSql = `
+          SELECT id, titulo, fk_interest, latitud AS latitude, longitud AS longitude, COALESCE(relevancia,0) AS relevancia
+          FROM locations
+          WHERE (country ILIKE $1 OR titulo ILIKE $1)
+          ORDER BY relevancia DESC NULLS LAST
+          LIMIT 80
+        `;
+        candidateParams = [`%${countryName}%`];
+      } else if (interestSlugs.length) {
+        candidateSql = `
+          SELECT id, titulo, fk_interest, latitud AS latitude, longitud AS longitude, COALESCE(relevancia,0) AS relevancia
+          FROM locations
+          WHERE fk_interest = ANY($1::text[])
+          ORDER BY relevancia DESC NULLS LAST
+          LIMIT 80
+        `;
+        candidateParams = [interestSlugs];
+      } else {
+        candidateSql = `
+          SELECT id, titulo, fk_interest, latitud AS latitude, longitud AS longitude, COALESCE(relevancia,0) AS relevancia
+          FROM locations
+          ORDER BY relevancia DESC NULLS LAST
+          LIMIT 80
+        `;
+        candidateParams = [];
+      }
+
+      const candidatesRes = candidateParams.length ? await client.query(candidateSql, candidateParams) : await client.query(candidateSql);
+      const candidateRows = candidatesRes.rows || [];
+
+      // map and filter to entries with coords if possible
+      const cleaned = candidateRows
+        .map(r => ({
+          id: r.id,
+          titulo: r.titulo,
+          fk_interest: r.fk_interest,
+          latitude: r.latitude !== null && r.latitude !== undefined ? Number(r.latitude) : null,
+          longitude: r.longitude !== null && r.longitude !== undefined ? Number(r.longitude) : null,
+          relevancia: Number(r.relevancia || 0)
+        }))
+        .filter(Boolean);
+
+      // if we have almost no candidates -> expand search (ignore country)
+      let finalCandidates = cleaned;
+      if (finalCandidates.length < 6 && interestSlugs.length) {
+        const moreRes = await client.query(`
+          SELECT id, titulo, fk_interest, latitud AS latitude, longitud AS longitude, COALESCE(relevancia,0) AS relevancia
+          FROM locations
+          WHERE fk_interest = ANY($1::text[])
+          ORDER BY relevancia DESC NULLS LAST
+          LIMIT 100
+        `, [interestSlugs]);
+        finalCandidates = (moreRes.rows || []).map(r => ({
+          id: r.id,
+          titulo: r.titulo,
+          fk_interest: r.fk_interest,
+          latitude: r.latitude !== null && r.latitude !== undefined ? Number(r.latitude) : null,
+          longitude: r.longitude !== null && r.longitude !== undefined ? Number(r.longitude) : null,
+          relevancia: Number(r.relevancia || 0)
+        }));
+      }
+
+      // Ensure we have at least some items
+      if (finalCandidates.length > 0) {
+        // pick up to (days * 4) items (rough)
+        const limitItems = Math.min(finalCandidates.length, Math.max(3, days * 4));
+        const selected = finalCandidates.slice(0, limitItems);
+
+        // cluster
+        const daysPlan = clusterByProximity(selected, days);
+
+        // assign simple times: start at 09:00, each visit 2h, gap 1h (slot length 3h)
+        // dateStr - generate ISO date for each day starting from start_date
+        const startDateObj = start_date ? new Date(start_date) : new Date();
+        for (let d = 0; d < daysPlan.length; d++) {
+          const dayPlaces = daysPlan[d];
+          if (!Array.isArray(dayPlaces) || dayPlaces.length === 0) continue;
+          const dateObj = new Date(startDateObj);
+          dateObj.setDate(startDateObj.getDate() + d);
+          const isoDate = dateObj.toISOString(); // postgres timestamp with time zone ok
+          let hourStart = 9; // 9AM first visit
+
+          for (const p of dayPlaces) {
+            const startHourStr = `${String(hourStart).padStart(2,'0')}:00:00`;
+            const endHourStr = `${String(hourStart + 2).padStart(2,'0')}:00:00`;
+            // create trip_place row
+            const placeRes = await client.query(insertPlaceSQL, [
+              p.id,
+              tripId,
+              isoDate,
+              startHourStr,
+              endHourStr,
+              `Itinerario automático (${p.fk_interest || 'general'})`
+            ]);
+            createdPlaces.push(placeRes.rows[0]);
+            // increase hour with gap
+            hourStart += 3;
+            if (hourStart > 20) hourStart = 20; // cap
+          }
+        }
+      }
     }
 
     await client.query('COMMIT');
 
+    // return created trip + inserted places (may be empty)
     const response = {
       trip: normalizeTripRow(tripRow),
       places: createdPlaces
@@ -465,8 +411,6 @@ router.post('/', auth, async (req, res) => {
 /**
  * GET /trips/:id
  * Get a single trip with its places. Ownership check.
- *
- * NOTE: This route must be after /:id/itinerary above.
  */
 router.get('/:id', auth, async (req, res) => {
   try {
@@ -495,6 +439,65 @@ router.get('/:id', auth, async (req, res) => {
     res.json(trip);
   } catch (err) {
     console.error('GET /trips/:id error:', err);
+    res.status(500).json({ message: 'Error' });
+  }
+});
+
+/**
+ * NEW: GET /trips/next
+ * Return the next (nearest upcoming) trip for the authenticated user.
+ * If no upcoming trips (start_date >= today) exist, return the most recent past trip.
+ */
+router.get('/next', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // 1) Try to find the next upcoming trip (start_date >= today), earliest start_date
+    const upcomingSql = `
+      SELECT
+        t.id, t.user_id, t.destination, t.start_date, t.end_date, t.budget, t.notes, t.created_at,
+        COALESCE(tp.places, '[]') AS places
+      FROM trips t
+      LEFT JOIN (
+        ${PLACES_AGG_SUBQUERY}
+      ) tp ON tp.fk_trips = t.id
+      WHERE t.user_id = $1 AND t.start_date >= CURRENT_DATE
+      ORDER BY t.start_date ASC
+      LIMIT 1
+    `;
+    let result = await pool.query(upcomingSql, [userId]);
+    if (result.rows.length) {
+      const row = result.rows[0];
+      const trip = normalizeTripRow(row);
+      trip.places = row.places || [];
+      return res.json({ trip });
+    }
+
+    // 2) If no upcoming trips, return the most recent past trip (latest start_date < today)
+    const pastSql = `
+      SELECT
+        t.id, t.user_id, t.destination, t.start_date, t.end_date, t.budget, t.notes, t.created_at,
+        COALESCE(tp.places, '[]') AS places
+      FROM trips t
+      LEFT JOIN (
+        ${PLACES_AGG_SUBQUERY}
+      ) tp ON tp.fk_trips = t.id
+      WHERE t.user_id = $1
+      ORDER BY t.start_date DESC
+      LIMIT 1
+    `;
+    result = await pool.query(pastSql, [userId]);
+    if (result.rows.length) {
+      const row = result.rows[0];
+      const trip = normalizeTripRow(row);
+      trip.places = row.places || [];
+      return res.json({ trip });
+    }
+
+    // no trips at all
+    return res.status(404).json({ message: 'No se encontraron viajes para el usuario' });
+  } catch (err) {
+    console.error('GET /trips/next error:', err);
     res.status(500).json({ message: 'Error' });
   }
 });
