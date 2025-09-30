@@ -47,6 +47,35 @@ async function pickCandidatesForTrip(trip) {
   return res.rows;
 }
 
+// NUEVA FUNCIÓN: crea un lugar si no existe en locations
+async function ensureLocationExists(client, candidate) {
+  // Busca por título y país (puedes ajustar la lógica de búsqueda si lo prefieres)
+  const res = await client.query(
+    `SELECT id FROM locations WHERE LOWER(titulo) = LOWER($1) AND country ILIKE $2 LIMIT 1`,
+    [candidate.title, candidate.country || '%']
+  );
+  if (res.rows.length) {
+    return res.rows[0].id;
+  }
+  // Si no existe, lo crea
+  const insertRes = await client.query(
+    `INSERT INTO locations (titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     RETURNING id`,
+    [
+      candidate.title,
+      candidate.interest || null,
+      candidate.descripcion || '',
+      candidate.lat || null,
+      candidate.lng || null,
+      candidate.imagenes || null,
+      candidate.relevancia || 1,
+      candidate.country || null
+    ]
+  );
+  return insertRes.rows[0].id;
+}
+
 async function scheduleForTrip(genRow) {
   const client = await pool.connect();
   try {
@@ -70,7 +99,9 @@ async function scheduleForTrip(genRow) {
       lng: c.longitud ? Number(c.longitud) : null,
       interest: c.fk_interest,
       relevancia: Number(c.relevancia || 0),
-      descripcion: c.descripcion
+      descripcion: c.descripcion,
+      country: c.country,
+      imagenes: c.imagenes
     }));
 
     // 2) if user has interests, attempt to prefer those:
@@ -120,8 +151,15 @@ async function scheduleForTrip(genRow) {
       const dayEndMin = 18 * 60;   // 18:00
       // choose up to a few places per day
       for (let i = 0; i < filtered.length && currentTimeMin + defaultVisitMin <= dayEndMin; i++) {
-        const candidate = filtered[i];
-        if (used.has(candidate.id)) continue;
+        let candidate = filtered[i];
+        let locationId = candidate.id;
+
+        // Si el lugar sugerido por IA no existe en locations, lo crea
+        if (!locationId) {
+          locationId = await ensureLocationExists(client, candidate);
+        }
+
+        if (used.has(locationId)) continue;
         // if candidate has coordinates, estimate travel from last chosen place
         let travelMin = 0;
         const last = finalPlaces.length ? finalPlaces[finalPlaces.length -1] : null;
@@ -141,7 +179,7 @@ async function scheduleForTrip(genRow) {
         const endHour = Math.floor(endMin/60).toString().padStart(2,'0') + ':' + (endMin%60).toString().padStart(2,'0');
 
         finalPlaces.push({
-          fk_locations: candidate.id,
+          fk_locations: locationId,
           date: new Date(day.getFullYear(), day.getMonth(), day.getDate()).toISOString(),
           start_hour: startHour,
           end_hour: endHour,
@@ -149,7 +187,7 @@ async function scheduleForTrip(genRow) {
           latitude: candidate.lat,
           longitude: candidate.lng,
         });
-        used.add(candidate.id);
+        used.add(locationId);
         // move clock forward
         currentTimeMin = endMin + travelBufferMin;
       }
@@ -158,7 +196,7 @@ async function scheduleForTrip(genRow) {
     }
 
     // 4) write trip_places (delete existing ones for the trip? we will append but you can change)
-    // here we will INSERT created places
+    // aquí se INSERTAN los lugares creados
     const inserted = [];
     for (const p of finalPlaces) {
       const r = await client.query(
