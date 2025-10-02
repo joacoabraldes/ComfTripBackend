@@ -28,35 +28,8 @@ function normalizeRow(row) {
         : row.longitud !== undefined
         ? Number(row.longitud)
         : null,
-    // try to return imagenes as array if it's a JSON/string column
-    imagenes: (() => {
-      const v = row.imagenes ?? row.images ?? null;
-      if (!v) return [];
-      if (Array.isArray(v)) return v;
-      try {
-        // if JSON string
-        if (typeof v === 'string') {
-          const t = v.trim();
-          if ((t.startsWith('[') && t.endsWith(']')) || (t.startsWith('{') && t.endsWith('}')) || (t.startsWith('"') && t.endsWith('"'))) {
-            const parsed = JSON.parse(t);
-            if (Array.isArray(parsed)) return parsed;
-            if (typeof parsed === 'object') return [parsed];
-          }
-          // fallback: split by commas
-          return t.replace(/^\[|\]$/g, '').replace(/(^"|"$)/g, '').split(',').map(s => s.trim()).filter(Boolean);
-        }
-      } catch (e) {
-        try {
-          // final fallback
-          return String(v).replace(/^\[|\]$/g, '').replace(/"/g, '').split(',').map(s => s.trim()).filter(Boolean);
-        } catch (_e) {
-          return [];
-        }
-      }
-      return [];
-    })(),
-    relevancia: row.relevancia !== undefined && row.relevancia !== null ? Number(row.relevancia) : 0,
-    country: row.country ?? null,
+    imagenes: row.imagenes,
+    relevancia: row.relevancia !== undefined && row.relevancia !== null ? Number(row.relevancia) : 0
   };
 }
 
@@ -64,42 +37,34 @@ function normalizeRow(row) {
  * GET /locations
  * List locations (public). Supports optional query params:
  *  - interest (slug or id)
- *  - country (case-insensitive match)
  *  - limit, offset (pagination)
  */
 router.get('/', async (req, res) => {
   try {
-    const { interest, country, limit = 50, offset = 0 } = req.query;
-
-    // Build dynamic WHERE clause
-    const where = [];
-    const params = [];
+    const { interest, limit = 50, offset = 0 } = req.query;
 
     if (interest) {
-      params.push(interest);
-      where.push(`fk_interest = $${params.length}`);
+      const sql = `
+        SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia
+        FROM locations
+        WHERE fk_interest = $1
+        ORDER BY relevancia DESC NULLS LAST, id
+        LIMIT $2 OFFSET $3
+      `;
+      const result = await pool.query(sql, [interest, limit, offset]);
+      const rows = result.rows.map(normalizeRow);
+      return res.json(rows);
+    } else {
+      const sql = `
+        SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia
+        FROM locations
+        ORDER BY relevancia DESC NULLS LAST, id
+        LIMIT $1 OFFSET $2
+      `;
+      const result = await pool.query(sql, [limit, offset]);
+      const rows = result.rows.map(normalizeRow);
+      return res.json(rows);
     }
-
-    if (country) {
-      params.push(country);
-      // ILIKE for case-insensitive match and allow partial matches
-      where.push(`country ILIKE $${params.length}`);
-    }
-
-    let sql = `
-      SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country
-      FROM locations
-    `;
-    if (where.length) {
-      sql += ' WHERE ' + where.join(' AND ');
-    }
-    sql += ` ORDER BY relevancia DESC NULLS LAST, id LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
-
-    params.push(limit, offset);
-
-    const result = await pool.query(sql, params);
-    const rows = result.rows.map(normalizeRow);
-    return res.json(rows);
   } catch (err) {
     console.error('GET /locations error:', err?.message || err);
     return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
@@ -113,7 +78,7 @@ router.get('/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     const result = await pool.query(
-      `SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country
+      `SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia
        FROM locations WHERE id = $1`,
       [id]
     );
@@ -128,11 +93,11 @@ router.get('/:id', async (req, res) => {
 /**
  * POST /locations
  * Create a location (protected)
- * Body: { titulo, fk_interest, descripcion, latitude, longitude, imagenes, relevancia, country }
+ * Body: { titulo, fk_interest, descripcion, latitude, longitude, imagenes, relevancia }
  */
 router.post('/', auth, async (req, res) => {
   try {
-    const { titulo, fk_interest, descripcion, latitude, longitude, imagenes, relevancia, country } = req.body;
+    const { titulo, fk_interest, descripcion, latitude, longitude, imagenes, relevancia } = req.body;
     if (!titulo || !fk_interest) return res.status(400).json({ message: 'Faltan campos obligatorios' });
 
     const lat = latitude !== undefined ? latitude : req.body.latitud;
@@ -141,10 +106,10 @@ router.post('/', auth, async (req, res) => {
     const imagenesJson = imagenes ? (typeof imagenes === 'string' ? imagenes : JSON.stringify(imagenes)) : null;
 
     const result = await pool.query(
-      `INSERT INTO locations (titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id, titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country`,
-      [titulo, fk_interest, descripcion || null, lat || null, lng || null, imagenesJson, relevancia || null, country || null]
+      `INSERT INTO locations (titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia`,
+      [titulo, fk_interest, descripcion || null, lat || null, lng || null, imagenesJson, relevancia || null]
     );
 
     return res.status(201).json({ message: 'Localidad creada', location: normalizeRow(result.rows[0]) });
@@ -170,8 +135,7 @@ router.put('/:id', auth, async (req, res) => {
       latitude,
       longitude,
       imagenes = existing.rows[0].imagenes,
-      relevancia = existing.rows[0].relevancia,
-      country = existing.rows[0].country
+      relevancia = existing.rows[0].relevancia
     } = req.body;
 
     const lat = latitude !== undefined ? latitude : (existing.rows[0].latitud ?? existing.rows[0].latitude);
@@ -181,10 +145,10 @@ router.put('/:id', auth, async (req, res) => {
 
     const updated = await pool.query(
       `UPDATE locations
-       SET titulo = $1, fk_interest = $2, descripcion = $3, latitud = $4, longitud = $5, imagenes = $6, relevancia = $7, country = $8
-       WHERE id = $9
-       RETURNING id, titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country`,
-      [titulo, fk_interest, descripcion || null, lat || null, lng || null, imagenesJson || null, relevancia || null, country || null, id]
+       SET titulo = $1, fk_interest = $2, descripcion = $3, latitud = $4, longitud = $5, imagenes = $6, relevancia = $7
+       WHERE id = $8
+       RETURNING id, titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia`,
+      [titulo, fk_interest, descripcion || null, lat || null, lng || null, imagenesJson || null, relevancia || null, id]
     );
 
     return res.json({ message: 'Localidad actualizada', location: normalizeRow(updated.rows[0]) });
