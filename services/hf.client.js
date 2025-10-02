@@ -1,9 +1,9 @@
 // services/hf.client.js
 const { HfInference } = require("@huggingface/inference");
-const HF_API_KEY = process.env.HF_API_TOKEN || "";
+const HF_API_KEY = process.env.HUGGINGFACE_API_KEY || "";
 
 if (!HF_API_KEY) {
-  console.warn("HF_API_TOKEN not set. HF calls will fail.");
+  console.warn("HUGGINGFACE_API_KEY not set. HF calls will fail.");
 }
 const hf = new HfInference(HF_API_KEY);
 
