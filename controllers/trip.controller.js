@@ -172,7 +172,8 @@ router.get('/:id/itinerary', auth, async (req, res) => {
     }
 
     // 3) fetch candidate POIs (db-first)
-    let candidates = await poiService.getCandidates({ db: pool, interestSlugs, country, limit: 300 });
+    let candidates = await poiService.getCandidates({ db: pool, interestSlugs, destination: trip.destination, limit: 300, notes: trip.notes });
+
     if (!candidates || !candidates.length) return res.status(404).json({ message: 'No candidate locations found' });
 
     // sort by relevancia and take topK for the LLM
