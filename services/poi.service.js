@@ -2,11 +2,23 @@
 // Improved POI fetcher that geocodes the trip destination and queries OSM using bbox.
 // Also filters DB results by proximity to the geocoded center to avoid returning far-away DB rows.
 
-const fetch = require('undici');
+const { fetch, AbortController } = require('undici');
 
 const NOMINATIM_URL = process.env.NOMINATIM_URL || 'https://nominatim.openstreetmap.org/search';
 const OVERPASS_URL = process.env.OVERPASS_URL || 'https://overpass-api.de/api/interpreter';
 const NOMINATIM_EMAIL = process.env.NOMINATIM_EMAIL || ''; // put contact email to respect policies
+
+// fetchWithTimeout helper using AbortController (undici)
+async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...opts, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(id);
+  }
+}
 
 function haversineMeters(lat1, lon1, lat2, lon2) {
   if ([lat1, lat2, lon1, lon2].some(v => v === null || v === undefined || Number.isNaN(v))) return Number.POSITIVE_INFINITY;
@@ -102,9 +114,9 @@ function extractMustVisitsFromNotes(notes) {
     const p = (m[1] || m[2] || '').trim();
     if (p) found.add(p);
   }
-  const mustRe = /(?:must visit|want to visit|visit|must-see)\s*[:\\-]?\\s*([^\\.\\n]{3,80})/ig;
+  const mustRe = /(?:must visit|want to visit|visit|must-see)\s*[:\\-]?\s*([^.\n]{3,80})/ig;
   while ((m = mustRe.exec(notes)) !== null) {
-    const p = (m[1] || '').split(/[;,\\n]/)[0].trim();
+    const p = (m[1] || '').split(/[;,\n]/)[0].trim();
     if (p) found.add(p);
   }
   return Array.from(found);
@@ -122,7 +134,7 @@ async function geocodeDestination(query) {
   };
   if (NOMINATIM_EMAIL) headers['From'] = NOMINATIM_EMAIL;
   try {
-    const resp = await fetch(url, { headers, timeout: 15000 });
+    const resp = await fetchWithTimeout(url, { headers }, 15000);
     if (!resp.ok) throw new Error(`Nominatim ${resp.status}`);
     const data = await resp.json();
     if (!Array.isArray(data) || data.length === 0) return null;
@@ -131,7 +143,7 @@ async function geocodeDestination(query) {
     for (const cand of data) {
       if (cand.type && ['city','town','village','municipality'].includes(cand.type)) { pick = cand; break; }
     }
-    const bbox = (pick.boundingbox || []).map(Number); // [south, north, west, east] or [south,north,west,east]? Nominatim returns [south, north, west, east] as strings
+    const bbox = (pick.boundingbox || []).map(Number); // [south, north, west, east] (strings)
     // normalize to [south,west,north,east]
     let normBbox = null;
     if (bbox.length === 4) {
@@ -150,7 +162,7 @@ async function geocodeDestination(query) {
   }
 }
 
-function escapeRegex(s) { return String(s).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&'); }
+function escapeRegex(s) { return String(s).replace(/[.*+?^${}()|[\\\]\\]/g, '\\\\$&'); }
 
 /**
  * Overpass bbox query: bbox = [south, west, north, east]
@@ -159,7 +171,7 @@ function escapeRegex(s) { return String(s).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\
 async function queryOverpassByBBox(bbox, extraNameRegexes = [], limit = 200) {
   if (!bbox || bbox.length !== 4) throw new Error('Invalid bbox for Overpass query');
   const [south, west, north, east] = bbox;
-  const nameFilter = extraNameRegexes && extraNameRegexes.length ? `node[\"name\"~\"${extraNameRegexes.join('|')}\"](${south},${west},${north},${east});way[\"name\"~\"${extraNameRegexes.join('|')}\"](${south},${west},${north},${east});` : '';
+  const nameFilter = extraNameRegexes && extraNameRegexes.length ? `node["name"~"${extraNameRegexes.join('|')}"](${south},${west},${north},${east});way["name"~"${extraNameRegexes.join('|')}"](${south},${west},${north},${east});` : '';
   const q = `[out:json][timeout:25];
 (
   node["tourism"](${south},${west},${north},${east});
@@ -174,12 +186,11 @@ async function queryOverpassByBBox(bbox, extraNameRegexes = [], limit = 200) {
 );
 out center ${Math.min(limit, 500)};`;
   try {
-    const resp = await fetch(OVERPASS_URL, {
+    const resp = await fetchWithTimeout(OVERPASS_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': `itinerary-service/1.0 (${NOMINATIM_EMAIL || 'dev'})` },
-      body: `data=${encodeURIComponent(q)}`,
-      timeout: 30000
-    });
+      body: `data=${encodeURIComponent(q)}`
+    }, 30000);
     if (!resp.ok) {
       const t = await resp.text();
       throw new Error(`Overpass ${resp.status}: ${t.slice(0,200)}`);
