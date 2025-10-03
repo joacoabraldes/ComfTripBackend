@@ -6,15 +6,9 @@ const pool = require('../db');
 const auth = require('../middleware/auth');
 const router = express.Router();
 
-/**
- * Ensure a usable fetch + AbortController are available (global or via undici).
- * This helps avoid "fetch is not a function" in environments < Node 18.
- *
- * If you run into an error here, run: npm install undici
- */
+/* (fetch / AbortController bootstrapping unchanged) */
 let fetchImpl = null;
 let AbortControllerImpl = null;
-
 try {
   if (typeof globalThis.fetch === 'function') fetchImpl = globalThis.fetch;
 } catch (e) { /* ignore */ }
@@ -24,9 +18,7 @@ if (!fetchImpl) {
     const undici = require('undici');
     if (undici && typeof undici.fetch === 'function') fetchImpl = undici.fetch.bind(undici);
     if (!AbortControllerImpl && undici && undici.AbortController) AbortControllerImpl = undici.AbortController;
-  } catch (e) {
-    // undici not installed
-  }
+  } catch (e) {}
 }
 
 if (!AbortControllerImpl) {
@@ -35,24 +27,16 @@ if (!AbortControllerImpl) {
     try {
       const AC = require('abort-controller');
       if (AC && AC.AbortController) AbortControllerImpl = AC.AbortController;
-    } catch (e) {
-      // leave null — we'll handle gracefully
-      AbortControllerImpl = null;
-    }
+    } catch (e) { AbortControllerImpl = null; }
   }
 }
 
 if (!fetchImpl) {
   throw new Error('No fetch implementation found. Install node >=18 or run `npm install undici`.');
 }
-
-// wire global.fetch / global.AbortController if missing so other modules (routing, poi) can use them
 if (typeof globalThis.fetch !== 'function') globalThis.fetch = fetchImpl;
 if (AbortControllerImpl && typeof globalThis.AbortController !== 'function') globalThis.AbortController = AbortControllerImpl;
 
-/**
- * fetchWithTimeout: will use AbortController if available, otherwise a Promise.race fallback
- */
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
   if (AbortControllerImpl) {
     const controller = new AbortControllerImpl();
@@ -64,7 +48,6 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
       clearTimeout(id);
     }
   } else {
-    // Promise.race fallback (won't actually abort underlying request)
     return await Promise.race([
       fetchImpl(url, opts),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Fetch timeout')), timeoutMs))
@@ -72,9 +55,7 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
   }
 }
 
-/**
- * Helper: normalize trip row (keep same keys frontend expects)
- */
+/* helpers unchanged (normalizeTripRow, PLACES_AGG_SUBQUERY, haversineMeters) */
 function normalizeTripRow(row) {
   return {
     id: row.id,
@@ -88,9 +69,6 @@ function normalizeTripRow(row) {
   };
 }
 
-/**
- * SQL fragment used to aggregate trip_places + basic location info as JSON array.
- */
 const PLACES_AGG_SUBQUERY = `
   SELECT fk_trips,
          json_agg(json_build_object(
@@ -115,9 +93,6 @@ const PLACES_AGG_SUBQUERY = `
   GROUP BY fk_trips
 `;
 
-/**
- * Utility: Haversine distance (meters)
- */
 function haversineMeters(lat1, lon1, lat2, lon2) {
   if (
     lat1 === null ||
@@ -132,7 +107,7 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
     return Number.POSITIVE_INFINITY;
   }
   const toRad = (v) => (v * Math.PI) / 180;
-  const R = 6371000; // earth radius meters
+  const R = 6371000;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
   const a =
@@ -143,16 +118,15 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// services (assume they use global.fetch or their own fetchWithTimeout)
+/* services */
 const poiService = require('../services/poi.service');
 const routingService = require('../services/routing.service');
-const optimizer = require('../services/optimizer.service'); // should accept spec & travelMatrix
+const optimizer = require('../services/optimizer.service');
 
-// Helper: robust JSON extraction from model output
+/* Helper: robust JSON extraction from model output (unchanged) */
 function extractJsonFromText(text) {
   text = (text || '').trim();
   try { return JSON.parse(text); } catch (e) {}
-  // try to find first {..} or [..] block
   const o = text.indexOf('{'); const b = text.indexOf('[');
   const start = (o === -1) ? b : (b === -1 ? o : Math.min(o,b));
   if (start === -1) return null;
@@ -165,25 +139,42 @@ function extractJsonFromText(text) {
   return null;
 }
 
-// Call Hugging Face inference for a prompt (uses fetchWithTimeout)
-// Replace the existing callHF with this improved version.
+/* new helper: normalize/parse any HF/router return into JSON (object/array) */
+function parseHFResultToJson(hfResp) {
+  if (hfResp === null || hfResp === undefined) return null;
+  // Already a parsed JSON array/object
+  if (Array.isArray(hfResp) || (typeof hfResp === 'object' && !hfResp._text && !hfResp.choices)) {
+    return hfResp;
+  }
+
+  // Build candidate text
+  let text = '';
+  if (typeof hfResp === 'string') text = hfResp;
+  else if (hfResp._text) text = String(hfResp._text);
+  else if (hfResp.choices && Array.isArray(hfResp.choices)) {
+    text = hfResp.choices.map(c => (c.message?.content || c.text || '')).join('\n');
+  } else {
+    try { text = JSON.stringify(hfResp); } catch (e) { text = String(hfResp); }
+  }
+
+  // Try direct parse
+  try { return JSON.parse(text); } catch (e) {}
+  // Fallback: extract first JSON block
+  return extractJsonFromText(text);
+}
+
+/* Call Hugging Face inference for a prompt (uses fetchWithTimeout) - unchanged except logs */
 async function callHF(promptOrMessages, opts = {}) {
-  // Environment values
-  const rawModel = process.env.HF_MODEL;                 // e.g. "HuggingFaceTB/SmolLM3-3B" OR "HuggingFaceTB/SmolLM3-3B:hf-inference"
-  const token = process.env.HF_API_TOKEN;               // e.g. "hf_xxxxx..."
+  const rawModel = process.env.HF_MODEL;
+  const token = process.env.HF_API_TOKEN;
   const routerUrl = process.env.HF_ROUTER_URL || 'https://router.huggingface.co/v1/chat/completions';
-  const useRouterEnv = !!process.env.HF_USE_ROUTER;     // optional flag to force router
+  const useRouterEnv = !!process.env.HF_USE_ROUTER;
   if (!rawModel || !token) throw new Error('Please set HF_MODEL and HF_API_TOKEN env vars.');
 
-  // options defaults
   const max_new_tokens = opts.max_new_tokens ?? 1024;
   const temperature = typeof opts.temperature === 'number' ? opts.temperature : 0.2;
   const top_p = opts.top_p ?? 0.95;
   const timeout = opts.timeout || 120000;
-
-  // Decide route:
-  // - Use router if HF_ROUTER_URL set OR HF_USE_ROUTER=1 OR model slug contains ":" (the UI used "slug:hf-inference")
-  // - Otherwise use api-inference models route
   const shouldUseRouter = useRouterEnv || rawModel.includes(':') || (opts.forceRouter === true);
 
   const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
@@ -191,22 +182,13 @@ async function callHF(promptOrMessages, opts = {}) {
   let resp;
   try {
     if (shouldUseRouter) {
-      // Build messages array: if caller passed a string, convert to [{role:'user',content:...}]
       let messages = [];
       if (Array.isArray(promptOrMessages)) messages = promptOrMessages;
       else if (typeof promptOrMessages === 'string') messages = [{ role: 'user', content: promptOrMessages }];
       else if (promptOrMessages && promptOrMessages.messages) messages = promptOrMessages.messages;
       else messages = [{ role: 'user', content: String(promptOrMessages || '') }];
 
-      const body = {
-        model: rawModel,               // e.g. "HuggingFaceTB/SmolLM3-3B:hf-inference"
-        messages,
-        // HF router respects common params; include them for control
-        max_new_tokens,
-        temperature,
-        top_p,
-        // optional: you can pass other router-specific fields here
-      };
+      const body = { model: rawModel, messages, max_new_tokens, temperature, top_p };
 
       resp = await fetchWithTimeout(routerUrl, {
         method: 'POST',
@@ -215,7 +197,7 @@ async function callHF(promptOrMessages, opts = {}) {
       }, timeout);
 
       const text = await resp.text().catch(() => '');
-      console.log('HF router response status', resp.status, 'bodySnippet:', text.slice(0,2000));
+      console.log('HF router response status', resp.status, 'bodySnippet:', text.slice(0,5000));
       let json = null;
       try { json = JSON.parse(text); } catch (e) { json = null; }
 
@@ -223,26 +205,15 @@ async function callHF(promptOrMessages, opts = {}) {
         throw new Error(`Router HF ${resp.status}: ${text}`);
       }
 
-      // Normalize return: if chat-style response present, return the assistant content (or full object)
-      // Many router responses contain { choices: [ { message: { role: 'assistant', content: '...' } } ] }
       if (json && Array.isArray(json.choices) && json.choices.length && json.choices[0].message) {
-        // return the full JSON but keep a convenience `text` field
         json._text = String(json.choices.map(c => (c.message?.content ?? '')).join('\n')).trim();
         return json;
       }
       return json ?? text;
-
     } else {
-      // old inference model route (text-generation / single-input)
       const modelUrl = `https://api-inference.huggingface.co/models/${rawModel}`;
-      // Expect promptOrMessages to be a string for this path
       const promptString = (typeof promptOrMessages === 'string') ? promptOrMessages : JSON.stringify(promptOrMessages);
-
-      const body = {
-        inputs: promptString,
-        options: { wait_for_model: true, use_cache: false },
-        parameters: { max_new_tokens, temperature, top_p }
-      };
+      const body = { inputs: promptString, options: { wait_for_model: true, use_cache: false }, parameters: { max_new_tokens, temperature, top_p } };
 
       resp = await fetchWithTimeout(modelUrl, {
         method: 'POST',
@@ -259,27 +230,89 @@ async function callHF(promptOrMessages, opts = {}) {
       return parsed;
     }
   } catch (err) {
-    // rethrow with useful context
     throw new Error(`callHF error (router=${shouldUseRouter}): ${err?.message || err}`);
   }
 }
 
+/**
+ * Simple greedy itinerary generator used as a final fallback.
+ * Distributes topCandidates across days respecting daily_hours and visit_default_minutes.
+ */
+function simpleGreedyGenerator({ candidates, days, spec }) {
+  if (!Array.isArray(candidates) || candidates.length === 0) return [];
+  const visitDefault = Number(spec?.visit_default_minutes || 90);
+  const startMin = (() => {
+    const s = spec?.daily_hours?.start || '09:00';
+    return Number(s.slice(0,2)) * 60 + Number(s.slice(3,5) || 0);
+  })();
+  const endMin = (() => {
+    const e = spec?.daily_hours?.end || '18:00';
+    return Number(e.slice(0,2)) * 60 + Number(e.slice(3,5) || 0);
+  })();
+  const dayCapacity = Math.max(60, endMin - startMin);
+  // compute simple travel minutes between sequential items using haversine (assume walking/driving speed)
+  const speedMetersPerMin = 500; // ~30 km/h -> 500 m/min (adjustable)
+  // sort candidates descending by combined_score
+  const sorted = [...candidates].sort((a,b)=> (b.combined_score||0) - (a.combined_score||0));
+  const assigned = new Set();
+  const itinerary = [];
+  for (let d = 0; d < days.length; d++) {
+    const dayDate = days[d] instanceof Date ? days[d].toISOString().slice(0,10) : (new Date(days[d]).toISOString().slice(0,10));
+    let remaining = dayCapacity;
+    const visits = [];
+    let prev = null;
+    for (let i=0;i<sorted.length;i++) {
+      const cand = sorted[i];
+      if (assigned.has(cand.id)) continue;
+      // compute travel to this from prev
+      let travelMin = 0;
+      if (prev && cand.lat != null && prev.lat != null) {
+        const dist = haversineMeters(prev.lat, prev.lng, cand.lat, cand.lng);
+        travelMin = Math.ceil(dist / speedMetersPerMin);
+      } else {
+        travelMin = 10; // small default initial travel
+      }
+      const needed = travelMin + visitDefault;
+      if (needed <= remaining) {
+        visits.push({
+          id: cand.id,
+          titulo: cand.titulo,
+          visit_minutes: visitDefault,
+          travel_to_prev_minutes: travelMin,
+          reason: cand.llm_reason || null,
+          score: cand.combined_score || null
+        });
+        assigned.add(cand.id);
+        remaining -= needed;
+        prev = cand;
+      }
+      if (remaining < visitDefault + 5) break;
+    }
+    itinerary.push({ date: dayDate, visits });
+  }
+  // If nothing assigned (rare), assign at least one POI per day from top candidates
+  const anyAssigned = itinerary.some(d => (d.visits && d.visits.length));
+  if (!anyAssigned) {
+    const fallbackDays = [];
+    for (let d=0; d<days.length; d++) {
+      const dayDate = days[d] instanceof Date ? days[d].toISOString().slice(0,10) : (new Date(days[d]).toISOString().slice(0,10));
+      const cand = sorted[d % sorted.length];
+      fallbackDays.push({ date: dayDate, visits: [{ id: cand.id, titulo: cand.titulo, visit_minutes: visitDefault, travel_to_prev_minutes: 10, reason: 'fallback' }]});
+    }
+    return fallbackDays;
+  }
+  return itinerary;
+}
 
 /**
  * GET /trips/:id/itinerary
- * Implements Google-style hybrid: LLM->spec + LLM->POI scoring -> routing matrix -> optimizer (OR-Tools preferred) -> repair -> save
- *
- * Query params:
- *   - save=true => persist result
- *   - topK (default 20) => how many candidates to include in LLM prompts
- *   - mode: 'hf' (default) or 'greedy' to skip HF planning and use greedy
  */
 router.get('/:id/itinerary', auth, async (req, res) => {
   const tripId = Number(req.params.id);
   const userId = req.user.id;
   const save = req.query.save === 'true' || req.query.save === '1';
   const topK = Number(req.query.topK) || Number(process.env.LLM_TOP_K) || 20;
-  const mode = req.query.mode || 'hf'; // 'hf' or 'greedy'
+  const mode = req.query.mode || 'hf';
 
   if (!Number.isFinite(tripId) || tripId <= 0) return res.status(400).json({ message: 'Invalid trip id' });
 
@@ -299,7 +332,7 @@ router.get('/:id/itinerary', auth, async (req, res) => {
     );
     const interestSlugs = uiRes.rows.map(r => r.slug);
 
-    // derive country (best-effort)
+    // derive country
     let country = null;
     if (typeof trip.destination === 'string' && trip.destination.includes(',')) {
       const parts = trip.destination.split(',');
@@ -318,8 +351,7 @@ router.get('/:id/itinerary', auth, async (req, res) => {
     candidates.sort((a,b) => (b.relevancia || 0) - (a.relevancia || 0));
     const topCandidates = candidates.slice(0, topK);
 
-    // 4) Parse user preferences into a structured spec (LLM role 1)
-    // Build a compact spec prompt
+    // 4) Parse user preferences into a structured spec
     const prefPrompt = `
 You are a trip-spec parser. Input: user preferences and trip metadata. Output: EXACT JSON with keys:
 {
@@ -343,15 +375,18 @@ Return only JSON.
 `;
     let spec = null;
     try {
-      if (mode === 'hf') spec = await callHF(prefPrompt, { max_new_tokens: 300, temperature: 0.0 });
+      if (mode === 'hf') {
+        const hfRaw = await callHF(prefPrompt, { max_new_tokens: 300, temperature: 0.0 });
+        const parsed = parseHFResultToJson(hfRaw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) spec = parsed;
+        else throw new Error('Spec parse returned non-object');
+      }
     } catch (err) {
       console.warn('Spec parsing with HF failed, using heuristic fallback', err?.message || err);
-      // fallback heuristic
       spec = { daily_hours: { start: '09:00', end: '18:00' }, visit_default_minutes: 90, relaxation: 'moderate', must_visit: [], avoid: [], max_travel_minutes_per_day: 180 };
     }
 
-    // 5) Score POIs semantically with HF (LLM role 2) — batch to reduce calls
-    // Build compact POI payload
+    // 5) Score POIs semantically with HF (batched)
     const smallPois = topCandidates.map((p, idx) => ({
       id: p.id, title: p.titulo, interest: p.fk_interest, country: p.country, relevancia: p.relevancia || 0, idx
     }));
@@ -368,7 +403,8 @@ POIS: ${JSON.stringify(chunk)}
 Return only JSON.
 `;
         try {
-          const parsed = await callHF(scorePrompt, { max_new_tokens: 400, temperature: 0.0 });
+          const hfRaw = await callHF(scorePrompt, { max_new_tokens: 400, temperature: 0.0 });
+          const parsed = parseHFResultToJson(hfRaw);
           if (!Array.isArray(parsed)) throw new Error('HF scoring returned non-array');
           parsed.forEach(p => scoreResults.push(p));
         } catch (err) {
@@ -377,7 +413,6 @@ Return only JSON.
         }
       }
     } else {
-      // forced greedy mode: just heuristic score
       smallPois.forEach(c => scoreResults.push({ id: c.id, score: Math.max(1, Math.min(5, 1 + ((c.relevancia||0)/10)*4)), reason:'heuristic' }));
     }
 
@@ -387,43 +422,60 @@ Return only JSON.
       const s = scoreMap.get(p.id);
       p.llm_score = s ? Number(s.score) : 1.0;
       p.llm_reason = s ? String(s.reason).slice(0,200) : null;
-      // combined score: tweak weights as you like
       p.combined_score = ((p.relevancia || 0) * 0.6) + ((p.llm_score || 1) * 2.0);
     });
     topCandidates.sort((a,b)=> (b.combined_score || 0) - (a.combined_score || 0));
 
     // 6) compute travel matrix for topCandidates (seconds) via routing service
     const coords = topCandidates.map(c => ({ id: c.id, lat: c.lat, lng: c.lng }));
-    let travelMatrixSeconds = await routingService.getMatrix(coords); // routing.service should use global.fetch or its own fetchWithTimeout
+    let travelMatrixSeconds = null;
+    try {
+      travelMatrixSeconds = await routingService.getMatrix(coords);
+    } catch (err) {
+      console.warn('routingService.getMatrix failed:', err?.message || err);
+      travelMatrixSeconds = null;
+    }
 
-    // convert seconds->minutes for some solvers / prompt if needed
+    // Validate travelMatrixSeconds shape; fallback to a zero matrix (safe)
+    const n = topCandidates.length;
+    if (!Array.isArray(travelMatrixSeconds) || travelMatrixSeconds.length !== n ||
+        travelMatrixSeconds.some(row => !Array.isArray(row) || row.length !== n)) {
+      console.warn('Invalid travelMatrixSeconds, falling back to default zero matrix');
+      travelMatrixSeconds = Array.from({length: n}, (_,i) => Array.from({length: n}, (_,j) => (i===j?0: (topCandidates[i] && topCandidates[j] && topCandidates[i].lat && topCandidates[j].lat ?
+        Math.round(haversineMeters(topCandidates[i].lat, topCandidates[i].lng, topCandidates[j].lat, topCandidates[j].lng) / 10) : 600))));
+      // above: approximate seconds by distance/10 to avoid huge values; arbitrary safe fallback
+    }
+
+    // convert seconds->minutes if needed (kept for use by some modules)
     const travelMatrixMinutes = travelMatrixSeconds.map(row => row.map(v => (isFinite(v) ? Math.round(v/60) : null)));
 
-    // 7) call optimizer
+    // 7) call optimizer with try/catch. If it returns falsy or empty, use simpleGreedyGenerator
     let itinerary = null;
+    const daysArr = (() => { const s=new Date(trip.start_date), e=new Date(trip.end_date), days=[]; for(let d=new Date(s); d<=e; d.setDate(d.getDate()+1)) days.push(new Date(d)); return days; })();
+
     try {
       const useOrtools = (process.env.ITINERARY_MODE === 'ortools' || req.query.useOrtools === '1');
       itinerary = await optimizer.generateItinerary({
         mode: useOrtools ? 'ortools' : 'greedy',
         candidates: topCandidates,
-        days: (() => { const s=new Date(trip.start_date), e=new Date(trip.end_date), days=[]; for(let d=new Date(s); d<=e; d.setDate(d.getDate()+1)) days.push(new Date(d)); return days; })(),
+        days: daysArr,
         travelMatrix: travelMatrixSeconds,
         spec: spec,
         placesPerDay: null
       });
     } catch (err) {
       console.warn('Optimizer failed, falling back to greedy simple generator', err?.message || err);
-      itinerary = await optimizer.generateItinerary({
-        mode: 'greedy',
-        candidates: topCandidates,
-        days: (() => { const s=new Date(trip.start_date), e=new Date(trip.end_date), days=[]; for(let d=new Date(s); d<=e; d.setDate(d.getDate()+1)) days.push(new Date(d)); return days; })(),
-        travelMatrix: travelMatrixSeconds,
-        spec: spec,
-        placesPerDay: 4
-      });
+      itinerary = null;
     }
 
-    // 8) repair loop
+    // if optimizer returned null/empty or invalid format, attempt simple greedy
+    const validItinerary = Array.isArray(itinerary) && itinerary.length > 0 && itinerary.some(d => Array.isArray(d.visits) && d.visits.length > 0);
+    if (!validItinerary) {
+      console.warn('Optimizer produced no valid itinerary — using simpleGreedyGenerator fallback');
+      itinerary = simpleGreedyGenerator({ candidates: topCandidates, days: daysArr, spec });
+    }
+
+    // 8) repair loop (unchanged)
     function validateAndRepair(itin) {
       const maxDailyMinutes = spec.max_travel_minutes_per_day || 24*60;
       const startMin = Number(spec.daily_hours?.start?.slice(0,2)) * 60 + Number(spec.daily_hours?.start?.slice(3,5) || 0);
@@ -451,7 +503,7 @@ Return only JSON.
 
     itinerary = validateAndRepair(itinerary);
 
-    // 9) optionally save to DB if save=true (replace trip_places)
+    // 9) optionally save to DB if save=true
     const insertedPlaces = [];
     if (save) {
       client = await pool.connect();
@@ -488,11 +540,8 @@ Return only JSON.
   }
 });
 
+/* (other routes unchanged below) */
 
-/**
- * GET /trips
- * List trips for the authenticated user, including places as JSON array
- */
 router.get('/', auth, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -523,10 +572,6 @@ router.get('/', auth, async (req, res) => {
   }
 });
 
-/**
- * POST /trips
- * Create a trip. Optionally provide `places` array in body to insert trip_places in same transaction.
- */
 router.post('/', auth, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -588,17 +633,11 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
-/**
- * GET /trips/:id
- * Get a single trip with its places. Ownership check.
- *
- * NOTE: This route must be after /:id/itinerary above.
- */
+/* GET /trips/:id, PUT, DELETE, POST /trips/:id/places, DELETE /trips/:id/places/:placeId unchanged below - omitted for brevity in snippet */
 router.get('/:id', auth, async (req, res) => {
   try {
     const id = Number(req.params.id);
     const userId = req.user.id;
-
     const sql = `
       SELECT
         t.id, t.user_id, t.destination, t.start_date, t.end_date, t.budget, t.notes, t.created_at,
@@ -611,13 +650,10 @@ router.get('/:id', auth, async (req, res) => {
       LIMIT 1
     `;
     const result = await pool.query(sql, [id, userId]);
-
     if (!result.rows.length) return res.status(404).json({ message: 'No encontrado' });
-
     const row = result.rows[0];
     const trip = normalizeTripRow(row);
     trip.places = row.places || [];
-
     res.json(trip);
   } catch (err) {
     console.error('GET /trips/:id error:', err);

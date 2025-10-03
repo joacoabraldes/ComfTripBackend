@@ -5,14 +5,10 @@
 'use strict';
 
 /**
- * Robust fetch + AbortController detection:
- * - prefer global fetch / AbortController (Node 18+)
- * - fallback to undici (npm install undici)
- * - fallback to abort-controller (npm install abort-controller) only for AbortController
+ * Robust fetch + AbortController detection
  */
 let fetchImpl = null;
 let AbortControllerImpl = null;
-
 try {
   if (typeof globalThis.fetch === 'function') {
     fetchImpl = globalThis.fetch;
@@ -21,30 +17,22 @@ try {
 
 if (!fetchImpl) {
   try {
-    const undici = require('undici'); // recommended for CommonJS environments
+    const undici = require('undici');
     if (undici && typeof undici.fetch === 'function') {
       fetchImpl = undici.fetch.bind(undici);
     }
-    // undici may export AbortController
     if (!AbortControllerImpl && undici && undici.AbortController) AbortControllerImpl = undici.AbortController;
-  } catch (e) {
-    // ignore
-  }
+  } catch (e) {}
 }
 
-// fallback for AbortController
 if (!AbortControllerImpl) {
   if (typeof globalThis.AbortController === 'function') {
     AbortControllerImpl = globalThis.AbortController;
   } else {
     try {
-      // lightweight polyfill if needed
       const ac = require('abort-controller');
       if (ac && ac.AbortController) AbortControllerImpl = ac.AbortController;
-    } catch (e) {
-      // if still missing, we'll handle later by using Promise.race timeout
-      AbortControllerImpl = null;
-    }
+    } catch (e) { AbortControllerImpl = null; }
   }
 }
 
@@ -54,13 +42,8 @@ if (!fetchImpl) {
 
 const NOMINATIM_URL = process.env.NOMINATIM_URL || 'https://nominatim.openstreetmap.org/search';
 const OVERPASS_URL = process.env.OVERPASS_URL || 'https://overpass-api.de/api/interpreter';
-const NOMINATIM_EMAIL = process.env.NOMINATIM_EMAIL || ''; // put contact email to respect policies
+const NOMINATIM_EMAIL = process.env.NOMINATIM_EMAIL || '';
 
-/**
- * fetchWithTimeout:
- * - uses AbortController if available for actual abort
- * - otherwise uses Promise.race fallback (will not abort underlying socket)
- */
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
   if (AbortControllerImpl) {
     const controller = new AbortControllerImpl();
@@ -72,7 +55,6 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
       clearTimeout(id);
     }
   } else {
-    // Promise.race fallback (no deterministic abort)
     return await Promise.race([
       fetchImpl(url, opts),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Fetch timeout')), timeoutMs))
@@ -107,22 +89,45 @@ function normalizeDbRow(r) {
   };
 }
 
+/* --- OSM filtering + interest mapping --- */
+const OSM_UNWANTED_AMENITIES = new Set([
+  'parking','parking_space','bicycle_parking','post_box','bench','waste_basket','recycling','fuel','charging_station',
+  'bus_station','taxi','car_rental','bicycle_rental','toilets','public_building','community_centre'
+]);
+
+const OSM_UNWANTED_TOURISM = new Set(['hotel','guest_house','motel']);
+
+const INTEREST_TO_OSM = {
+  gastronomia: ['restaurant','cafe','bar','fast_food','pub'],
+  deportes: ['stadium','pitch','sports_centre','fitness_centre','leisure','pitch']
+};
+
 function normalizeOsmElement(el) {
   const tags = el.tags || {};
+  const amenity = tags.amenity || null;
+  const tourism = tags.tourism || null;
+  const leisure = tags.leisure || null;
+
+  // filter obvious service-only elements
+  if (amenity && OSM_UNWANTED_AMENITIES.has(amenity)) return null;
+  if (tourism && OSM_UNWANTED_TOURISM.has(tourism)) return null;
+
   const name = tags.name || tags['name:en'] || tags.int_name || null;
   const lat = el.lat !== undefined && el.lat !== null ? Number(el.lat) : (el.center && el.center.lat ? Number(el.center.lat) : null);
   const lon = el.lon !== undefined && el.lon !== null ? Number(el.lon) : (el.center && el.center.lon ? Number(el.center.lon) : null);
   const id = `osm-${el.type}-${el.id}`;
+  const titleFallback = amenity || tourism || leisure || tags.historic || 'unnamed';
   return {
     id,
-    titulo: name || (tags.amenity || tags.tourism || tags.historic || 'unnamed'),
+    titulo: name || titleFallback,
     fk_interest: null,
     lat: lat,
     lng: lon,
     imagenes: null,
     relevancia: 5,
     source: 'osm',
-    osm: { type: el.type, osm_id: el.id, tags }
+    osm: { type: el.type, osm_id: el.id, tags },
+    osmTag: amenity || tourism || leisure || null
   };
 }
 
@@ -183,7 +188,6 @@ function extractMustVisitsFromNotes(notes) {
 }
 
 async function geocodeDestination(query) {
-  // returns { lat, lon, bbox: [south,west,north,east], display_name } or null
   if (!query || !String(query).trim()) return null;
   const q = encodeURIComponent(String(query));
   const url = `${NOMINATIM_URL}?q=${q}&format=json&limit=3&addressdetails=1&polygon_geojson=0`;
@@ -197,13 +201,11 @@ async function geocodeDestination(query) {
     if (!resp.ok) throw new Error(`Nominatim ${resp.status}`);
     const data = await resp.json();
     if (!Array.isArray(data) || data.length === 0) return null;
-    // pick best result: prefer type=city/town/village if available
     let pick = data[0];
     for (const cand of data) {
       if (cand.type && ['city','town','village','municipality'].includes(cand.type)) { pick = cand; break; }
     }
-    const bbox = (pick.boundingbox || []).map(Number); // [south, north, west, east] (strings)
-    // normalize to [south,west,north,east]
+    const bbox = (pick.boundingbox || []).map(Number);
     let normBbox = null;
     if (bbox.length === 4) {
       normBbox = [bbox[0], bbox[2], bbox[1], bbox[3]]; // south, west, north, east
@@ -224,26 +226,63 @@ async function geocodeDestination(query) {
 function escapeRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\\\$&'); }
 
 /**
- * Overpass bbox query: bbox = [south, west, north, east]
- * We pick a compact set of tags: tourism, amenity, historic, leisure, shop (popular)
+ * queryOverpassByBBox now accepts interestSlugs to build focused queries when possible.
+ * bbox = [south, west, north, east]
  */
-async function queryOverpassByBBox(bbox, extraNameRegexes = [], limit = 200) {
+async function queryOverpassByBBox(bbox, extraNameRegexes = [], limit = 200, interestSlugs = []) {
   if (!bbox || bbox.length !== 4) throw new Error('Invalid bbox for Overpass query');
   const [south, west, north, east] = bbox;
+
+  // build tag clauses depending on interests
+  const clauses = [];
   const nameFilter = extraNameRegexes && extraNameRegexes.length ? `node["name"~"${extraNameRegexes.join('|')}"](${south},${west},${north},${east});way["name"~"${extraNameRegexes.join('|')}"](${south},${west},${north},${east});` : '';
+
+  if (Array.isArray(interestSlugs) && interestSlugs.length) {
+    // prioritize interest-specific amenity/leisure/tourism filters
+    const uniq = new Set(interestSlugs.map(s => String(s).toLowerCase()));
+    if (uniq.has('gastronomia')) {
+      clauses.push(`node["amenity"~"restaurant|cafe|bar|fast_food|pub"](${south},${west},${north},${east});`);
+      clauses.push(`way["amenity"~"restaurant|cafe|bar|fast_food|pub"](${south},${west},${north},${east});`);
+    }
+    if (uniq.has('deportes')) {
+      clauses.push(`node["leisure"~"pitch|sports_centre|stadium|fitness_centre|sports_hall"](${south},${west},${north},${east});`);
+      clauses.push(`way["leisure"~"pitch|sports_centre|stadium|fitness_centre|sports_hall"](${south},${west},${north},${east});`);
+      clauses.push(`node["tourism"~"stadium|sports_centre"](${south},${west},${north},${east});`);
+    }
+    // If we added some clauses, still include a small set of generic tags to avoid missing results
+    if (clauses.length === 0) {
+      clauses.push(
+        `node["tourism"](${south},${west},${north},${east});`,
+        `way["tourism"](${south},${west},${north},${east});`,
+        `node["amenity"](${south},${west},${north},${east});`,
+        `way["amenity"](${south},${west},${north},${east});`
+      );
+    } else {
+      // also include popular tourism/historic for variety
+      clauses.push(`node["tourism"](${south},${west},${north},${east});`);
+      clauses.push(`way["tourism"](${south},${west},${north},${east});`);
+    }
+  } else {
+    // default broad query
+    clauses.push(
+      `node["tourism"](${south},${west},${north},${east});`,
+      `way["tourism"](${south},${west},${north},${east});`,
+      `node["amenity"](${south},${west},${north},${east});`,
+      `way["amenity"](${south},${west},${north},${east});`,
+      `node["historic"](${south},${west},${north},${east});`,
+      `way["historic"](${south},${west},${north},${east});`,
+      `node["leisure"](${south},${west},${north},${east});`,
+      `way["leisure"](${south},${west},${north},${east});`
+    );
+  }
+
   const q = `[out:json][timeout:25];
 (
-  node["tourism"](${south},${west},${north},${east});
-  way["tourism"](${south},${west},${north},${east});
-  node["amenity"](${south},${west},${north},${east});
-  way["amenity"](${south},${west},${north},${east});
-  node["historic"](${south},${west},${north},${east});
-  way["historic"](${south},${west},${north},${east});
-  node["leisure"](${south},${west},${north},${east});
-  way["leisure"](${south},${west},${north},${east});
+  ${clauses.join('\n  ')}
   ${nameFilter}
 );
 out center ${Math.min(limit, 500)};`;
+
   try {
     const resp = await fetchWithTimeout(OVERPASS_URL, {
       method: 'POST',
@@ -256,7 +295,7 @@ out center ${Math.min(limit, 500)};`;
     }
     const body = await resp.json();
     const elements = body.elements || [];
-    const normalized = elements.map(normalizeOsmElement).filter(x => x.titulo && x.lat !== null && x.lng !== null);
+    const normalized = elements.map(normalizeOsmElement).filter(x => x && x.titulo && x.lat !== null && x.lng !== null);
     return normalized;
   } catch (err) {
     console.warn('queryOverpassByBBox failed:', err?.message || err);
@@ -267,8 +306,6 @@ out center ${Math.min(limit, 500)};`;
 /**
  * Main exported function
  * options: { db, interestSlugs, country, destination, limit, mustVisits, notes }
- *
- * IMPORTANT: prefer passing `destination` (string like "Berlin, Germany"). The service will geocode it.
  */
 async function getCandidates(options = {}) {
   const { db, interestSlugs = [], country = null, destination = null, limit = 300, mustVisits = [], notes = '' } = options;
@@ -277,32 +314,45 @@ async function getCandidates(options = {}) {
   const parsedMusts = extractMustVisitsFromNotes(notes || '');
   const explicitMusts = Array.from(new Set([...(mustVisits || []), ...parsedMusts])).slice(0, 20);
 
-  // 1) geocode destination to bbox & center (if present)
+  // 1) geocode destination
   let geo = null;
   if (destination) {
     geo = await geocodeDestination(destination);
   } else if (country) {
-    // try minimal geocode of country name if destination not provided
     geo = await geocodeDestination(country);
   }
 
-  // 2) Query DB but filter by proximity to geocoded center if available
+  // 2) Query DB but filter by interestSlugs when provided and proximity to geo center if available
   let rows = [];
   try {
-    // base DB query (no geographic filter) but limited
-    const q = `SELECT id, titulo, fk_interest, latitud, longitud, imagenes, relevancia, country FROM locations ORDER BY relevancia DESC NULLS LAST LIMIT $1`;
-    const r = await db.query(q, [limit]);
+    const q = `
+      SELECT l.id, l.titulo, l.fk_interest, l.latitud, l.longitud, l.imagenes, l.relevancia, l.country
+      FROM locations l
+      LEFT JOIN interests i ON i.id = l.fk_interest
+      WHERE ($2::text[] IS NULL OR i.slug = ANY($2))
+      ORDER BY l.relevancia DESC NULLS LAST
+      LIMIT $1
+    `;
+    const interestParam = (Array.isArray(interestSlugs) && interestSlugs.length) ? interestSlugs : null;
+    const r = await db.query(q, [limit, interestParam]);
     rows = r.rows || [];
   } catch (err) {
     console.warn('DB candidate fetch failed:', err?.message || err);
     rows = [];
   }
 
-  // normalize DB rows and optionally filter by distance: if geo is present, keep only within radius (e.g., 50km)
   const dbCandidatesAll = (rows || []).map(normalizeDbRow);
   let dbCandidates = dbCandidatesAll;
+
   if (geo && geo.lat && geo.lon) {
-    const radiusMeters = Number(process.env.POI_DB_RADIUS_METERS || 50000); // default 50km
+    // derive radius from bbox diagonal if available
+    let radiusMeters = Number(process.env.POI_DB_RADIUS_METERS || 50000);
+    if (Array.isArray(geo.bbox) && geo.bbox.length === 4) {
+      const [s, w, n, e] = geo.bbox;
+      const diagonal = Math.round(haversineMeters(s, w, n, e));
+      // clamp radius to sensible limits
+      radiusMeters = Math.max(5000, Math.min(50000, Math.round(diagonal / 2)));
+    }
     dbCandidates = dbCandidatesAll.filter(c => {
       if (c.lat === null || c.lng === null) return false;
       const d = haversineMeters(geo.lat, geo.lon, c.lat, c.lng);
@@ -310,63 +360,64 @@ async function getCandidates(options = {}) {
     });
   }
 
-  // 3) If DB returned few results or mustVisits not present in DB, query OSM via bbox
+  // 3) Query OSM when needed (pass interestSlugs for focused queries)
   let osmCandidates = [];
   const needExtra = dbCandidates.length < Math.min(limit, 60) || explicitMusts.length > 0 || !geo;
   if (geo && (needExtra || dbCandidates.length === 0)) {
-    // build regex list for mustVisits to prioritize
     const nameRegexes = explicitMusts.map(s => escapeRegex(s)).slice(0, 10);
     try {
-      const bbox = geo.bbox; // [south,west,north,east]
+      const bbox = geo.bbox;
       if (bbox && bbox.length === 4) {
-        osmCandidates = await queryOverpassByBBox(bbox, nameRegexes, Math.max(100, limit - dbCandidates.length));
+        osmCandidates = await queryOverpassByBBox(bbox, nameRegexes, Math.max(100, limit - dbCandidates.length), interestSlugs);
       } else {
-        // fallback: search small bbox around center
-        const delta = 0.25; // ~25km depending on lat
+        const delta = 0.25;
         const bbox2 = [geo.lat - delta, geo.lon - delta, geo.lat + delta, geo.lon + delta];
-        osmCandidates = await queryOverpassByBBox(bbox2, nameRegexes, Math.max(50, limit - dbCandidates.length));
+        osmCandidates = await queryOverpassByBBox(bbox2, nameRegexes, Math.max(50, limit - dbCandidates.length), interestSlugs);
       }
     } catch (err) {
       console.warn('Overpass bbox query failed:', err?.message || err);
       osmCandidates = [];
     }
   } else if (!geo) {
-    // no geocode at all: attempt a small Overpass search around some DB candidate (if any)
     if (dbCandidates.length) {
       const c = dbCandidates[0];
       if (c.lat && c.lng) {
         const delta = 0.25;
         try {
-          osmCandidates = await queryOverpassByBBox([c.lat-delta, c.lng-delta, c.lat+delta, c.lng+delta], [], 100);
+          osmCandidates = await queryOverpassByBBox([c.lat-delta, c.lng-delta, c.lat+delta, c.lng+delta], [], 100, interestSlugs);
         } catch (err) { osmCandidates = []; }
       }
     }
   }
 
-  // 4) Merge & dedupe OSM + DB
+  // 4) Merge & dedupe
   let candidates = dedupeMerge(dbCandidates, osmCandidates, 75);
 
-  // 5) Ensure explicit mustVisits are included: if a must-visit name wasn't matched, attempt to find by name in OSM (small focused search)
+  // 5) Ensure explicit mustVisits are included
   if (explicitMusts.length && geo) {
     for (const mv of explicitMusts) {
       const present = candidates.find(c => c.titulo && c.titulo.toLowerCase().includes(mv.toLowerCase()));
       if (!present) {
-        // query Overpass for the name inside bbox
         try {
           const nameRegex = escapeRegex(mv);
-          const more = await queryOverpassByBBox(geo.bbox || [geo.lat-0.25, geo.lon-0.25, geo.lat+0.25, geo.lon+0.25], [nameRegex], 20);
-          if (more && more.length) {
-            candidates = dedupeMerge(candidates, more, 50);
-          }
-        } catch (err) {
-          // ignore
-        }
+          const more = await queryOverpassByBBox(geo.bbox || [geo.lat-0.25, geo.lon-0.25, geo.lat+0.25, geo.lon+0.25], [nameRegex], 20, interestSlugs);
+          if (more && more.length) candidates = dedupeMerge(candidates, more, 50);
+        } catch (err) {}
       }
     }
   }
 
-  // 6) Final scoring and normalization: compute combined_score and mark isMust
+  // 6) Final scoring and interest-boosting
   const maxRelev = Math.max(1, ...candidates.map(c => c.relevancia || 0));
+  // build interest -> osmTag set
+  const interestTags = new Set();
+  if (Array.isArray(interestSlugs)) {
+    for (const s of interestSlugs) {
+      const tags = INTEREST_TO_OSM[s];
+      if (Array.isArray(tags)) tags.forEach(t => interestTags.add(t));
+    }
+  }
+
   candidates = candidates.map(c => {
     const lat = c.lat !== null && c.lat !== undefined ? Number(c.lat) : null;
     const lng = c.lng !== null && c.lng !== undefined ? Number(c.lng) : null;
@@ -374,11 +425,18 @@ async function getCandidates(options = {}) {
     if (explicitMusts.length && c.titulo) {
       for (const mv of explicitMusts) { if (c.titulo.toLowerCase().includes(mv.toLowerCase())) { isMust = true; break; } }
     }
-    const base = (c.relevancia || 0) / maxRelev; // 0..1
+    const base = (c.relevancia || 0) / maxRelev;
     const osmBoost = (c.source && String(c.source).includes('osm')) ? 0.2 : 0;
     const mustBoost = isMust ? 1.5 : 0;
-    const combined = (base * 3.0) + osmBoost + mustBoost;
-    // compute distance to center if geo present
+    // interest boost if osmTag or fk_interest matches user's interests
+    let interestBoost = 0;
+    if (c.osm && c.osm.tags) {
+      const amen = (c.osm.tags.amenity || c.osm.tags.tourism || c.osm.tags.leisure || '').toString().toLowerCase();
+      if (interestTags.has(amen)) interestBoost += 1.2;
+    }
+    // if fk_interest present, give small boost (mapping of ids->slugs assumed in DB)
+    // This is conservative: we don't attempt to resolve id->slug here.
+    const combined = (base * 3.0) + osmBoost + mustBoost + interestBoost;
     const distanceToCenter = (geo && geo.lat && lat && lng) ? Math.round(haversineMeters(geo.lat, geo.lon, lat, lng)) : null;
     return {
       id: c.id,
