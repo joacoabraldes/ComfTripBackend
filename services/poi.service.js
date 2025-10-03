@@ -2,21 +2,81 @@
 // Improved POI fetcher that geocodes the trip destination and queries OSM using bbox.
 // Also filters DB results by proximity to the geocoded center to avoid returning far-away DB rows.
 
-const { fetch, AbortController } = require('undici');
+'use strict';
+
+/**
+ * Robust fetch + AbortController detection:
+ * - prefer global fetch / AbortController (Node 18+)
+ * - fallback to undici (npm install undici)
+ * - fallback to abort-controller (npm install abort-controller) only for AbortController
+ */
+let fetchImpl = null;
+let AbortControllerImpl = null;
+
+try {
+  if (typeof globalThis.fetch === 'function') {
+    fetchImpl = globalThis.fetch;
+  }
+} catch (e) {}
+
+if (!fetchImpl) {
+  try {
+    const undici = require('undici'); // recommended for CommonJS environments
+    if (undici && typeof undici.fetch === 'function') {
+      fetchImpl = undici.fetch.bind(undici);
+    }
+    // undici may export AbortController
+    if (!AbortControllerImpl && undici && undici.AbortController) AbortControllerImpl = undici.AbortController;
+  } catch (e) {
+    // ignore
+  }
+}
+
+// fallback for AbortController
+if (!AbortControllerImpl) {
+  if (typeof globalThis.AbortController === 'function') {
+    AbortControllerImpl = globalThis.AbortController;
+  } else {
+    try {
+      // lightweight polyfill if needed
+      const ac = require('abort-controller');
+      if (ac && ac.AbortController) AbortControllerImpl = ac.AbortController;
+    } catch (e) {
+      // if still missing, we'll handle later by using Promise.race timeout
+      AbortControllerImpl = null;
+    }
+  }
+}
+
+if (!fetchImpl) {
+  throw new Error('No fetch implementation found. Install node >=18 or `npm install undici`.');
+}
 
 const NOMINATIM_URL = process.env.NOMINATIM_URL || 'https://nominatim.openstreetmap.org/search';
 const OVERPASS_URL = process.env.OVERPASS_URL || 'https://overpass-api.de/api/interpreter';
 const NOMINATIM_EMAIL = process.env.NOMINATIM_EMAIL || ''; // put contact email to respect policies
 
-// fetchWithTimeout helper using AbortController (undici)
+/**
+ * fetchWithTimeout:
+ * - uses AbortController if available for actual abort
+ * - otherwise uses Promise.race fallback (will not abort underlying socket)
+ */
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { ...opts, signal: controller.signal });
-    return res;
-  } finally {
-    clearTimeout(id);
+  if (AbortControllerImpl) {
+    const controller = new AbortControllerImpl();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetchImpl(url, { ...opts, signal: controller.signal });
+      return res;
+    } finally {
+      clearTimeout(id);
+    }
+  } else {
+    // Promise.race fallback (no deterministic abort)
+    return await Promise.race([
+      fetchImpl(url, opts),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Fetch timeout')), timeoutMs))
+    ]);
   }
 }
 
@@ -114,7 +174,7 @@ function extractMustVisitsFromNotes(notes) {
     const p = (m[1] || m[2] || '').trim();
     if (p) found.add(p);
   }
-  const mustRe = /(?:must visit|want to visit|visit|must-see)\s*[:\\-]?\s*([^.\n]{3,80})/ig;
+  const mustRe = /(?:must visit|want to visit|visit|must-see)\s*[:\-\s]?\s*([^.\n]{3,80})/ig;
   while ((m = mustRe.exec(notes)) !== null) {
     const p = (m[1] || '').split(/[;,\n]/)[0].trim();
     if (p) found.add(p);
@@ -126,7 +186,6 @@ async function geocodeDestination(query) {
   // returns { lat, lon, bbox: [south,west,north,east], display_name } or null
   if (!query || !String(query).trim()) return null;
   const q = encodeURIComponent(String(query));
-  // Nominatim requires a proper user-agent / email when sending many requests
   const url = `${NOMINATIM_URL}?q=${q}&format=json&limit=3&addressdetails=1&polygon_geojson=0`;
   const headers = {
     'User-Agent': `itinerary-service/1.0 (${NOMINATIM_EMAIL || 'dev'})`,
@@ -162,7 +221,7 @@ async function geocodeDestination(query) {
   }
 }
 
-function escapeRegex(s) { return String(s).replace(/[.*+?^${}()|[\\\]\\]/g, '\\\\$&'); }
+function escapeRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\\\$&'); }
 
 /**
  * Overpass bbox query: bbox = [south, west, north, east]

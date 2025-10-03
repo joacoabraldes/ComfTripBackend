@@ -1,8 +1,76 @@
 // controllers/trip.controller.js
+'use strict';
+
 const express = require('express');
 const pool = require('../db');
 const auth = require('../middleware/auth');
 const router = express.Router();
+
+/**
+ * Ensure a usable fetch + AbortController are available (global or via undici).
+ * This helps avoid "fetch is not a function" in environments < Node 18.
+ *
+ * If you run into an error here, run: npm install undici
+ */
+let fetchImpl = null;
+let AbortControllerImpl = null;
+
+try {
+  if (typeof globalThis.fetch === 'function') fetchImpl = globalThis.fetch;
+} catch (e) { /* ignore */ }
+
+if (!fetchImpl) {
+  try {
+    const undici = require('undici');
+    if (undici && typeof undici.fetch === 'function') fetchImpl = undici.fetch.bind(undici);
+    if (!AbortControllerImpl && undici && undici.AbortController) AbortControllerImpl = undici.AbortController;
+  } catch (e) {
+    // undici not installed
+  }
+}
+
+if (!AbortControllerImpl) {
+  if (typeof globalThis.AbortController === 'function') AbortControllerImpl = globalThis.AbortController;
+  else {
+    try {
+      const AC = require('abort-controller');
+      if (AC && AC.AbortController) AbortControllerImpl = AC.AbortController;
+    } catch (e) {
+      // leave null — we'll handle gracefully
+      AbortControllerImpl = null;
+    }
+  }
+}
+
+if (!fetchImpl) {
+  throw new Error('No fetch implementation found. Install node >=18 or run `npm install undici`.');
+}
+
+// wire global.fetch / global.AbortController if missing so other modules (routing, poi) can use them
+if (typeof globalThis.fetch !== 'function') globalThis.fetch = fetchImpl;
+if (AbortControllerImpl && typeof globalThis.AbortController !== 'function') globalThis.AbortController = AbortControllerImpl;
+
+/**
+ * fetchWithTimeout: will use AbortController if available, otherwise a Promise.race fallback
+ */
+async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
+  if (AbortControllerImpl) {
+    const controller = new AbortControllerImpl();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetchImpl(url, { ...opts, signal: controller.signal });
+      return res;
+    } finally {
+      clearTimeout(id);
+    }
+  } else {
+    // Promise.race fallback (won't actually abort underlying request)
+    return await Promise.race([
+      fetchImpl(url, opts),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Fetch timeout')), timeoutMs))
+    ]);
+  }
+}
 
 /**
  * Helper: normalize trip row (keep same keys frontend expects)
@@ -75,12 +143,10 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// inside controllers/trip.controller.js near the top:
-const fetch = require('undici'); // if Node < 18
+// services (assume they use global.fetch or their own fetchWithTimeout)
 const poiService = require('../services/poi.service');
 const routingService = require('../services/routing.service');
 const optimizer = require('../services/optimizer.service'); // should accept spec & travelMatrix
-// pool, auth, router already declared in your file
 
 // Helper: robust JSON extraction from model output
 function extractJsonFromText(text) {
@@ -99,7 +165,7 @@ function extractJsonFromText(text) {
   return null;
 }
 
-// Call Hugging Face inference for a prompt
+// Call Hugging Face inference for a prompt (uses fetchWithTimeout)
 async function callHF(prompt, opts = {}) {
   const model = process.env.HF_MODEL;
   const token = process.env.HF_API_TOKEN;
@@ -114,13 +180,23 @@ async function callHF(prompt, opts = {}) {
       top_p: opts.top_p ?? 0.95
     }
   };
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    timeout: opts.timeout || 120000
-  });
-  const text = await resp.text();
+
+  const timeout = opts.timeout || 120000;
+  const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+
+  let resp;
+  try {
+    resp = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body)
+    }, timeout);
+  } catch (err) {
+    // rethrow with context
+    throw new Error(`HF fetch failed: ${err?.message || err}`);
+  }
+
+  const text = await resp.text().catch(() => '');
   if (!resp.ok) throw new Error(`HF ${resp.status}: ${text}`);
   const parsed = extractJsonFromText(text);
   if (!parsed) throw new Error('Could not parse JSON from HF response');
@@ -256,24 +332,22 @@ Return only JSON.
 
     // 6) compute travel matrix for topCandidates (seconds) via routing service
     const coords = topCandidates.map(c => ({ id: c.id, lat: c.lat, lng: c.lng }));
-    let travelMatrixSeconds = await routingService.getMatrix(coords); // fallback is haversine-based inside service
+    let travelMatrixSeconds = await routingService.getMatrix(coords); // routing.service should use global.fetch or its own fetchWithTimeout
 
     // convert seconds->minutes for some solvers / prompt if needed
     const travelMatrixMinutes = travelMatrixSeconds.map(row => row.map(v => (isFinite(v) ? Math.round(v/60) : null)));
 
-    // 7) call optimizer: prefer OR-Tools VRP with time windows (mode 'ortools'), else greedy fallback.
-    // Pass the spec (visit_default_minutes, daily window) and travelMatrixSeconds.
+    // 7) call optimizer
     let itinerary = null;
     try {
-      // if you have OR-Tools python solver ready, call with mode 'ortools' by setting ITINERARY_MODE env var
       const useOrtools = (process.env.ITINERARY_MODE === 'ortools' || req.query.useOrtools === '1');
       itinerary = await optimizer.generateItinerary({
         mode: useOrtools ? 'ortools' : 'greedy',
         candidates: topCandidates,
         days: (() => { const s=new Date(trip.start_date), e=new Date(trip.end_date), days=[]; for(let d=new Date(s); d<=e; d.setDate(d.getDate()+1)) days.push(new Date(d)); return days; })(),
         travelMatrix: travelMatrixSeconds,
-        spec: spec, // includes visit_default_minutes and max_travel_minutes_per_day etc.
-        placesPerDay: null // intentionally allow optimizer to decide; greedy fallback will use an internal heuristic
+        spec: spec,
+        placesPerDay: null
       });
     } catch (err) {
       console.warn('Optimizer failed, falling back to greedy simple generator', err?.message || err);
@@ -283,31 +357,29 @@ Return only JSON.
         days: (() => { const s=new Date(trip.start_date), e=new Date(trip.end_date), days=[]; for(let d=new Date(s); d<=e; d.setDate(d.getDate()+1)) days.push(new Date(d)); return days; })(),
         travelMatrix: travelMatrixSeconds,
         spec: spec,
-        placesPerDay: 4 // fallback heuristic
+        placesPerDay: 4
       });
     }
 
-    // 8) repair loop: validate that each day's visits fit daily_hours and travel estimates; if a day violates hard constraint, remove lowest combined_score POI(s) from that day and re-run small local repair.
+    // 8) repair loop
     function validateAndRepair(itin) {
       const maxDailyMinutes = spec.max_travel_minutes_per_day || 24*60;
       const startMin = Number(spec.daily_hours?.start?.slice(0,2)) * 60 + Number(spec.daily_hours?.start?.slice(3,5) || 0);
       const endMin = Number(spec.daily_hours?.end?.slice(0,2)) * 60 + Number(spec.daily_hours?.end?.slice(3,5) || 0);
       const dayCapacity = Math.max(60, endMin - startMin);
-      // simple pass: if any day's total visit_minutes + travel_to_prev_minutes > dayCapacity, drop lowest-scoring visit(s)
       for (const day of itin) {
         let total = 0;
         for (const v of day.visits || []) {
           total += (v.visit_minutes || spec.visit_default_minutes || 90) + (v.travel_to_prev_minutes || 0);
         }
         if (total > dayCapacity || total > maxDailyMinutes) {
-          // drop lowest combined score visit(s) until fits
           day.visits.sort((a,b)=> {
             const ca = topCandidates.find(x=>x.id===a.id)?.combined_score || 0;
             const cb = topCandidates.find(x=>x.id===b.id)?.combined_score || 0;
-            return ca - cb; // ascending
+            return ca - cb;
           });
           while (day.visits.length && (total > dayCapacity || total > maxDailyMinutes)) {
-            const removed = day.visits.shift(); // remove least valuable
+            const removed = day.visits.shift();
             total -= (removed.visit_minutes || spec.visit_default_minutes || 90) + (removed.travel_to_prev_minutes || 0);
           }
         }
