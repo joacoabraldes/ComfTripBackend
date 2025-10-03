@@ -166,42 +166,104 @@ function extractJsonFromText(text) {
 }
 
 // Call Hugging Face inference for a prompt (uses fetchWithTimeout)
-async function callHF(prompt, opts = {}) {
-  const model = process.env.HF_MODEL;
-  const token = process.env.HF_API_TOKEN;
-  if (!model || !token) throw new Error('Please set HF_MODEL and HF_API_TOKEN env vars.');
-  const url = `https://api-inference.huggingface.co/models/${model}`;
-  const body = {
-    inputs: prompt,
-    options: { wait_for_model: true, use_cache: false },
-    parameters: {
-      max_new_tokens: opts.max_new_tokens || 1024,
-      temperature: typeof opts.temperature === 'number' ? opts.temperature : 0.2,
-      top_p: opts.top_p ?? 0.95
-    }
-  };
+// Replace the existing callHF with this improved version.
+async function callHF(promptOrMessages, opts = {}) {
+  // Environment values
+  const rawModel = process.env.HF_MODEL;                 // e.g. "HuggingFaceTB/SmolLM3-3B" OR "HuggingFaceTB/SmolLM3-3B:hf-inference"
+  const token = process.env.HF_API_TOKEN;               // e.g. "hf_xxxxx..."
+  const routerUrl = process.env.HF_ROUTER_URL || 'https://router.huggingface.co/v1/chat/completions';
+  const useRouterEnv = !!process.env.HF_USE_ROUTER;     // optional flag to force router
+  if (!rawModel || !token) throw new Error('Please set HF_MODEL and HF_API_TOKEN env vars.');
 
+  // options defaults
+  const max_new_tokens = opts.max_new_tokens ?? 1024;
+  const temperature = typeof opts.temperature === 'number' ? opts.temperature : 0.2;
+  const top_p = opts.top_p ?? 0.95;
   const timeout = opts.timeout || 120000;
+
+  // Decide route:
+  // - Use router if HF_ROUTER_URL set OR HF_USE_ROUTER=1 OR model slug contains ":" (the UI used "slug:hf-inference")
+  // - Otherwise use api-inference models route
+  const shouldUseRouter = useRouterEnv || rawModel.includes(':') || (opts.forceRouter === true);
+
   const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
 
   let resp;
   try {
-    resp = await fetchWithTimeout(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body)
-    }, timeout);
-  } catch (err) {
-    // rethrow with context
-    throw new Error(`HF fetch failed: ${err?.message || err}`);
-  }
+    if (shouldUseRouter) {
+      // Build messages array: if caller passed a string, convert to [{role:'user',content:...}]
+      let messages = [];
+      if (Array.isArray(promptOrMessages)) messages = promptOrMessages;
+      else if (typeof promptOrMessages === 'string') messages = [{ role: 'user', content: promptOrMessages }];
+      else if (promptOrMessages && promptOrMessages.messages) messages = promptOrMessages.messages;
+      else messages = [{ role: 'user', content: String(promptOrMessages || '') }];
 
-  const text = await resp.text().catch(() => '');
-  if (!resp.ok) throw new Error(`HF ${resp.status}: ${text}`);
-  const parsed = extractJsonFromText(text);
-  if (!parsed) throw new Error('Could not parse JSON from HF response');
-  return parsed;
+      const body = {
+        model: rawModel,               // e.g. "HuggingFaceTB/SmolLM3-3B:hf-inference"
+        messages,
+        // HF router respects common params; include them for control
+        max_new_tokens,
+        temperature,
+        top_p,
+        // optional: you can pass other router-specific fields here
+      };
+
+      resp = await fetchWithTimeout(routerUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body)
+      }, timeout);
+
+      const text = await resp.text().catch(() => '');
+      console.log('HF router response status', resp.status, 'bodySnippet:', text.slice(0,2000));
+      let json = null;
+      try { json = JSON.parse(text); } catch (e) { json = null; }
+
+      if (!resp.ok) {
+        throw new Error(`Router HF ${resp.status}: ${text}`);
+      }
+
+      // Normalize return: if chat-style response present, return the assistant content (or full object)
+      // Many router responses contain { choices: [ { message: { role: 'assistant', content: '...' } } ] }
+      if (json && Array.isArray(json.choices) && json.choices.length && json.choices[0].message) {
+        // return the full JSON but keep a convenience `text` field
+        json._text = String(json.choices.map(c => (c.message?.content ?? '')).join('\n')).trim();
+        return json;
+      }
+      return json ?? text;
+
+    } else {
+      // old inference model route (text-generation / single-input)
+      const modelUrl = `https://api-inference.huggingface.co/models/${rawModel}`;
+      // Expect promptOrMessages to be a string for this path
+      const promptString = (typeof promptOrMessages === 'string') ? promptOrMessages : JSON.stringify(promptOrMessages);
+
+      const body = {
+        inputs: promptString,
+        options: { wait_for_model: true, use_cache: false },
+        parameters: { max_new_tokens, temperature, top_p }
+      };
+
+      resp = await fetchWithTimeout(modelUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body)
+      }, timeout);
+
+      const text = await resp.text().catch(() => '');
+      console.log('HF model response status', resp.status, 'bodySnippet:', text.slice(0,1200));
+      if (!resp.ok) throw new Error(`HF ${resp.status}: ${text}`);
+
+      const parsed = extractJsonFromText(text);
+      if (!parsed) throw new Error('Could not parse JSON from HF response');
+      return parsed;
+    }
+  } catch (err) {
+    // rethrow with useful context
+    throw new Error(`callHF error (router=${shouldUseRouter}): ${err?.message || err}`);
+  }
 }
+
 
 /**
  * GET /trips/:id/itinerary
