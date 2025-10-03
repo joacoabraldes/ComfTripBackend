@@ -503,8 +503,9 @@ Return only JSON.
 
     itinerary = validateAndRepair(itinerary);
 
-    // 9) optionally save to DB if save=true
+        // 9) optionally save to DB if save=true (replace trip_places)
     const insertedPlaces = [];
+    const skippedPlaces = [];
     if (save) {
       client = await pool.connect();
       try {
@@ -513,11 +514,54 @@ Return only JSON.
         if (!check.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Trip not found' }); }
         if (check.rows[0].user_id !== userId) { await client.query('ROLLBACK'); return res.status(403).json({ message:'No autorizado' }); }
 
+        // remove existing places for trip
         await client.query('DELETE FROM trip_places WHERE fk_trips = $1', [tripId]);
+
         const insertSQL = 'INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, fk_locations, fk_trips, date, start_hour, end_hour, notes, created_at';
+
         for (const day of itinerary) {
           for (const v of day.visits || []) {
-            const r = await client.query(insertSQL, [v.id, tripId, day.date, v.start, v.end, v.reason || null]);
+            // Attempt to resolve a numeric fk_location id safely:
+            let fk_location = null;
+
+            // 1) If visit id is numeric string or number, use it
+            if (v && (typeof v.id === 'number' || (/^\d+$/.test(String(v.id)).valueOf()))) {
+              // numeric id
+              const n = Number(v.id);
+              if (Number.isFinite(n)) fk_location = n;
+            }
+
+            // 2) If we didn't get numeric id, try to match against the topCandidates by id or title
+            if (!fk_location) {
+              // topCandidates is in outer scope; find candidate object
+              const candidate = topCandidates.find(x => String(x.id) === String(v.id) || (v.titulo && String(x.titulo) === String(v.titulo)));
+              if (candidate && typeof candidate.id === 'number') {
+                fk_location = candidate.id;
+              }
+            }
+
+            // 3) Fallback: try to find a DB location by title (case-insensitive)
+            if (!fk_location && (v.titulo || v.name || v.title)) {
+              const titleToMatch = (v.titulo || v.name || v.title).trim();
+              if (titleToMatch.length) {
+                const found = await client.query('SELECT id FROM locations WHERE lower(titulo) = lower($1) LIMIT 1', [titleToMatch]);
+                if (found.rows.length) fk_location = found.rows[0].id;
+                else {
+                  // try ILIKE with wildcard to be more forgiving
+                  const found2 = await client.query('SELECT id FROM locations WHERE titulo ILIKE $1 LIMIT 1', [`%${titleToMatch}%`]);
+                  if (found2.rows.length) fk_location = found2.rows[0].id;
+                }
+              }
+            }
+
+            // 4) If still not resolved, skip this visit (it's likely an osm-only id like "osm-node-...")
+            if (!fk_location) {
+              skippedPlaces.push({ id: v.id, titulo: v.titulo || null, reason: 'Could not resolve to DB location id; skipped saving' });
+              continue;
+            }
+
+            // Insert resolved place
+            const r = await client.query(insertSQL, [fk_location, tripId, day.date, v.start || null, v.end || null, v.reason || null]);
             insertedPlaces.push(r.rows[0]);
           }
         }
@@ -531,7 +575,7 @@ Return only JSON.
       }
     }
 
-    return res.json({ itinerary, saved: !!save, insertedCount: insertedPlaces.length, insertedPlaces });
+    return res.json({ itinerary, saved: !!save, insertedCount: insertedPlaces.length, insertedPlaces, skippedPlaces });
 
   } catch (err) {
     if (client) { await client.query('ROLLBACK').catch(()=>{}); client.release(); }

@@ -208,6 +208,7 @@ async function geocodeDestination(query) {
     const bbox = (pick.boundingbox || []).map(Number);
     let normBbox = null;
     if (bbox.length === 4) {
+      // boundingbox from Nominatim is [south, north, west, east] as strings
       normBbox = [bbox[0], bbox[2], bbox[1], bbox[3]]; // south, west, north, east
     }
     return {
@@ -238,7 +239,6 @@ async function queryOverpassByBBox(bbox, extraNameRegexes = [], limit = 200, int
   const nameFilter = extraNameRegexes && extraNameRegexes.length ? `node["name"~"${extraNameRegexes.join('|')}"](${south},${west},${north},${east});way["name"~"${extraNameRegexes.join('|')}"](${south},${west},${north},${east});` : '';
 
   if (Array.isArray(interestSlugs) && interestSlugs.length) {
-    // prioritize interest-specific amenity/leisure/tourism filters
     const uniq = new Set(interestSlugs.map(s => String(s).toLowerCase()));
     if (uniq.has('gastronomia')) {
       clauses.push(`node["amenity"~"restaurant|cafe|bar|fast_food|pub"](${south},${west},${north},${east});`);
@@ -249,7 +249,6 @@ async function queryOverpassByBBox(bbox, extraNameRegexes = [], limit = 200, int
       clauses.push(`way["leisure"~"pitch|sports_centre|stadium|fitness_centre|sports_hall"](${south},${west},${north},${east});`);
       clauses.push(`node["tourism"~"stadium|sports_centre"](${south},${west},${north},${east});`);
     }
-    // If we added some clauses, still include a small set of generic tags to avoid missing results
     if (clauses.length === 0) {
       clauses.push(
         `node["tourism"](${south},${west},${north},${east});`,
@@ -258,12 +257,10 @@ async function queryOverpassByBBox(bbox, extraNameRegexes = [], limit = 200, int
         `way["amenity"](${south},${west},${north},${east});`
       );
     } else {
-      // also include popular tourism/historic for variety
       clauses.push(`node["tourism"](${south},${west},${north},${east});`);
       clauses.push(`way["tourism"](${south},${west},${north},${east});`);
     }
   } else {
-    // default broad query
     clauses.push(
       `node["tourism"](${south},${west},${north},${east});`,
       `way["tourism"](${south},${west},${north},${east});`,
@@ -325,17 +322,24 @@ async function getCandidates(options = {}) {
   // 2) Query DB but filter by interestSlugs when provided and proximity to geo center if available
   let rows = [];
   try {
-    const q = `
-      SELECT l.id, l.titulo, l.fk_interest, l.latitud, l.longitud, l.imagenes, l.relevancia, l.country
-      FROM locations l
-      LEFT JOIN interests i ON i.id = l.fk_interest
-      WHERE ($2::text[] IS NULL OR i.slug = ANY($2))
-      ORDER BY l.relevancia DESC NULLS LAST
-      LIMIT $1
-    `;
-    const interestParam = (Array.isArray(interestSlugs) && interestSlugs.length) ? interestSlugs : null;
-    const r = await db.query(q, [limit, interestParam]);
-    rows = r.rows || [];
+    if (Array.isArray(interestSlugs) && interestSlugs.length) {
+      // Only use the interest filter when we have non-empty interestSlugs.
+      const q = `
+        SELECT l.id, l.titulo, l.fk_interest, l.latitud, l.longitud, l.imagenes, l.relevancia, l.country
+        FROM locations l
+        LEFT JOIN interests i ON i.id = l.fk_interest
+        WHERE i.slug = ANY($2)
+        ORDER BY l.relevancia DESC NULLS LAST
+        LIMIT $1
+      `;
+      const r = await db.query(q, [limit, interestSlugs]);
+      rows = r.rows || [];
+    } else {
+      // No interest filter
+      const q = `SELECT id, titulo, fk_interest, latitud, longitud, imagenes, relevancia, country FROM locations ORDER BY relevancia DESC NULLS LAST LIMIT $1`;
+      const r = await db.query(q, [limit]);
+      rows = r.rows || [];
+    }
   } catch (err) {
     console.warn('DB candidate fetch failed:', err?.message || err);
     rows = [];
@@ -350,7 +354,6 @@ async function getCandidates(options = {}) {
     if (Array.isArray(geo.bbox) && geo.bbox.length === 4) {
       const [s, w, n, e] = geo.bbox;
       const diagonal = Math.round(haversineMeters(s, w, n, e));
-      // clamp radius to sensible limits
       radiusMeters = Math.max(5000, Math.min(50000, Math.round(diagonal / 2)));
     }
     dbCandidates = dbCandidatesAll.filter(c => {
@@ -409,7 +412,6 @@ async function getCandidates(options = {}) {
 
   // 6) Final scoring and interest-boosting
   const maxRelev = Math.max(1, ...candidates.map(c => c.relevancia || 0));
-  // build interest -> osmTag set
   const interestTags = new Set();
   if (Array.isArray(interestSlugs)) {
     for (const s of interestSlugs) {
@@ -428,14 +430,11 @@ async function getCandidates(options = {}) {
     const base = (c.relevancia || 0) / maxRelev;
     const osmBoost = (c.source && String(c.source).includes('osm')) ? 0.2 : 0;
     const mustBoost = isMust ? 1.5 : 0;
-    // interest boost if osmTag or fk_interest matches user's interests
     let interestBoost = 0;
     if (c.osm && c.osm.tags) {
       const amen = (c.osm.tags.amenity || c.osm.tags.tourism || c.osm.tags.leisure || '').toString().toLowerCase();
       if (interestTags.has(amen)) interestBoost += 1.2;
     }
-    // if fk_interest present, give small boost (mapping of ids->slugs assumed in DB)
-    // This is conservative: we don't attempt to resolve id->slug here.
     const combined = (base * 3.0) + osmBoost + mustBoost + interestBoost;
     const distanceToCenter = (geo && geo.lat && lat && lng) ? Math.round(haversineMeters(geo.lat, geo.lon, lat, lng)) : null;
     return {
