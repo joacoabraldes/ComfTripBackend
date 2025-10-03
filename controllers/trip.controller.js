@@ -76,7 +76,7 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
 }
 
 // inside controllers/trip.controller.js near the top:
-const fetch = require('node-fetch'); // if Node < 18
+const fetch = require('undici'); // if Node < 18
 const poiService = require('../services/poi.service');
 const routingService = require('../services/routing.service');
 const optimizer = require('../services/optimizer.service'); // should accept spec & travelMatrix

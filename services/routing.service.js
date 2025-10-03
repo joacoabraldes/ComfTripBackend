@@ -3,7 +3,7 @@
 // - Primary: calls an OSRM-compatible table API (seconds).
 // - Fallback: estimate times by haversine / 40 km/h.
 
-const fetch = require('node-fetch');
+const fetch = require('undici');
 
 function haversineMeters(lat1, lon1, lat2, lon2) {
   if ([lat1, lat2, lon1, lon2].some(v => v === null || v === undefined || Number.isNaN(v))) return Number.POSITIVE_INFINITY;

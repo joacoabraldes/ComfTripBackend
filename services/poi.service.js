@@ -2,7 +2,7 @@
 // Improved POI fetcher that geocodes the trip destination and queries OSM using bbox.
 // Also filters DB results by proximity to the geocoded center to avoid returning far-away DB rows.
 
-const fetch = require('node-fetch');
+const fetch = require('undici');
 
 const NOMINATIM_URL = process.env.NOMINATIM_URL || 'https://nominatim.openstreetmap.org/search';
 const OVERPASS_URL = process.env.OVERPASS_URL || 'https://overpass-api.de/api/interpreter';
