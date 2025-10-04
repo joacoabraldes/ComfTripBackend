@@ -123,45 +123,108 @@ const poiService = require('../services/poi.service');
 const routingService = require('../services/routing.service');
 const optimizer = require('../services/optimizer.service');
 
-/* Helper: robust JSON extraction from model output (unchanged) */
+/* robust JSON extraction from a text blob - uses balanced-brace parsing */
 function extractJsonFromText(text) {
   text = (text || '').trim();
+  if (!text) return null;
+
+  // quick attempt
   try { return JSON.parse(text); } catch (e) {}
-  const o = text.indexOf('{'); const b = text.indexOf('[');
-  const start = (o === -1) ? b : (b === -1 ? o : Math.min(o,b));
-  if (start === -1) return null;
-  for (let end = text.length; end > start; end--) {
-    try {
-      const substr = text.slice(start, end);
-      return JSON.parse(substr);
-    } catch (e) { /* continue */ }
+
+  // find first '{' or '['
+  const startIdx = (() => {
+    const o = text.indexOf('{');
+    const b = text.indexOf('[');
+    if (o === -1) return b;
+    if (b === -1) return o;
+    return Math.min(o,b);
+  })();
+  if (startIdx === -1) return null;
+
+  // walk forward balancing brackets, ignoring those inside strings
+  const openToClose = { '{': '}', '[': ']' };
+  const stack = [];
+  let inString = false;
+  let escape = false;
+  let startChar = text[startIdx];
+  if (!('{[').includes(startChar)) return null;
+  stack.push(openToClose[startChar]);
+  for (let i = startIdx + 1; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escape) { escape = false; continue; }
+      if (ch === '\\') { escape = true; continue; }
+      if (ch === '"') { inString = false; continue; }
+      continue;
+    } else {
+      if (ch === '"') { inString = true; continue; }
+      if (ch === '{' || ch === '[') { stack.push(openToClose[ch]); continue; }
+      if (ch === '}' || ch === ']') {
+        const expected = stack.pop();
+        if (ch !== expected) {
+          // mismatch -> try to continue but this likely fails parse
+          // break early if stack empty and mismatch doesn't make sense
+        }
+        if (stack.length === 0) {
+          const candidate = text.slice(startIdx, i + 1);
+          try { return JSON.parse(candidate); } catch (e) { return null; }
+        }
+      }
+    }
+  }
+
+  // fallback: try to find any JSON-like substring with a looser approach (small windows)
+  for (let s = startIdx; s < Math.min(startIdx + 2000, text.length); s++) {
+    if (!('{[').includes(text[s])) continue;
+    for (let e = s + 1; e < Math.min(s + 2000, text.length); e++) {
+      const substr = text.slice(s, e);
+      try { return JSON.parse(substr); } catch (e) { /* continue */ }
+    }
   }
   return null;
 }
 
-/* new helper: normalize/parse any HF/router return into JSON (object/array) */
+
 function parseHFResultToJson(hfResp) {
   if (hfResp === null || hfResp === undefined) return null;
-  // Already a parsed JSON array/object
-  if (Array.isArray(hfResp) || (typeof hfResp === 'object' && !hfResp._text && !hfResp.choices)) {
+
+  // If already a parsed array/object and not a router wrapper, return it
+  if (Array.isArray(hfResp) || (typeof hfResp === 'object' && hfResp !== null && !hfResp._text && !hfResp.choices && !hfResp.generated_text && !hfResp.outputs)) {
     return hfResp;
   }
 
-  // Build candidate text
+  // Build candidate text from known fields
   let text = '';
-  if (typeof hfResp === 'string') text = hfResp;
-  else if (hfResp._text) text = String(hfResp._text);
-  else if (hfResp.choices && Array.isArray(hfResp.choices)) {
-    text = hfResp.choices.map(c => (c.message?.content || c.text || '')).join('\n');
-  } else {
-    try { text = JSON.stringify(hfResp); } catch (e) { text = String(hfResp); }
+  if (typeof hfResp === 'string') {
+    text = hfResp;
+  } else if (hfResp && typeof hfResp === 'object') {
+    // if we already set _text earlier in callHF, use it
+    if (hfResp._text && typeof hfResp._text === 'string') {
+      text = hfResp._text;
+    } else if (Array.isArray(hfResp.choices) && hfResp.choices.length) {
+      text = hfResp.choices.map(c => {
+        return (c.message && (c.message.content || c.message.content?.text)) ||
+               c.text ||
+               c.generated_text ||
+               (typeof c === 'string' ? c : '');
+      }).filter(Boolean).join('\n').trim();
+    } else if (Array.isArray(hfResp.outputs) && hfResp.outputs.length) {
+      text = hfResp.outputs.map(o => (o.generated_text || o.text || o.content || '')).join('\n').trim();
+    } else if (hfResp.generated_text) {
+      text = String(hfResp.generated_text);
+    } else {
+      try { text = JSON.stringify(hfResp); } catch (e) { text = String(hfResp); }
+    }
   }
 
-  // Try direct parse
+  // Try direct parse of whole text
   try { return JSON.parse(text); } catch (e) {}
+
   // Fallback: extract first JSON block
-  return extractJsonFromText(text);
+  const parsed = extractJsonFromText(text);
+  return parsed;
 }
+
 
 /* Call Hugging Face inference for a prompt (uses fetchWithTimeout) - unchanged except logs */
 async function callHF(promptOrMessages, opts = {}) {
@@ -306,11 +369,12 @@ function simpleGreedyGenerator({ candidates, days, spec }) {
 
 /**
  * GET /trips/:id/itinerary
+ * Generate itinerary (LLM + optimizer fallback) and ALWAYS persist trip_places.
+ * Creates new locations rows when a visit cannot be resolved to an existing location.
  */
 router.get('/:id/itinerary', auth, async (req, res) => {
   const tripId = Number(req.params.id);
   const userId = req.user.id;
-  const save = req.query.save === 'true' || req.query.save === '1';
   const topK = Number(req.query.topK) || Number(process.env.LLM_TOP_K) || 20;
   const mode = req.query.mode || 'hf';
 
@@ -332,7 +396,7 @@ router.get('/:id/itinerary', auth, async (req, res) => {
     );
     const interestSlugs = uiRes.rows.map(r => r.slug);
 
-    // derive country
+    // derive country from destination (best-effort)
     let country = null;
     if (typeof trip.destination === 'string' && trip.destination.includes(',')) {
       const parts = trip.destination.split(',');
@@ -413,7 +477,7 @@ Return only JSON.
         }
       }
     } else {
-      smallPois.forEach(c => scoreResults.push({ id: c.id, score: Math.max(1, Math.min(5, 1 + ((c.relevancia||0)/10)*4)), reason:'heuristic' }));
+      smallPois.forEach(c => scoreResults.push({ id: c.id, score: Math.max(1, Math.min(5, 1 + ((c.relevancia||0)/10)*4)), reason:'heuristic' } ));
     }
 
     // merge scores into topCandidates and compute combined_score
@@ -436,20 +500,16 @@ Return only JSON.
       travelMatrixSeconds = null;
     }
 
-    // Validate travelMatrixSeconds shape; fallback to a zero matrix (safe)
+    // Validate travelMatrixSeconds shape; fallback to approximate matrix if invalid
     const n = topCandidates.length;
     if (!Array.isArray(travelMatrixSeconds) || travelMatrixSeconds.length !== n ||
         travelMatrixSeconds.some(row => !Array.isArray(row) || row.length !== n)) {
-      console.warn('Invalid travelMatrixSeconds, falling back to default zero matrix');
-      travelMatrixSeconds = Array.from({length: n}, (_,i) => Array.from({length: n}, (_,j) => (i===j?0: (topCandidates[i] && topCandidates[j] && topCandidates[i].lat && topCandidates[j].lat ?
+      console.warn('Invalid travelMatrixSeconds, falling back to default distance-based matrix');
+      travelMatrixSeconds = Array.from({length: n}, (_,i) => Array.from({length: n}, (_,j) => (i===j?0: (topCandidates[i] && topCandidates[j] && topCandidates[i].lat != null && topCandidates[j].lat != null ?
         Math.round(haversineMeters(topCandidates[i].lat, topCandidates[i].lng, topCandidates[j].lat, topCandidates[j].lng) / 10) : 600))));
-      // above: approximate seconds by distance/10 to avoid huge values; arbitrary safe fallback
     }
 
-    // convert seconds->minutes if needed (kept for use by some modules)
-    const travelMatrixMinutes = travelMatrixSeconds.map(row => row.map(v => (isFinite(v) ? Math.round(v/60) : null)));
-
-    // 7) call optimizer with try/catch. If it returns falsy or empty, use simpleGreedyGenerator
+    // 7) call optimizer (try/catch)
     let itinerary = null;
     const daysArr = (() => { const s=new Date(trip.start_date), e=new Date(trip.end_date), days=[]; for(let d=new Date(s); d<=e; d.setDate(d.getDate()+1)) days.push(new Date(d)); return days; })();
 
@@ -468,14 +528,14 @@ Return only JSON.
       itinerary = null;
     }
 
-    // if optimizer returned null/empty or invalid format, attempt simple greedy
+    // fallback to greedy if needed
     const validItinerary = Array.isArray(itinerary) && itinerary.length > 0 && itinerary.some(d => Array.isArray(d.visits) && d.visits.length > 0);
     if (!validItinerary) {
       console.warn('Optimizer produced no valid itinerary — using simpleGreedyGenerator fallback');
       itinerary = simpleGreedyGenerator({ candidates: topCandidates, days: daysArr, spec });
     }
 
-    // 8) repair loop (unchanged)
+    // repair/validate
     function validateAndRepair(itin) {
       const maxDailyMinutes = spec.max_travel_minutes_per_day || 24*60;
       const startMin = Number(spec.daily_hours?.start?.slice(0,2)) * 60 + Number(spec.daily_hours?.start?.slice(3,5) || 0);
@@ -488,8 +548,8 @@ Return only JSON.
         }
         if (total > dayCapacity || total > maxDailyMinutes) {
           day.visits.sort((a,b)=> {
-            const ca = topCandidates.find(x=>x.id===a.id)?.combined_score || 0;
-            const cb = topCandidates.find(x=>x.id===b.id)?.combined_score || 0;
+            const ca = topCandidates.find(x=>String(x.id)===String(a.id))?.combined_score || 0;
+            const cb = topCandidates.find(x=>String(x.id)===String(b.id))?.combined_score || 0;
             return ca - cb;
           });
           while (day.visits.length && (total > dayCapacity || total > maxDailyMinutes)) {
@@ -503,84 +563,164 @@ Return only JSON.
 
     itinerary = validateAndRepair(itinerary);
 
-        // 9) optionally save to DB if save=true (replace trip_places)
+    // --- 8) ALWAYS save itinerary into DB (replace existing places). Create locations when needed.
     const insertedPlaces = [];
     const skippedPlaces = [];
-    if (save) {
-      client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-        const check = await client.query('SELECT user_id FROM trips WHERE id = $1 FOR UPDATE', [tripId]);
-        if (!check.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Trip not found' }); }
-        if (check.rows[0].user_id !== userId) { await client.query('ROLLBACK'); return res.status(403).json({ message:'No autorizado' }); }
+    client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-        // remove existing places for trip
-        await client.query('DELETE FROM trip_places WHERE fk_trips = $1', [tripId]);
+      // check ownership (FOR UPDATE)
+      const check = await client.query('SELECT user_id FROM trips WHERE id = $1 FOR UPDATE', [tripId]);
+      if (!check.rows.length) { const e = new Error('Trip not found'); e.status = 404; throw e; }
+      if (check.rows[0].user_id !== userId) { const e = new Error('No autorizado'); e.status = 403; throw e; }
 
-        const insertSQL = 'INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, fk_locations, fk_trips, date, start_hour, end_hour, notes, created_at';
+      // delete existing places
+      await client.query('DELETE FROM trip_places WHERE fk_trips = $1', [tripId]);
 
-        for (const day of itinerary) {
-          for (const v of day.visits || []) {
-            // Attempt to resolve a numeric fk_location id safely:
-            let fk_location = null;
+      const insertTripPlaceSQL =
+        'INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, fk_locations, fk_trips, date, start_hour, end_hour, notes, created_at';
 
-            // 1) If visit id is numeric string or number, use it
-            if (v && (typeof v.id === 'number' || (/^\d+$/.test(String(v.id)).valueOf()))) {
-              // numeric id
-              const n = Number(v.id);
-              if (Number.isFinite(n)) fk_location = n;
+      const insertLocationSQL =
+        `INSERT INTO locations (titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country, opening_hours, timezone, avg_duration_min, popularity)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`;
+
+      // helper
+      const toNumOrNull = v => (v === null || v === undefined || v === '') ? null : (Number.isFinite(Number(v)) ? Number(v) : null);
+
+      // tolerance for lat/lng near-duplicate (approx degrees)
+      const LAT_LNG_EPS = 0.0006; // roughly ~50-70 meters
+
+      for (const day of itinerary) {
+        for (const v of day.visits || []) {
+          let fk_location = null;
+
+          // 1) numeric id
+          if (v && (typeof v.id === 'number' || (/^\d+$/.test(String(v.id))))) {
+            const n = Number(v.id);
+            if (Number.isFinite(n)) fk_location = n;
+          }
+
+          // 2) match topCandidates by id or exact title (case-insensitive)
+          if (!fk_location) {
+            const candidate = topCandidates.find(x =>
+              String(x.id) === String(v.id) ||
+              (v.titulo && x.titulo && String(x.titulo).toLowerCase() === String(v.titulo).toLowerCase())
+            );
+            if (candidate && (typeof candidate.id === 'number' || /^\d+$/.test(String(candidate.id)))) {
+              fk_location = Number(candidate.id);
             }
+          }
 
-            // 2) If we didn't get numeric id, try to match against the topCandidates by id or title
-            if (!fk_location) {
-              // topCandidates is in outer scope; find candidate object
-              const candidate = topCandidates.find(x => String(x.id) === String(v.id) || (v.titulo && String(x.titulo) === String(v.titulo)));
-              if (candidate && typeof candidate.id === 'number') {
-                fk_location = candidate.id;
-              }
+          // 3) attempt DB title lookup (exact lower() or ILIKE)
+          const title = (v.titulo || v.name || v.title || '').trim();
+          // gather coords (from visit, osm, or topCandidates)
+          let lat = toNumOrNull(v.lat ?? v.latitude ?? v.latitud ?? (v.osm && v.osm.center && v.osm.center.lat) ?? null);
+          let lng = toNumOrNull(v.lng ?? v.longitude ?? v.lon ?? v.longitud ?? (v.osm && v.osm.center && v.osm.center.lon) ?? null);
+
+          // if coords are missing, try to derive from a matching topCandidate
+          if ((lat === null || lng === null) && topCandidates && topCandidates.length) {
+            const cand = topCandidates.find(x =>
+              String(x.id) === String(v.id) ||
+              (title && x.titulo && x.titulo.toLowerCase() === title.toLowerCase())
+            );
+            if (cand) { lat = toNumOrNull(cand.lat); lng = toNumOrNull(cand.lng); }
+          }
+
+          if (!fk_location && title) {
+            const found = await client.query('SELECT id, latitud, longitud FROM locations WHERE lower(titulo) = lower($1) LIMIT 1', [title]);
+            if (found.rows.length) fk_location = found.rows[0].id;
+            else {
+              const found2 = await client.query('SELECT id, latitud, longitud FROM locations WHERE titulo ILIKE $1 LIMIT 1', [`%${title}%`]);
+              if (found2.rows.length) fk_location = found2.rows[0].id;
             }
+          }
 
-            // 3) Fallback: try to find a DB location by title (case-insensitive)
-            if (!fk_location && (v.titulo || v.name || v.title)) {
-              const titleToMatch = (v.titulo || v.name || v.title).trim();
-              if (titleToMatch.length) {
-                const found = await client.query('SELECT id FROM locations WHERE lower(titulo) = lower($1) LIMIT 1', [titleToMatch]);
-                if (found.rows.length) fk_location = found.rows[0].id;
-                else {
-                  // try ILIKE with wildcard to be more forgiving
-                  const found2 = await client.query('SELECT id FROM locations WHERE titulo ILIKE $1 LIMIT 1', [`%${titleToMatch}%`]);
-                  if (found2.rows.length) fk_location = found2.rows[0].id;
-                }
-              }
-            }
+          // 4) try lat/lng nearby detect to avoid duplicates
+          if (!fk_location && lat !== null && lng !== null) {
+            const nearby = await client.query(
+              'SELECT id FROM locations WHERE latitud IS NOT NULL AND longitud IS NOT NULL AND abs(latitud - $1) < $3 AND abs(longitud - $2) < $3 LIMIT 1',
+              [lat, lng, LAT_LNG_EPS]
+            );
+            if (nearby.rows.length) fk_location = nearby.rows[0].id;
+          }
 
-            // 4) If still not resolved, skip this visit (it's likely an osm-only id like "osm-node-...")
-            if (!fk_location) {
-              skippedPlaces.push({ id: v.id, titulo: v.titulo || null, reason: 'Could not resolve to DB location id; skipped saving' });
+          // 5) If still not found -> create location (if we have title or coords)
+          if (!fk_location) {
+            if (!title && (lat === null || lng === null)) {
+              skippedPlaces.push({ id: v.id, titulo: v.titulo || null, reason: 'No title and no coordinates — cannot create location' });
               continue;
             }
 
-            // Insert resolved place
-            const r = await client.query(insertSQL, [fk_location, tripId, day.date, v.start || null, v.end || null, v.reason || null]);
-            insertedPlaces.push(r.rows[0]);
+            const fk_interest = null; // unknown at creation time
+            const descripcion = v.descripcion || v.description || null;
+            const imagenes = v.imagenes || v.images || null;
+            const relevancia = toNumOrNull(v.relevancia) ?? 5;
+            const countryVal = country || null;
+            const opening_hours = null;
+            const timezone = v.timezone || null;
+            const avg_duration_min = toNumOrNull(v.visit_minutes) || toNumOrNull(v.avg_duration_min) || 90;
+            const popularity = null;
+
+            const locRes = await client.query(insertLocationSQL, [
+              title || 'unnamed',
+              fk_interest,
+              descripcion,
+              lat,
+              lng,
+              imagenes,
+              relevancia,
+              countryVal,
+              opening_hours,
+              timezone,
+              avg_duration_min,
+              popularity
+            ]);
+            fk_location = locRes.rows[0].id;
           }
-        }
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK').catch(()=>{});
-        throw err;
-      } finally {
-        client.release();
-        client = null;
-      }
+
+          // 6) Insert trip_place
+          try {
+            const r = await client.query(insertTripPlaceSQL, [
+              fk_location,
+              tripId,
+              day.date || null,
+              v.start || v.start_hour || null,
+              v.end || v.end_hour || null,
+              v.reason || v.notes || null
+            ]);
+            insertedPlaces.push(r.rows[0]);
+          } catch (err) {
+            skippedPlaces.push({ id: v.id, titulo: title || null, reason: `Insert trip_place failed: ${err.message}` });
+            // continue with next visit
+          }
+        } // end visits
+      } // end days
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(()=>{});
+      throw err;
+    } finally {
+      // release DB client used for save
+      client.release();
+      client = null;
     }
 
-    return res.json({ itinerary, saved: !!save, insertedCount: insertedPlaces.length, insertedPlaces, skippedPlaces });
+    // success: return itinerary and save metadata
+    return res.json({ itinerary, saved: true, insertedCount: insertedPlaces.length, insertedPlaces, skippedPlaces });
 
   } catch (err) {
-    if (client) { await client.query('ROLLBACK').catch(()=>{}); client.release(); }
+    // ensure any still-open client is rolled back & released
+    if (client) {
+      try { await client.query('ROLLBACK').catch(()=>{}); } catch(e) {}
+      try { client.release(); } catch(e) {}
+      client = null;
+    }
     console.error('GET /trips/:id/itinerary error:', err);
-    return res.status(500).json({ message:'Error generating itinerary', detail: err?.message || String(err) });
+    const status = err.status || 500;
+    const msg = err.message || 'Error generating itinerary';
+    return res.status(status).json({ message: msg, detail: err.detail || undefined });
   }
 });
 

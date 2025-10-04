@@ -2,7 +2,7 @@
 // Improved POI fetcher that geocodes the trip destination and queries OSM using bbox.
 // Also filters DB results by proximity to the geocoded center to avoid returning far-away DB rows.
 
-'use strict';
+"use strict";
 
 /**
  * Robust fetch + AbortController detection
@@ -10,39 +10,46 @@
 let fetchImpl = null;
 let AbortControllerImpl = null;
 try {
-  if (typeof globalThis.fetch === 'function') {
+  if (typeof globalThis.fetch === "function") {
     fetchImpl = globalThis.fetch;
   }
 } catch (e) {}
 
 if (!fetchImpl) {
   try {
-    const undici = require('undici');
-    if (undici && typeof undici.fetch === 'function') {
+    const undici = require("undici");
+    if (undici && typeof undici.fetch === "function") {
       fetchImpl = undici.fetch.bind(undici);
     }
-    if (!AbortControllerImpl && undici && undici.AbortController) AbortControllerImpl = undici.AbortController;
+    if (!AbortControllerImpl && undici && undici.AbortController)
+      AbortControllerImpl = undici.AbortController;
   } catch (e) {}
 }
 
 if (!AbortControllerImpl) {
-  if (typeof globalThis.AbortController === 'function') {
+  if (typeof globalThis.AbortController === "function") {
     AbortControllerImpl = globalThis.AbortController;
   } else {
     try {
-      const ac = require('abort-controller');
+      const ac = require("abort-controller");
       if (ac && ac.AbortController) AbortControllerImpl = ac.AbortController;
-    } catch (e) { AbortControllerImpl = null; }
+    } catch (e) {
+      AbortControllerImpl = null;
+    }
   }
 }
 
 if (!fetchImpl) {
-  throw new Error('No fetch implementation found. Install node >=18 or `npm install undici`.');
+  throw new Error(
+    "No fetch implementation found. Install node >=18 or `npm install undici`."
+  );
 }
 
-const NOMINATIM_URL = process.env.NOMINATIM_URL || 'https://nominatim.openstreetmap.org/search';
-const OVERPASS_URL = process.env.OVERPASS_URL || 'https://overpass-api.de/api/interpreter';
-const NOMINATIM_EMAIL = process.env.NOMINATIM_EMAIL || '';
+const NOMINATIM_URL =
+  process.env.NOMINATIM_URL || "https://nominatim.openstreetmap.org/search";
+const OVERPASS_URL =
+  process.env.OVERPASS_URL || "https://overpass-api.de/api/interpreter";
+const NOMINATIM_EMAIL = process.env.NOMINATIM_EMAIL || "";
 
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
   if (AbortControllerImpl) {
@@ -57,20 +64,30 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
   } else {
     return await Promise.race([
       fetchImpl(url, opts),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Fetch timeout')), timeoutMs))
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Fetch timeout")), timeoutMs)
+      ),
     ]);
   }
 }
 
 function haversineMeters(lat1, lon1, lat2, lon2) {
-  if ([lat1, lat2, lon1, lon2].some(v => v === null || v === undefined || Number.isNaN(v))) return Number.POSITIVE_INFINITY;
+  if (
+    [lat1, lat2, lon1, lon2].some(
+      (v) => v === null || v === undefined || Number.isNaN(v)
+    )
+  )
+    return Number.POSITIVE_INFINITY;
   const toRad = (v) => (v * Math.PI) / 180;
   const R = 6371000;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
-  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-            Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
 }
@@ -80,26 +97,54 @@ function normalizeDbRow(r) {
     id: r.id,
     titulo: r.titulo,
     fk_interest: r.fk_interest,
-    lat: r.latitud !== null && r.latitud !== undefined ? Number(r.latitud) : null,
-    lng: r.longitud !== null && r.longitud !== undefined ? Number(r.longitud) : null,
+    lat:
+      r.latitud !== null && r.latitud !== undefined ? Number(r.latitud) : null,
+    lng:
+      r.longitud !== null && r.longitud !== undefined
+        ? Number(r.longitud)
+        : null,
     imagenes: r.imagenes || null,
-    relevancia: r.relevancia !== null && r.relevancia !== undefined ? Number(r.relevancia) : 0,
+    relevancia:
+      r.relevancia !== null && r.relevancia !== undefined
+        ? Number(r.relevancia)
+        : 0,
     country: r.country || null,
-    source: 'db'
+    source: "db",
   };
 }
 
 /* --- OSM filtering + interest mapping --- */
 const OSM_UNWANTED_AMENITIES = new Set([
-  'parking','parking_space','bicycle_parking','post_box','bench','waste_basket','recycling','fuel','charging_station',
-  'bus_station','taxi','car_rental','bicycle_rental','toilets','public_building','community_centre'
+  "parking",
+  "parking_space",
+  "bicycle_parking",
+  "post_box",
+  "bench",
+  "waste_basket",
+  "recycling",
+  "fuel",
+  "charging_station",
+  "bus_station",
+  "taxi",
+  "car_rental",
+  "bicycle_rental",
+  "toilets",
+  "public_building",
+  "community_centre",
 ]);
 
-const OSM_UNWANTED_TOURISM = new Set(['hotel','guest_house','motel']);
+const OSM_UNWANTED_TOURISM = new Set(["hotel", "guest_house", "motel"]);
 
 const INTEREST_TO_OSM = {
-  gastronomia: ['restaurant','cafe','bar','fast_food','pub'],
-  deportes: ['stadium','pitch','sports_centre','fitness_centre','leisure','pitch']
+  gastronomia: ["restaurant", "cafe", "bar", "fast_food", "pub"],
+  deportes: [
+    "stadium",
+    "pitch",
+    "sports_centre",
+    "fitness_centre",
+    "leisure",
+    "pitch",
+  ],
 };
 
 function normalizeOsmElement(el) {
@@ -112,11 +157,22 @@ function normalizeOsmElement(el) {
   if (amenity && OSM_UNWANTED_AMENITIES.has(amenity)) return null;
   if (tourism && OSM_UNWANTED_TOURISM.has(tourism)) return null;
 
-  const name = tags.name || tags['name:en'] || tags.int_name || null;
-  const lat = el.lat !== undefined && el.lat !== null ? Number(el.lat) : (el.center && el.center.lat ? Number(el.center.lat) : null);
-  const lon = el.lon !== undefined && el.lon !== null ? Number(el.lon) : (el.center && el.center.lon ? Number(el.center.lon) : null);
+  const name = tags.name || tags["name:en"] || tags.int_name || null;
+  const lat =
+    el.lat !== undefined && el.lat !== null
+      ? Number(el.lat)
+      : el.center && el.center.lat
+      ? Number(el.center.lat)
+      : null;
+  const lon =
+    el.lon !== undefined && el.lon !== null
+      ? Number(el.lon)
+      : el.center && el.center.lon
+      ? Number(el.center.lon)
+      : null;
   const id = `osm-${el.type}-${el.id}`;
-  const titleFallback = amenity || tourism || leisure || tags.historic || 'unnamed';
+  const titleFallback =
+    amenity || tourism || leisure || tags.historic || "unnamed";
   return {
     id,
     titulo: name || titleFallback,
@@ -125,9 +181,9 @@ function normalizeOsmElement(el) {
     lng: lon,
     imagenes: null,
     relevancia: 5,
-    source: 'osm',
+    source: "osm",
     osm: { type: el.type, osm_id: el.id, tags },
-    osmTag: amenity || tourism || leisure || null
+    osmTag: amenity || tourism || leisure || null,
   };
 }
 
@@ -137,18 +193,46 @@ function dedupeMerge(existing, incoming, distanceThresholdMeters = 50) {
     let foundIdx = -1;
     for (let i = 0; i < merged.length; i++) {
       const ex = merged[i];
-      if (typeof ex.id === 'number' && typeof inc.id === 'number' && ex.id === inc.id) { foundIdx = i; break; }
-      if (ex.titulo && inc.titulo && ex.titulo.toLowerCase() === inc.titulo.toLowerCase()) {
-        if (ex.lat !== null && inc.lat !== null && isFinite(ex.lat) && isFinite(inc.lat)) {
+      if (
+        typeof ex.id === "number" &&
+        typeof inc.id === "number" &&
+        ex.id === inc.id
+      ) {
+        foundIdx = i;
+        break;
+      }
+      if (
+        ex.titulo &&
+        inc.titulo &&
+        ex.titulo.toLowerCase() === inc.titulo.toLowerCase()
+      ) {
+        if (
+          ex.lat !== null &&
+          inc.lat !== null &&
+          isFinite(ex.lat) &&
+          isFinite(inc.lat)
+        ) {
           const d = haversineMeters(ex.lat, ex.lng, inc.lat, inc.lng);
-          if (d <= distanceThresholdMeters) { foundIdx = i; break; }
+          if (d <= distanceThresholdMeters) {
+            foundIdx = i;
+            break;
+          }
         } else {
-          foundIdx = i; break;
+          foundIdx = i;
+          break;
         }
       }
-      if (ex.lat !== null && inc.lat !== null && isFinite(ex.lat) && isFinite(inc.lat)) {
+      if (
+        ex.lat !== null &&
+        inc.lat !== null &&
+        isFinite(ex.lat) &&
+        isFinite(inc.lat)
+      ) {
         const d = haversineMeters(ex.lat, ex.lng, inc.lat, inc.lng);
-        if (d < 10) { foundIdx = i; break; }
+        if (d < 10) {
+          foundIdx = i;
+          break;
+        }
       }
     }
     if (foundIdx === -1) {
@@ -163,7 +247,7 @@ function dedupeMerge(existing, incoming, distanceThresholdMeters = 50) {
         imagenes: ex.imagenes || inc.imagenes || null,
         relevancia: Math.max(ex.relevancia || 0, inc.relevancia || 0),
         osm: { ...(ex.osm || {}), ...(inc.osm || {}) },
-        source: ex.source === 'db' ? 'db+osm' : inc.source
+        source: ex.source === "db" ? "db+osm" : inc.source,
       };
     }
   }
@@ -171,17 +255,18 @@ function dedupeMerge(existing, incoming, distanceThresholdMeters = 50) {
 }
 
 function extractMustVisitsFromNotes(notes) {
-  if (!notes || typeof notes !== 'string') return [];
+  if (!notes || typeof notes !== "string") return [];
   const found = new Set();
   const quoteRe = /\"([^\"]{3,80})\"|'([^']{3,80})'/g;
   let m;
   while ((m = quoteRe.exec(notes)) !== null) {
-    const p = (m[1] || m[2] || '').trim();
+    const p = (m[1] || m[2] || "").trim();
     if (p) found.add(p);
   }
-  const mustRe = /(?:must visit|want to visit|visit|must-see)\s*[:\-\s]?\s*([^.\n]{3,80})/ig;
+  const mustRe =
+    /(?:must visit|want to visit|visit|must-see)\s*[:\-\s]?\s*([^.\n]{3,80})/gi;
   while ((m = mustRe.exec(notes)) !== null) {
-    const p = (m[1] || '').split(/[;,\n]/)[0].trim();
+    const p = (m[1] || "").split(/[;,\n]/)[0].trim();
     if (p) found.add(p);
   }
   return Array.from(found);
@@ -192,10 +277,10 @@ async function geocodeDestination(query) {
   const q = encodeURIComponent(String(query));
   const url = `${NOMINATIM_URL}?q=${q}&format=json&limit=3&addressdetails=1&polygon_geojson=0`;
   const headers = {
-    'User-Agent': `itinerary-service/1.0 (${NOMINATIM_EMAIL || 'dev'})`,
-    'Accept-Language': 'en'
+    "User-Agent": `itinerary-service/1.0 (${NOMINATIM_EMAIL || "dev"})`,
+    "Accept-Language": "en",
   };
-  if (NOMINATIM_EMAIL) headers['From'] = NOMINATIM_EMAIL;
+  if (NOMINATIM_EMAIL) headers["From"] = NOMINATIM_EMAIL;
   try {
     const resp = await fetchWithTimeout(url, { headers }, 15000);
     if (!resp.ok) throw new Error(`Nominatim ${resp.status}`);
@@ -203,7 +288,13 @@ async function geocodeDestination(query) {
     if (!Array.isArray(data) || data.length === 0) return null;
     let pick = data[0];
     for (const cand of data) {
-      if (cand.type && ['city','town','village','municipality'].includes(cand.type)) { pick = cand; break; }
+      if (
+        cand.type &&
+        ["city", "town", "village", "municipality"].includes(cand.type)
+      ) {
+        pick = cand;
+        break;
+      }
     }
     const bbox = (pick.boundingbox || []).map(Number);
     let normBbox = null;
@@ -216,38 +307,63 @@ async function geocodeDestination(query) {
       lon: Number(pick.lon),
       bbox: normBbox,
       display_name: pick.display_name,
-      raw: pick
+      raw: pick,
     };
   } catch (err) {
-    console.warn('geocodeDestination failed:', err?.message || err);
+    console.warn("geocodeDestination failed:", err?.message || err);
     return null;
   }
 }
 
-function escapeRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\\\$&'); }
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\\\$&");
+}
 
 /**
  * queryOverpassByBBox now accepts interestSlugs to build focused queries when possible.
  * bbox = [south, west, north, east]
  */
-async function queryOverpassByBBox(bbox, extraNameRegexes = [], limit = 200, interestSlugs = []) {
-  if (!bbox || bbox.length !== 4) throw new Error('Invalid bbox for Overpass query');
+async function queryOverpassByBBox(
+  bbox,
+  extraNameRegexes = [],
+  limit = 200,
+  interestSlugs = []
+) {
+  if (!bbox || bbox.length !== 4)
+    throw new Error("Invalid bbox for Overpass query");
   const [south, west, north, east] = bbox;
 
   // build tag clauses depending on interests
   const clauses = [];
-  const nameFilter = extraNameRegexes && extraNameRegexes.length ? `node["name"~"${extraNameRegexes.join('|')}"](${south},${west},${north},${east});way["name"~"${extraNameRegexes.join('|')}"](${south},${west},${north},${east});` : '';
+  const nameFilter =
+    extraNameRegexes && extraNameRegexes.length
+      ? `node["name"~"${extraNameRegexes.join(
+          "|"
+        )}"](${south},${west},${north},${east});way["name"~"${extraNameRegexes.join(
+          "|"
+        )}"](${south},${west},${north},${east});`
+      : "";
 
   if (Array.isArray(interestSlugs) && interestSlugs.length) {
-    const uniq = new Set(interestSlugs.map(s => String(s).toLowerCase()));
-    if (uniq.has('gastronomia')) {
-      clauses.push(`node["amenity"~"restaurant|cafe|bar|fast_food|pub"](${south},${west},${north},${east});`);
-      clauses.push(`way["amenity"~"restaurant|cafe|bar|fast_food|pub"](${south},${west},${north},${east});`);
+    const uniq = new Set(interestSlugs.map((s) => String(s).toLowerCase()));
+    if (uniq.has("gastronomia")) {
+      clauses.push(
+        `node["amenity"~"restaurant|cafe|bar|fast_food|pub"](${south},${west},${north},${east});`
+      );
+      clauses.push(
+        `way["amenity"~"restaurant|cafe|bar|fast_food|pub"](${south},${west},${north},${east});`
+      );
     }
-    if (uniq.has('deportes')) {
-      clauses.push(`node["leisure"~"pitch|sports_centre|stadium|fitness_centre|sports_hall"](${south},${west},${north},${east});`);
-      clauses.push(`way["leisure"~"pitch|sports_centre|stadium|fitness_centre|sports_hall"](${south},${west},${north},${east});`);
-      clauses.push(`node["tourism"~"stadium|sports_centre"](${south},${west},${north},${east});`);
+    if (uniq.has("deportes")) {
+      clauses.push(
+        `node["leisure"~"pitch|sports_centre|stadium|fitness_centre|sports_hall"](${south},${west},${north},${east});`
+      );
+      clauses.push(
+        `way["leisure"~"pitch|sports_centre|stadium|fitness_centre|sports_hall"](${south},${west},${north},${east});`
+      );
+      clauses.push(
+        `node["tourism"~"stadium|sports_centre"](${south},${west},${north},${east});`
+      );
     }
     if (clauses.length === 0) {
       clauses.push(
@@ -275,27 +391,36 @@ async function queryOverpassByBBox(bbox, extraNameRegexes = [], limit = 200, int
 
   const q = `[out:json][timeout:25];
 (
-  ${clauses.join('\n  ')}
+  ${clauses.join("\n  ")}
   ${nameFilter}
 );
 out center ${Math.min(limit, 500)};`;
 
   try {
-    const resp = await fetchWithTimeout(OVERPASS_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': `itinerary-service/1.0 (${NOMINATIM_EMAIL || 'dev'})` },
-      body: `data=${encodeURIComponent(q)}`
-    }, 30000);
+    const resp = await fetchWithTimeout(
+      OVERPASS_URL,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": `itinerary-service/1.0 (${NOMINATIM_EMAIL || "dev"})`,
+        },
+        body: `data=${encodeURIComponent(q)}`,
+      },
+      30000
+    );
     if (!resp.ok) {
       const t = await resp.text();
-      throw new Error(`Overpass ${resp.status}: ${t.slice(0,200)}`);
+      throw new Error(`Overpass ${resp.status}: ${t.slice(0, 200)}`);
     }
     const body = await resp.json();
     const elements = body.elements || [];
-    const normalized = elements.map(normalizeOsmElement).filter(x => x && x.titulo && x.lat !== null && x.lng !== null);
+    const normalized = elements
+      .map(normalizeOsmElement)
+      .filter((x) => x && x.titulo && x.lat !== null && x.lng !== null);
     return normalized;
   } catch (err) {
-    console.warn('queryOverpassByBBox failed:', err?.message || err);
+    console.warn("queryOverpassByBBox failed:", err?.message || err);
     return [];
   }
 }
@@ -305,11 +430,21 @@ out center ${Math.min(limit, 500)};`;
  * options: { db, interestSlugs, country, destination, limit, mustVisits, notes }
  */
 async function getCandidates(options = {}) {
-  const { db, interestSlugs = [], country = null, destination = null, limit = 300, mustVisits = [], notes = '' } = options;
-  if (!db) throw new Error('db pool required');
+  const {
+    db,
+    interestSlugs = [],
+    country = null,
+    destination = null,
+    limit = 300,
+    mustVisits = [],
+    notes = "",
+  } = options;
+  if (!db) throw new Error("db pool required");
 
-  const parsedMusts = extractMustVisitsFromNotes(notes || '');
-  const explicitMusts = Array.from(new Set([...(mustVisits || []), ...parsedMusts])).slice(0, 20);
+  const parsedMusts = extractMustVisitsFromNotes(notes || "");
+  const explicitMusts = Array.from(
+    new Set([...(mustVisits || []), ...parsedMusts])
+  ).slice(0, 20);
 
   // 1) geocode destination
   let geo = null;
@@ -323,16 +458,36 @@ async function getCandidates(options = {}) {
   let rows = [];
   try {
     if (Array.isArray(interestSlugs) && interestSlugs.length) {
-      // Only use the interest filter when we have non-empty interestSlugs.
+      // Normalize slugs to lowercase (slugs are usually lowercase)
+      const slugs = interestSlugs.map((s) => String(s).toLowerCase());
+
+      // Find interest IDs for these slugs (may be empty)
+      const idsRes = await db.query(
+        "SELECT id, slug FROM interests WHERE slug = ANY($1)",
+        [slugs]
+      );
+      const matchingIds = (idsRes.rows || [])
+        .map((r) => Number(r.id))
+        .filter((n) => Number.isFinite(n));
+
+      // Query locations where:
+      //  - l.fk_interest equals the slug (text match), OR
+      //  - l.fk_interest is a numeric string and its integer value matches an interest id
+      // Note: we use a regex check (l.fk_interest ~ '^[0-9]+$') before casting to int to avoid cast errors.
       const q = `
-        SELECT l.id, l.titulo, l.fk_interest, l.latitud, l.longitud, l.imagenes, l.relevancia, l.country
-        FROM locations l
-        LEFT JOIN interests i ON i.id = l.fk_interest
-        WHERE i.slug = ANY($2)
-        ORDER BY l.relevancia DESC NULLS LAST
-        LIMIT $1
-      `;
-      const r = await db.query(q, [limit, interestSlugs]);
+    SELECT l.id, l.titulo, l.fk_interest, l.latitud, l.longitud, l.imagenes, l.relevancia, l.country
+    FROM locations l
+    WHERE
+      (l.fk_interest IS NOT NULL AND lower(l.fk_interest) = ANY($2))
+      OR (l.fk_interest ~ '^[0-9]+$' AND (l.fk_interest::int = ANY($3)))
+    ORDER BY l.relevancia DESC NULLS LAST
+    LIMIT $1
+  `;
+
+      // If matchingIds is empty, pass a dummy negative ID array so the ANY(...) call is valid.
+      const idsParam = matchingIds.length ? matchingIds : [-999999];
+
+      const r = await db.query(q, [limit, slugs, idsParam]);
       rows = r.rows || [];
     } else {
       // No interest filter
@@ -341,7 +496,7 @@ async function getCandidates(options = {}) {
       rows = r.rows || [];
     }
   } catch (err) {
-    console.warn('DB candidate fetch failed:', err?.message || err);
+    console.warn("DB candidate fetch failed:", err?.message || err);
     rows = [];
   }
 
@@ -356,7 +511,7 @@ async function getCandidates(options = {}) {
       const diagonal = Math.round(haversineMeters(s, w, n, e));
       radiusMeters = Math.max(5000, Math.min(50000, Math.round(diagonal / 2)));
     }
-    dbCandidates = dbCandidatesAll.filter(c => {
+    dbCandidates = dbCandidatesAll.filter((c) => {
       if (c.lat === null || c.lng === null) return false;
       const d = haversineMeters(geo.lat, geo.lon, c.lat, c.lng);
       return isFinite(d) && d <= radiusMeters;
@@ -365,20 +520,38 @@ async function getCandidates(options = {}) {
 
   // 3) Query OSM when needed (pass interestSlugs for focused queries)
   let osmCandidates = [];
-  const needExtra = dbCandidates.length < Math.min(limit, 60) || explicitMusts.length > 0 || !geo;
+  const needExtra =
+    dbCandidates.length < Math.min(limit, 60) ||
+    explicitMusts.length > 0 ||
+    !geo;
   if (geo && (needExtra || dbCandidates.length === 0)) {
-    const nameRegexes = explicitMusts.map(s => escapeRegex(s)).slice(0, 10);
+    const nameRegexes = explicitMusts.map((s) => escapeRegex(s)).slice(0, 10);
     try {
       const bbox = geo.bbox;
       if (bbox && bbox.length === 4) {
-        osmCandidates = await queryOverpassByBBox(bbox, nameRegexes, Math.max(100, limit - dbCandidates.length), interestSlugs);
+        osmCandidates = await queryOverpassByBBox(
+          bbox,
+          nameRegexes,
+          Math.max(100, limit - dbCandidates.length),
+          interestSlugs
+        );
       } else {
         const delta = 0.25;
-        const bbox2 = [geo.lat - delta, geo.lon - delta, geo.lat + delta, geo.lon + delta];
-        osmCandidates = await queryOverpassByBBox(bbox2, nameRegexes, Math.max(50, limit - dbCandidates.length), interestSlugs);
+        const bbox2 = [
+          geo.lat - delta,
+          geo.lon - delta,
+          geo.lat + delta,
+          geo.lon + delta,
+        ];
+        osmCandidates = await queryOverpassByBBox(
+          bbox2,
+          nameRegexes,
+          Math.max(50, limit - dbCandidates.length),
+          interestSlugs
+        );
       }
     } catch (err) {
-      console.warn('Overpass bbox query failed:', err?.message || err);
+      console.warn("Overpass bbox query failed:", err?.message || err);
       osmCandidates = [];
     }
   } else if (!geo) {
@@ -387,8 +560,15 @@ async function getCandidates(options = {}) {
       if (c.lat && c.lng) {
         const delta = 0.25;
         try {
-          osmCandidates = await queryOverpassByBBox([c.lat-delta, c.lng-delta, c.lat+delta, c.lng+delta], [], 100, interestSlugs);
-        } catch (err) { osmCandidates = []; }
+          osmCandidates = await queryOverpassByBBox(
+            [c.lat - delta, c.lng - delta, c.lat + delta, c.lng + delta],
+            [],
+            100,
+            interestSlugs
+          );
+        } catch (err) {
+          osmCandidates = [];
+        }
       }
     }
   }
@@ -399,44 +579,72 @@ async function getCandidates(options = {}) {
   // 5) Ensure explicit mustVisits are included
   if (explicitMusts.length && geo) {
     for (const mv of explicitMusts) {
-      const present = candidates.find(c => c.titulo && c.titulo.toLowerCase().includes(mv.toLowerCase()));
+      const present = candidates.find(
+        (c) => c.titulo && c.titulo.toLowerCase().includes(mv.toLowerCase())
+      );
       if (!present) {
         try {
           const nameRegex = escapeRegex(mv);
-          const more = await queryOverpassByBBox(geo.bbox || [geo.lat-0.25, geo.lon-0.25, geo.lat+0.25, geo.lon+0.25], [nameRegex], 20, interestSlugs);
-          if (more && more.length) candidates = dedupeMerge(candidates, more, 50);
+          const more = await queryOverpassByBBox(
+            geo.bbox || [
+              geo.lat - 0.25,
+              geo.lon - 0.25,
+              geo.lat + 0.25,
+              geo.lon + 0.25,
+            ],
+            [nameRegex],
+            20,
+            interestSlugs
+          );
+          if (more && more.length)
+            candidates = dedupeMerge(candidates, more, 50);
         } catch (err) {}
       }
     }
   }
 
   // 6) Final scoring and interest-boosting
-  const maxRelev = Math.max(1, ...candidates.map(c => c.relevancia || 0));
+  const maxRelev = Math.max(1, ...candidates.map((c) => c.relevancia || 0));
   const interestTags = new Set();
   if (Array.isArray(interestSlugs)) {
     for (const s of interestSlugs) {
       const tags = INTEREST_TO_OSM[s];
-      if (Array.isArray(tags)) tags.forEach(t => interestTags.add(t));
+      if (Array.isArray(tags)) tags.forEach((t) => interestTags.add(t));
     }
   }
 
-  candidates = candidates.map(c => {
+  candidates = candidates.map((c) => {
     const lat = c.lat !== null && c.lat !== undefined ? Number(c.lat) : null;
     const lng = c.lng !== null && c.lng !== undefined ? Number(c.lng) : null;
     let isMust = false;
     if (explicitMusts.length && c.titulo) {
-      for (const mv of explicitMusts) { if (c.titulo.toLowerCase().includes(mv.toLowerCase())) { isMust = true; break; } }
+      for (const mv of explicitMusts) {
+        if (c.titulo.toLowerCase().includes(mv.toLowerCase())) {
+          isMust = true;
+          break;
+        }
+      }
     }
     const base = (c.relevancia || 0) / maxRelev;
-    const osmBoost = (c.source && String(c.source).includes('osm')) ? 0.2 : 0;
+    const osmBoost = c.source && String(c.source).includes("osm") ? 0.2 : 0;
     const mustBoost = isMust ? 1.5 : 0;
     let interestBoost = 0;
     if (c.osm && c.osm.tags) {
-      const amen = (c.osm.tags.amenity || c.osm.tags.tourism || c.osm.tags.leisure || '').toString().toLowerCase();
+      const amen = (
+        c.osm.tags.amenity ||
+        c.osm.tags.tourism ||
+        c.osm.tags.leisure ||
+        ""
+      )
+        .toString()
+        .toLowerCase();
       if (interestTags.has(amen)) interestBoost += 1.2;
     }
-    const combined = (base * 3.0) + osmBoost + mustBoost + interestBoost;
-    const distanceToCenter = (geo && geo.lat && lat && lng) ? Math.round(haversineMeters(geo.lat, geo.lon, lat, lng)) : null;
+    const combined = base * 3.0 + osmBoost + mustBoost + interestBoost;
+    const distanceToCenter =
+      geo && geo.lat && lat && lng
+        ? Math.round(haversineMeters(geo.lat, geo.lon, lat, lng))
+        : null;
     return {
       id: c.id,
       titulo: c.titulo,
@@ -445,11 +653,11 @@ async function getCandidates(options = {}) {
       lng,
       imagenes: c.imagenes || null,
       relevancia: c.relevancia || 0,
-      source: c.source || 'db',
+      source: c.source || "db",
       osm: c.osm || null,
       isMust: isMust,
       combined_score: combined,
-      distance_to_center: distanceToCenter
+      distance_to_center: distanceToCenter,
     };
   });
 
