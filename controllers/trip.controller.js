@@ -817,6 +817,69 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
+/**
+ * POST /trips/:id/share
+ * Create a share link (public or per-user) for a trip.
+ * Body:
+ *   { mode: 'viewer'|'editor', public: boolean, expires_in_days: number, shared_with_user_id: number }
+ * Returns: { url, share_uuid, id, created_at }
+ */
+router.post('/:id/share', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const tripId = Number(req.params.id);
+    if (!Number.isFinite(tripId) || tripId <= 0) return res.status(400).json({ message: 'Invalid trip id' });
+
+    const userId = req.user.id;
+    const { mode = 'viewer', public: isPublic = true, expires_in_days = null, shared_with_user_id = null } = req.body || {};
+
+    if (!['viewer','editor'].includes(mode)) return res.status(400).json({ message: 'Invalid mode' });
+
+    // Verify ownership
+    const t = await client.query('SELECT user_id FROM trips WHERE id = $1 LIMIT 1', [tripId]);
+    if (!t.rows.length) return res.status(404).json({ message: 'Trip not found' });
+    if (t.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
+
+    // compute expires_at if requested
+    let expiresAt = null;
+    if (expires_in_days && Number.isFinite(Number(expires_in_days))) {
+      const days = Number(expires_in_days);
+      const d = new Date();
+      d.setDate(d.getDate() + days);
+      expiresAt = d.toISOString();
+    }
+
+    // If shared_with_user_id provided, create a non-public share for that user
+    const sharedWith = shared_with_user_id ? Number(shared_with_user_id) : null;
+
+    await client.query('BEGIN');
+
+    const insertSQL = `
+      INSERT INTO trip_shares (trip_id, shared_by, shared_with, mode, public, expires_at)
+      VALUES ($1,$2,$3,$4,$5,$6)
+      RETURNING share_uuid, id, created_at
+    `;
+    const ins = await client.query(insertSQL, [tripId, userId, sharedWith, mode, isPublic, expiresAt]);
+
+    await client.query('COMMIT');
+
+    const row = ins.rows[0];
+    // build URL from request host/origin if possible
+    const proto = req.headers['x-forwarded-proto'] || (req.secure ? 'https' : 'http');
+    const host = req.get('host');
+    // public URL path we provide: /share/trip/:uuid
+    const url = `${proto}://${host}/share/trip/${row.share_uuid}`;
+
+    res.status(201).json({ url, share_uuid: row.share_uuid, id: row.id, created_at: row.created_at });
+  } catch (err) {
+    try { await client.query('ROLLBACK').catch(()=>{}); } catch (e) {}
+    console.error('POST /trips/:id/share error:', err);
+    res.status(500).json({ message: 'Error generando share' });
+  } finally {
+    client.release();
+  }
+});
+
 /* GET /trips/:id, PUT, DELETE, POST /trips/:id/places, DELETE /trips/:id/places/:placeId unchanged below - omitted for brevity in snippet */
 router.get('/:id', auth, async (req, res) => {
   try {
