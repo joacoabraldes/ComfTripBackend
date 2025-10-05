@@ -7,11 +7,20 @@ const auth = require('../middleware/auth');
 const router = express.Router();
 
 /**
- * POST /friends
+ * Nota importante:
+ * Este controller se monta en server.js como:
+ *   app.use('/api/friends', communityController);
+ *
+ * Por eso las rutas aquí deben ser relativas al mount point.
+ * Ej: router.get('/') => GET /api/friends
+ */
+
+/**
+ * POST /
  * Send a friend request.
  * Body: { addressee_id } OR { email }
  */
-router.post('/friends', auth, async (req, res) => {
+router.post('/', auth, async (req, res) => {
   try {
     const requesterId = req.user.id;
     const { addressee_id, email } = req.body;
@@ -26,9 +35,12 @@ router.post('/friends', auth, async (req, res) => {
     if (!addresseeId) return res.status(400).json({ message: 'addressee_id o email requerido' });
     if (Number(addresseeId) === requesterId) return res.status(400).json({ message: 'No puedes agregarte a ti mismo' });
 
-    // CHECK: select all fields so later code can check requester_id/addressee_id
+    // check if exists reverse or already accepted
     const existing = await pool.query(
-      'SELECT * FROM friend_requests WHERE (requester_id=$1 AND addressee_id=$2) OR (requester_id=$2 AND addressee_id=$1) LIMIT 1',
+      `SELECT id, status, requester_id, addressee_id
+       FROM friend_requests
+       WHERE (requester_id=$1 AND addressee_id=$2) OR (requester_id=$2 AND addressee_id=$1)
+       LIMIT 1`,
       [requesterId, addresseeId]
     );
 
@@ -43,7 +55,7 @@ router.post('/friends', auth, async (req, res) => {
         }
         return res.status(400).json({ message: 'Ya existe una solicitud pendiente' });
       }
-      // if rejected, allow to create new
+      // if rejected, allow to create new (we'll proceed)
     }
 
     const ins = await pool.query(
@@ -53,16 +65,16 @@ router.post('/friends', auth, async (req, res) => {
 
     res.status(201).json({ request: ins.rows[0] });
   } catch (err) {
-    console.error('POST /friends error:', err);
+    console.error('POST / (send friend) error:', err);
     res.status(500).json({ message: 'Error' });
   }
 });
 
 /**
- * GET /friends/requests
+ * GET /requests
  * List incoming friend requests (to the logged user) and outgoing
  */
-router.get('/friends/requests', auth, async (req, res) => {
+router.get('/requests', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     const incoming = await pool.query(
@@ -85,16 +97,16 @@ router.get('/friends/requests', auth, async (req, res) => {
     );
     res.json({ incoming: incoming.rows, outgoing: outgoing.rows });
   } catch (err) {
-    console.error('GET /friends/requests error:', err);
+    console.error('GET /requests error:', err);
     res.status(500).json({ message: 'Error' });
   }
 });
 
 /**
- * POST /friends/:id/accept
+ * POST /:id/accept
  * Accept an incoming request (id = friend_requests.id)
  */
-router.post('/friends/:id/accept', auth, async (req, res) => {
+router.post('/:id/accept', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     const reqId = Number(req.params.id);
@@ -107,16 +119,16 @@ router.post('/friends/:id/accept', auth, async (req, res) => {
     await pool.query('UPDATE friend_requests SET status=$1 WHERE id=$2', ['accepted', reqId]);
     res.json({ message: 'Solicitud aceptada' });
   } catch (err) {
-    console.error('POST /friends/:id/accept error:', err);
+    console.error('POST /:id/accept error:', err);
     res.status(500).json({ message: 'Error' });
   }
 });
 
 /**
- * POST /friends/:id/reject
+ * POST /:id/reject
  * Reject an incoming request
  */
-router.post('/friends/:id/reject', auth, async (req, res) => {
+router.post('/:id/reject', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     const reqId = Number(req.params.id);
@@ -129,16 +141,16 @@ router.post('/friends/:id/reject', auth, async (req, res) => {
     await pool.query('UPDATE friend_requests SET status=$1 WHERE id=$2', ['rejected', reqId]);
     res.json({ message: 'Solicitud rechazada' });
   } catch (err) {
-    console.error('POST /friends/:id/reject error:', err);
+    console.error('POST /:id/reject error:', err);
     res.status(500).json({ message: 'Error' });
   }
 });
 
 /**
- * DELETE /friends/:userId
+ * DELETE /:userId
  * Remove friendship between logged user and userId OR cancel outgoing request.
  */
-router.delete('/friends/:userId', auth, async (req, res) => {
+router.delete('/:userId', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     const otherId = Number(req.params.userId);
@@ -153,16 +165,16 @@ router.delete('/friends/:userId', auth, async (req, res) => {
     await pool.query('DELETE FROM friend_requests WHERE id = $1', [frId]);
     res.json({ message: 'Relación eliminada' });
   } catch (err) {
-    console.error('DELETE /friends/:userId error:', err);
+    console.error('DELETE /:userId error:', err);
     res.status(500).json({ message: 'Error' });
   }
 });
 
 /**
- * GET /friends
+ * GET /
  * List accepted friends (returns user's id, name, email)
  */
-router.get('/friends', auth, async (req, res) => {
+router.get('/', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     const q = `
@@ -178,7 +190,7 @@ router.get('/friends', auth, async (req, res) => {
     const rows = await pool.query(q, [userId]);
     res.json(rows.rows);
   } catch (err) {
-    console.error('GET /friends error:', err);
+    console.error('GET / error (list friends):', err);
     res.status(500).json({ message: 'Error' });
   }
 });
