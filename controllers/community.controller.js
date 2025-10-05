@@ -26,9 +26,9 @@ router.post('/friends', auth, async (req, res) => {
     if (!addresseeId) return res.status(400).json({ message: 'addressee_id o email requerido' });
     if (Number(addresseeId) === requesterId) return res.status(400).json({ message: 'No puedes agregarte a ti mismo' });
 
-    // check if exists reverse or already accepted
+    // CHECK: select all fields so later code can check requester_id/addressee_id
     const existing = await pool.query(
-      'SELECT id, status FROM friend_requests WHERE (requester_id=$1 AND addressee_id=$2) OR (requester_id=$2 AND addressee_id=$1) LIMIT 1',
+      'SELECT * FROM friend_requests WHERE (requester_id=$1 AND addressee_id=$2) OR (requester_id=$2 AND addressee_id=$1) LIMIT 1',
       [requesterId, addresseeId]
     );
 
@@ -43,7 +43,7 @@ router.post('/friends', auth, async (req, res) => {
         }
         return res.status(400).json({ message: 'Ya existe una solicitud pendiente' });
       }
-      // if rejected, allow to create new? we'll allow
+      // if rejected, allow to create new
     }
 
     const ins = await pool.query(
