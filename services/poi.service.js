@@ -1,7 +1,6 @@
 // services/poi.service.js
 // Improved POI fetcher that geocodes the trip destination and queries OSM using bbox.
-// Also filters DB results by proximity to the geocoded center to avoid returning far-away DB rows.
-// New: persists OSM candidates into `locations` to avoid repeated Overpass calls.
+// Persists OSM candidates into `locations` using bulk upsert (temp table) for speed.
 
 "use strict";
 
@@ -92,34 +91,85 @@ const INTEREST_TO_OSM = {
   otro: ['tourism','historic','leisure']
 };
 
-/* ---------- OSM normalization & scoring helpers ---------- */
-function normalizeOsmElement(el) {
+/* ---------- OSM normalization & helpers for insertion ---------- */
+function pickFirstImageFromTags(tags) {
+  if (!tags) return [];
+  const imgs = [];
+  if (tags.image) imgs.push(tags.image);
+  Object.keys(tags).forEach(k => { if (/^image(:\d+)?$/.test(k) && tags[k]) imgs.push(tags[k]); });
+  if (tags.photo) imgs.push(tags.photo);
+  return Array.from(new Set(imgs)).slice(0,6);
+}
+
+function parsePriceLevel(tags) {
+  if (!tags) return null;
+  const p = tags.price || tags.fee || tags['entrance_fee'] || tags['price_level'];
+  if (!p) return null;
+  if (/^\$+$/.test(String(p))) return String(p).length;
+  const m = String(p).match(/(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
+function heuristicAvgDuration(tags) {
+  if (!tags) return 90;
+  const tourism = (tags.tourism||'').toString().toLowerCase();
+  const amen = (tags.amenity||'').toString().toLowerCase();
+  const leisure = (tags.leisure||'').toString().toLowerCase();
+  if (['museum','aquarium','zoo'].includes(tourism)) return 120;
+  if (['attraction','viewpoint','memorial','gallery'].includes(tourism) || ['museum','gallery'].includes(amen)) return 90;
+  if (['park','garden','nature_reserve'].includes(leisure)) return 60;
+  if (['restaurant','cafe','bar','pub','fast_food'].includes(amen)) return 60;
+  return 90;
+}
+
+function normalizeOsmForInsert(el) {
+  if (!el || !el.tags) return null;
   const tags = el.tags || {};
-  const amenity = tags.amenity || null;
-  const tourism = tags.tourism || null;
-  const leisure = tags.leisure || null;
-
-  // filter obvious service-only elements
-  if (amenity && OSM_UNWANTED_AMENITIES.has(amenity)) return null;
-  if (tourism && OSM_UNWANTED_TOURISM.has(tourism)) return null;
-
   const name = tags.name || tags['name:en'] || tags.int_name || null;
   const lat = (el.lat !== undefined && el.lat !== null) ? Number(el.lat) : (el.center && el.center.lat ? Number(el.center.lat) : null);
   const lon = (el.lon !== undefined && el.lon !== null) ? Number(el.lon) : (el.center && el.center.lon ? Number(el.center.lon) : null);
-  const id = `osm-${el.type}-${el.id}`;
-  const titleFallback = amenity || tourism || leisure || tags.historic || 'unnamed';
+  const amenity = tags.amenity || null;
+  const tourism = tags.tourism || null;
+
+  if (amenity && OSM_UNWANTED_AMENITIES.has(amenity)) return null;
+  if (tourism && OSM_UNWANTED_TOURISM.has(tourism)) return null;
+  if (!name || lat === null || lon === null) return null;
+
+  const photos = pickFirstImageFromTags(tags);
+  const phone = tags.phone || tags['contact:phone'] || null;
+  const website = tags.website || tags['contact:website'] || null;
+  const opening_hours = tags.opening_hours || null;
+  // We don't attempt to parse opening_hours here (opening_hours lib optional),
+  // we store raw string; the populate script can enhance if library is installed.
+  const opening_hours_parsed = opening_hours ? { raw: opening_hours } : null;
+  const price_level = parsePriceLevel(tags);
+  const tags_json = tags;
+  const osm_id = el.id;
+  const osm_type = el.type;
+  const wikidata = tags.wikidata || null;
+  const wikipedia = tags.wikipedia || null;
+  const timezone = tags['addr:timezone'] || null;
+  const avg_duration_min = heuristicAvgDuration(tags);
 
   return {
-    id,
-    titulo: name || titleFallback,
-    fk_interest: null,
-    lat,
-    lng: lon,
-    imagenes: null,
+    titulo: name.trim(),
+    latitud: lat,
+    longitud: lon,
     relevancia: 5,
-    source: 'osm',
-    osm: { type: el.type, osm_id: el.id, tags },
-    osmTag: amenity || tourism || leisure || null
+    descripcion: JSON.stringify({ source: 'osm', tags }).slice(0, 2000),
+    opening_hours,
+    opening_hours_parsed,
+    phone,
+    website,
+    photos,
+    price_level,
+    tags_json,
+    osm_id,
+    osm_type,
+    wikidata,
+    wikipedia,
+    timezone,
+    avg_duration_min
   };
 }
 
@@ -206,7 +256,7 @@ async function geocodeDestination(query) {
   }
 }
 
-/* ---------- Overpass bbox query ---------- */
+/* ---------- Overpass bbox query (unchanged) ---------- */
 function escapeRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\\\$&'); }
 
 async function queryOverpassByBBox(bbox, extraNameRegexes = [], limit = 200, interestSlugs = []) {
@@ -228,7 +278,6 @@ async function queryOverpassByBBox(bbox, extraNameRegexes = [], limit = 200, int
       clauses.push(`way["leisure"~"pitch|sports_centre|stadium|fitness_centre|sports_hall"](${south},${west},${north},${east});`);
       clauses.push(`node["tourism"~"stadium|sports_centre"](${south},${west},${north},${east});`);
     }
-    // if other interest slugs exist, we still want a broad set
     if (clauses.length === 0) {
       clauses.push(
         `node["tourism"](${south},${west},${north},${east});`,
@@ -280,67 +329,276 @@ out center ${Math.min(limit, 500)};`;
   }
 }
 
-/* ---------- Persist OSM candidates to DB (avoid duplicates) ---------- */
-/*
-  Strategy:
-   - For each osm candidate:
-     1) skip if no title or coords
-     2) try find existing by exact lower(titulo) -> use existing id
-     3) try find nearby by lat/lng bbox -> use existing id
-     4) otherwise INSERT into locations and return inserted row
-*/
-async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null) {
-  if (!Array.isArray(osmCandidates) || osmCandidates.length === 0) return [];
-  const inserted = [];
-  const LAT_LNG_EPS = 0.0006; // ~50-70 meters
-  const insertSQL = `INSERT INTO locations (titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country, avg_duration_min, popularity)
-                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-                     RETURNING id, titulo, latitud, longitud, imagenes, relevancia, country`;
-  for (const cand of osmCandidates) {
-    try {
-      const title = (cand.titulo || '').trim();
-      const lat = (cand.lat !== null && cand.lat !== undefined) ? Number(cand.lat) : null;
-      const lng = (cand.lng !== null && cand.lng !== undefined) ? Number(cand.lng) : null;
-      if (!title || lat === null || lng === null) continue;
+// keep older, simpler normalizer used for immediate query->candidate mapping
+function normalizeOsmElement(el) {
+  const tags = el.tags || {};
+  const amenity = tags.amenity || null;
+  const tourism = tags.tourism || null;
+  const leisure = tags.leisure || null;
 
-      // 1) exact title match
-      const found = await db.query('SELECT id, titulo, latitud, longitud, imagenes, relevancia, country FROM locations WHERE lower(titulo) = lower($1) LIMIT 1', [title]);
-      if (found.rows.length) {
-        // found existing; nothing to insert
-        continue;
-      }
+  if (amenity && OSM_UNWANTED_AMENITIES.has(amenity)) return null;
+  if (tourism && OSM_UNWANTED_TOURISM.has(tourism)) return null;
 
-      // 2) fuzzy ILIKE match
-      const found2 = await db.query('SELECT id, titulo, latitud, longitud, imagenes, relevancia, country FROM locations WHERE titulo ILIKE $1 LIMIT 1', [`%${title}%`]);
-      if (found2.rows.length) { continue; }
+  const name = tags.name || tags['name:en'] || tags.int_name || null;
+  const lat = (el.lat !== undefined && el.lat !== null) ? Number(el.lat) : (el.center && el.center.lat ? Number(el.center.lat) : null);
+  const lon = (el.lon !== undefined && el.lon !== null) ? Number(el.lon) : (el.center && el.center.lon ? Number(el.center.lon) : null);
+  const id = `osm-${el.type}-${el.id}`;
+  const titleFallback = amenity || tourism || leisure || tags.historic || 'unnamed';
 
-      // 3) proximity match
-      const nearby = await db.query('SELECT id FROM locations WHERE latitud IS NOT NULL AND longitud IS NOT NULL AND abs(latitud - $1) < $3 AND abs(longitud - $2) < $3 LIMIT 1', [lat, lng, LAT_LNG_EPS]);
-      if (nearby.rows.length) continue;
-
-      // 4) insert new location
-      const descripcion = JSON.stringify({ source: 'osm', osm: cand.osm }).slice(0, 2000);
-      const imagenes = null;
-      const relevancia = cand.relevancia || 5;
-      const avg_duration_min = 90;
-      const popularity = null;
-
-      const r = await db.query(insertSQL, [title, null, descripcion, lat, lng, imagenes, relevancia, country || null, avg_duration_min, popularity]);
-      if (r.rows && r.rows.length) {
-        inserted.push(r.rows[0]);
-      }
-      // small throttle (optional) - commented out for speed; enable if Overpass-heavy
-      // await new Promise(r => setTimeout(r, 40));
-    } catch (err) {
-      // don't break whole flow if one insert fails
-      console.warn('persistOsmCandidatesToDb: error for', cand && cand.titulo, err?.message || err);
-      continue;
-    }
-  }
-  return inserted;
+  return {
+    id,
+    titulo: name || titleFallback,
+    fk_interest: null,
+    lat,
+    lng: lon,
+    imagenes: null,
+    relevancia: 5,
+    source: 'osm',
+    osm: { type: el.type, osm_id: el.id, tags },
+    osmTag: amenity || tourism || leisure || null
+  };
 }
 
-/* ---------- Main exported function ---------- */
+/* ---------- Persist OSM candidates to DB using bulk upsert (fast) ---------- */
+/*
+ Strategy:
+  - normalize OSM elements to full candidate objects (with tags, photos, osm_id...)
+  - use a temp table and single multi-row INSERT into tmp_pois
+  - perform 3 set-based SQL ops:
+     1) update by exact title+country+city (coalesce missing fields)
+     2) update by proximity for rows with osm_id IS NULL (avoid overwriting authoritative osm rows)
+     3) insert remaining rows that do not exist by title+country+city or proximity
+  - finally SELECT matching rows from locations (by lower(titulo) and/or osm_id) and return them
+*/
+const LAT_LNG_EPS = 0.0006; // ~50-70 meters
+
+async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, city = null) {
+  if (!Array.isArray(osmCandidates) || osmCandidates.length === 0) return [];
+  // normalize
+  const norm = [];
+  for (const c of osmCandidates) {
+    // if element is raw OSM element, convert to richer structure for insert
+    const candidate = normalizeOsmForInsert(c._raw || c._raw === undefined ? c : c._raw);
+    if (candidate) norm.push(candidate);
+  }
+  if (!norm.length) return [];
+
+  // use client (db may be Pool or client)
+  let client = db;
+  let mustRelease = false;
+  try {
+    if (typeof db.connect === 'function') {
+      client = await db.connect();
+      mustRelease = true;
+    }
+  } catch (e) {
+    // keep db as-is and try to use .query directly
+    client = db;
+    mustRelease = false;
+  }
+
+  try {
+    // Begin transaction
+    await client.query('BEGIN');
+
+    // Create temp table
+    await client.query(`CREATE TEMP TABLE tmp_pois (
+      titulo text,
+      latitud double precision,
+      longitud double precision,
+      descripcion text,
+      relevancia numeric,
+      opening_hours jsonb,
+      opening_hours_parsed jsonb,
+      phone text,
+      website text,
+      photos jsonb,
+      price_level smallint,
+      tags jsonb,
+      osm_id bigint,
+      osm_type text,
+      wikidata text,
+      wikipedia text,
+      timezone text,
+      avg_duration_min integer
+    ) ON COMMIT DROP;`);
+
+    // Bulk insert into tmp_pois with parameterized placeholders
+    const vals = [];
+    const placeholders = [];
+    for (let i=0;i<norm.length;i++){
+      const idx = i*18;
+      placeholders.push(`($${idx+1},$${idx+2},$${idx+3},$${idx+4},$${idx+5},$${idx+6}::jsonb,$${idx+7}::jsonb,$${idx+8},$${idx+9},$${idx+10}::jsonb,$${idx+11},$${idx+12}::jsonb,$${idx+13},$${idx+14},$${idx+15},$${idx+16},$${idx+17},$${idx+18})`);
+      const c = norm[i];
+      vals.push(
+        c.titulo, c.latitud, c.longitud, c.descripcion, c.relevancia || 5,
+        JSON.stringify(c.opening_hours ? { raw: c.opening_hours } : (c.opening_hours_parsed || null)),
+        JSON.stringify(c.opening_hours_parsed || null),
+        c.phone || null,
+        c.website || null,
+        JSON.stringify(c.photos || []),
+        c.price_level || null,
+        JSON.stringify(c.tags_json || {}),
+        c.osm_id || null,
+        c.osm_type || null,
+        c.wikidata || null,
+        c.wikipedia || null,
+        c.timezone || null,
+        c.avg_duration_min || 90
+      );
+    }
+    const insertTmpSql = `INSERT INTO tmp_pois (titulo, latitud, longitud, descripcion, relevancia, opening_hours, opening_hours_parsed, phone, website, photos, price_level, tags, osm_id, osm_type, wikidata, wikipedia, timezone, avg_duration_min) VALUES ${placeholders.join(',')};`;
+    await client.query(insertTmpSql, vals);
+
+    // 1) update by exact title + country + city
+    const updateByTitleSql = `
+      WITH updated AS (
+        UPDATE locations l
+        SET
+          descripcion = COALESCE(l.descripcion, t.descripcion),
+          latitud = COALESCE(l.latitud, t.latitud),
+          longitud = COALESCE(l.longitud, t.longitud),
+          opening_hours = COALESCE(l.opening_hours, t.opening_hours),
+          opening_hours_parsed = COALESCE(l.opening_hours_parsed, t.opening_hours_parsed),
+          phone = COALESCE(l.phone, t.phone),
+          website = COALESCE(l.website, t.website),
+          photos = COALESCE(l.photos, t.photos),
+          price_level = COALESCE(l.price_level, t.price_level),
+          tags = COALESCE(l.tags, t.tags),
+          osm_id = COALESCE(l.osm_id, t.osm_id),
+          osm_type = COALESCE(l.osm_type, t.osm_type),
+          wikidata = COALESCE(l.wikidata, t.wikidata),
+          wikipedia = COALESCE(l.wikipedia, t.wikipedia),
+          timezone = COALESCE(l.timezone, t.timezone),
+          avg_duration_min = COALESCE(l.avg_duration_min, t.avg_duration_min),
+          country = COALESCE(l.country, $1::text),
+          city = COALESCE(l.city, $2::text),
+          last_osm_sync = now(),
+          titulo_lower = lower(coalesce(l.titulo, t.titulo))
+        FROM tmp_pois t
+        WHERE lower(l.titulo) = lower(t.titulo)
+          AND coalesce(l.country,'') = coalesce($1::text,'')
+          AND coalesce(l.city,'') = coalesce($2::text,'')
+        RETURNING l.id
+      )
+      SELECT COUNT(*) as cnt FROM updated;
+    `;
+    const upTitleRes = await client.query(updateByTitleSql, [country || null, city || null]);
+    const updated_by_title = upTitleRes.rows && Number(upTitleRes.rows[0].cnt || 0) || 0;
+
+    // 2) update by proximity for rows that don't have osm_id
+    const updateByProxSql = `
+      WITH updated AS (
+        UPDATE locations l
+        SET
+          descripcion = COALESCE(l.descripcion, t.descripcion),
+          latitud = COALESCE(l.latitud, t.latitud),
+          longitud = COALESCE(l.longitud, t.longitud),
+          opening_hours = COALESCE(l.opening_hours, t.opening_hours),
+          opening_hours_parsed = COALESCE(l.opening_hours_parsed, t.opening_hours_parsed),
+          phone = COALESCE(l.phone, t.phone),
+          website = COALESCE(l.website, t.website),
+          photos = COALESCE(l.photos, t.photos),
+          price_level = COALESCE(l.price_level, t.price_level),
+          tags = COALESCE(l.tags, t.tags),
+          osm_id = COALESCE(l.osm_id, t.osm_id),
+          osm_type = COALESCE(l.osm_type, t.osm_type),
+          wikidata = COALESCE(l.wikidata, t.wikidata),
+          wikipedia = COALESCE(l.wikipedia, t.wikipedia),
+          timezone = COALESCE(l.timezone, t.timezone),
+          avg_duration_min = COALESCE(l.avg_duration_min, t.avg_duration_min),
+          country = COALESCE(l.country, $3::text),
+          city = COALESCE(l.city, $4::text),
+          last_osm_sync = now(),
+          titulo_lower = lower(coalesce(l.titulo, t.titulo))
+        FROM tmp_pois t
+        WHERE l.osm_id IS NULL
+          AND l.latitud IS NOT NULL AND l.longitud IS NOT NULL
+          AND abs(l.latitud - t.latitud) < $1::double precision AND abs(l.longitud - t.longitud) < $1::double precision
+          AND coalesce(l.country,'') = coalesce($3::text,'')
+          AND coalesce(l.city,'') = coalesce($4::text,'')
+        RETURNING l.id
+      )
+      SELECT COUNT(*) as cnt FROM updated;
+    `;
+    const upProxRes = await client.query(updateByProxSql, [LAT_LNG_EPS, /*unused*/null, country || null, city || null]);
+    const updated_by_proximity = upProxRes.rows && Number(upProxRes.rows[0].cnt || 0) || 0;
+
+    // 3) insert remaining rows that don't exist by title+country+city or proximity
+    const insertSql = `
+      WITH ins AS (
+        INSERT INTO locations (
+          titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country, city,
+          opening_hours, opening_hours_parsed, phone, website, photos, price_level, tags,
+          osm_id, osm_type, wikidata, wikipedia, timezone, avg_duration_min, last_osm_sync, titulo_lower
+        )
+        SELECT
+          t.titulo, NULL, t.descripcion, t.latitud, t.longitud, NULL, COALESCE(t.relevancia,5), $1::text, $2::text,
+          t.opening_hours, t.opening_hours_parsed, t.phone, t.website, t.photos, t.price_level, t.tags,
+          t.osm_id, t.osm_type, t.wikidata, t.wikipedia, t.timezone, COALESCE(t.avg_duration_min,90), now(), lower(coalesce(t.titulo,''))
+        FROM tmp_pois t
+        WHERE NOT EXISTS (
+          SELECT 1 FROM locations l
+          WHERE (lower(l.titulo) = lower(t.titulo) AND coalesce(l.country,'') = coalesce($1::text,'') AND coalesce(l.city,'') = coalesce($2::text,''))
+             OR (l.latitud IS NOT NULL AND l.longitud IS NOT NULL AND abs(l.latitud - t.latitud) < $3::double precision AND abs(l.longitud - t.longitud) < $3::double precision AND coalesce(l.country,'') = coalesce($1::text,'') AND coalesce(l.city,'') = coalesce($2::text,''))
+        )
+        RETURNING id
+      )
+      SELECT COUNT(*) as inserted_count FROM ins;
+    `;
+    const insertRes = await client.query(insertSql, [country || null, city || null, LAT_LNG_EPS]);
+    const inserted = insertRes.rows && Number(insertRes.rows[0].inserted_count || 0) || 0;
+
+    // Commit
+    await client.query('COMMIT');
+
+    // Now fetch inserted/updated rows to return them.
+    // We'll pick by lower(titulo) IN (...) and osm_id IN (...). Build arrays.
+    const tituloList = norm.map(n => (n.titulo || '').toLowerCase()).filter(Boolean);
+    const osmIdList = norm.map(n => n.osm_id).filter(v => v !== null && v !== undefined);
+
+    const fetchClauses = [];
+    const fetchParams = [];
+    let paramIdx = 1;
+    if (tituloList.length) {
+      fetchClauses.push(`lower(titulo) = ANY($${paramIdx})`);
+      fetchParams.push(tituloList);
+      paramIdx++;
+    }
+    if (osmIdList.length) {
+      fetchClauses.push(`osm_id = ANY($${paramIdx})`);
+      fetchParams.push(osmIdList);
+      paramIdx++;
+    }
+    // fallback: fetch near by bbox to catch any proximity-updates (rare)
+    if (!fetchClauses.length) {
+      // nothing to match; return empty
+      return [];
+    }
+    const fetchSql = `SELECT id, titulo, latitud, longitud, imagenes, relevancia, country FROM locations WHERE ${fetchClauses.join(' OR ')} LIMIT 500;`;
+    const fetchRes = await client.query(fetchSql, fetchParams);
+    const rows = (fetchRes.rows || []).map(r => ({
+      id: r.id,
+      titulo: r.titulo,
+      latitud: r.latitud,
+      longitud: r.longitud,
+      imagenes: r.imagenes || null,
+      relevancia: r.relevancia || 5,
+      country: r.country || country || null
+    }));
+
+    // Return rows in similar shape to earlier persist function (so caller can merge)
+    return rows;
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (e) {}
+    console.warn('persistOsmCandidatesToDb (bulk) failed:', err?.message || err);
+    return [];
+  } finally {
+    if (mustRelease && client && typeof client.release === 'function') client.release();
+  }
+}
+
+/* ---------- Main exported function (unchanged logic but uses bulk persist) ---------- */
 /**
  * options: { db, interestSlugs, country, destination, limit, mustVisits, notes }
  * db = pg pool (has .query)
@@ -459,15 +717,23 @@ async function getCandidates(options = {}) {
     }
   }
 
-  // Persist new OSM candidates into DB (so next request will pick them from DB)
+  // Persist new OSM candidates into DB (so next request will pick them from DB) - bulk upsert
   if (Array.isArray(osmCandidates) && osmCandidates.length && db) {
     try {
-      // persist and get inserted rows (normalized)
-      const inserted = await persistOsmCandidatesToDb(osmCandidates, db, country);
-      // merge inserted rows into dbCandidatesAll so dedupeMerge can combine properly
-      if (inserted && inserted.length) {
-        const normInserted = inserted.map(r => ({ id: r.id, titulo: r.titulo, fk_interest: null, lat: r.latitud !== null && r.latitud !== undefined ? Number(r.latitud) : null, lng: r.longitud !== null && r.longitud !== undefined ? Number(r.longitud) : null, imagenes: r.imagenes || null, relevancia: r.relevancia || 5, country: r.country || country || null, source: 'db+osm' }));
-        // add to dbCandidatesAll for later merging; but avoid duplicates
+      const insertedRows = await persistOsmCandidatesToDb(osmCandidates, db, country, geo && geo.raw && geo.raw.display_name ? (geo.raw.display_name.split(',')[0] || null) : null);
+      // normalize inserted rows for merging - keep consistent shape as earlier
+      if (insertedRows && insertedRows.length) {
+        const normInserted = insertedRows.map(r => ({
+          id: r.id,
+          titulo: r.titulo,
+          fk_interest: null,
+          lat: r.latitud !== null && r.latitud !== undefined ? Number(r.latitud) : null,
+          lng: r.longitud !== null && r.longitud !== undefined ? Number(r.longitud) : null,
+          imagenes: r.imagenes || null,
+          relevancia: r.relevancia || 5,
+          country: r.country || country || null,
+          source: 'db+osm'
+        }));
         for (const ni of normInserted) {
           if (!dbCandidatesAll.find(x => String(x.id) === String(ni.id))) dbCandidatesAll.push(ni);
         }

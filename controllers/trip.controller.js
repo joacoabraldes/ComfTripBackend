@@ -1,4 +1,3 @@
-// controllers/trip.controller.js
 'use strict';
 
 const express = require('express');
@@ -69,6 +68,7 @@ function normalizeTripRow(row) {
   };
 }
 
+// Updated PLACES_AGG_SUBQUERY to include new columns added to `locations`
 const PLACES_AGG_SUBQUERY = `
   SELECT fk_trips,
          json_agg(json_build_object(
@@ -85,7 +85,15 @@ const PLACES_AGG_SUBQUERY = `
              'latitude', l.latitud,
              'longitude', l.longitud,
              'imagenes', l.imagenes,
-             'relevancia', l.relevancia
+             'relevancia', l.relevancia,
+             'opening_hours', l.opening_hours,
+             'opening_hours_parsed', l.opening_hours_parsed,
+             'photos', l.photos,
+             'avg_duration_min', l.avg_duration_min,
+             'timezone', l.timezone,
+             'price_level', l.price_level,
+             'tags', l.tags,
+             'osm_id', l.osm_id
            )
          ) ORDER BY tp.date, tp.start_hour) AS places
   FROM trip_places tp
@@ -163,7 +171,6 @@ function extractJsonFromText(text) {
         const expected = stack.pop();
         if (ch !== expected) {
           // mismatch -> try to continue but this likely fails parse
-          // break early if stack empty and mismatch doesn't make sense
         }
         if (stack.length === 0) {
           const candidate = text.slice(startIdx, i + 1);
@@ -300,33 +307,65 @@ async function callHF(promptOrMessages, opts = {}) {
 /**
  * Simple greedy itinerary generator used as a final fallback.
  * Distributes topCandidates across days respecting daily_hours and visit_default_minutes.
+ * Now uses candidate.avg_duration_min when available and respects a simple opening-hours window heuristic.
  */
+function parseTimeToMinutes(t) {
+  if (!t || typeof t !== 'string') return null;
+  const hh = Number(t.slice(0,2));
+  const mm = Number(t.slice(3,5) || 0);
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  return hh*60 + mm;
+}
+
+function minutesToHHMM(m) {
+  if (!Number.isFinite(m)) return null;
+  const hh = Math.floor(m/60).toString().padStart(2,'0');
+  const mm = Math.round(m%60).toString().padStart(2,'0');
+  return `${hh}:${mm}`;
+}
+
+function extractOpeningWindowFromString(openingStr) {
+  if (!openingStr || typeof openingStr !== 'string') return null;
+  // very simple regex to find first occurrence of HH:MM-HH:MM
+  const re = /([01]?\d|2[0-3]):([0-5]\d)\s*-\s*([01]?\d|2[0-3]):([0-5]\d)/;
+  const m = openingStr.match(re);
+  if (!m) return null;
+  const open = `${m[1].padStart(2,'0')}:${m[2].padStart(2,'0')}`;
+  const close = `${m[3].padStart(2,'0')}:${m[4].padStart(2,'0')}`;
+  return [open, close];
+}
+
 function simpleGreedyGenerator({ candidates, days, spec }) {
   if (!Array.isArray(candidates) || candidates.length === 0) return [];
-  const visitDefault = Number(spec?.visit_default_minutes || 90);
-  const startMin = (() => {
+  const defaultVisit = Number(spec?.visit_default_minutes || 90);
+  const startMinGlobal = (() => {
     const s = spec?.daily_hours?.start || '09:00';
-    return Number(s.slice(0,2)) * 60 + Number(s.slice(3,5) || 0);
+    return parseTimeToMinutes(s) ?? (9*60);
   })();
-  const endMin = (() => {
+  const endMinGlobal = (() => {
     const e = spec?.daily_hours?.end || '18:00';
-    return Number(e.slice(0,2)) * 60 + Number(e.slice(3,5) || 0);
+    return parseTimeToMinutes(e) ?? (18*60);
   })();
-  const dayCapacity = Math.max(60, endMin - startMin);
-  // compute simple travel minutes between sequential items using haversine (assume walking/driving speed)
-  const speedMetersPerMin = 500; // ~30 km/h -> 500 m/min (adjustable)
-  // sort candidates descending by combined_score
+  const dayCapacity = Math.max(60, endMinGlobal - startMinGlobal);
+  const speedMetersPerMin = 500; // ~30 km/h -> 500 m/min
+
   const sorted = [...candidates].sort((a,b)=> (b.combined_score||0) - (a.combined_score||0));
   const assigned = new Set();
   const itinerary = [];
+
   for (let d = 0; d < days.length; d++) {
     const dayDate = days[d] instanceof Date ? days[d].toISOString().slice(0,10) : (new Date(days[d]).toISOString().slice(0,10));
     let remaining = dayCapacity;
     const visits = [];
     let prev = null;
+    let cursorMin = startMinGlobal; // minutes from midnight
+
     for (let i=0;i<sorted.length;i++) {
       const cand = sorted[i];
       if (assigned.has(cand.id)) continue;
+      // determine visit duration (prefer candidate.avg_duration_min)
+      const visitDur = Number(cand.avg_duration_min) && Number(cand.avg_duration_min) > 0 ? Number(cand.avg_duration_min) : defaultVisit;
+
       // compute travel to this from prev
       let travelMin = 0;
       if (prev && cand.lat != null && prev.lat != null) {
@@ -335,32 +374,70 @@ function simpleGreedyGenerator({ candidates, days, spec }) {
       } else {
         travelMin = 10; // small default initial travel
       }
-      const needed = travelMin + visitDefault;
+
+      let proposedStart = cursorMin + travelMin;
+      let proposedEnd = proposedStart + visitDur;
+
+      // try respect simple opening hours heuristic if available
+      let window = null;
+      if (cand.opening_hours_parsed && cand.opening_hours_parsed.is_open_now === true) {
+        // if parsed exists and indicates open_now, accept
+      } else if (cand.opening_hours) {
+        window = extractOpeningWindowFromString(typeof cand.opening_hours === 'string' ? cand.opening_hours : String(cand.opening_hours));
+      }
+      if (window) {
+        const openMin = parseTimeToMinutes(window[0]);
+        const closeMin = parseTimeToMinutes(window[1]);
+        // shift proposedStart to be at least openMin
+        if (proposedStart < openMin) {
+          proposedStart = openMin;
+          proposedEnd = proposedStart + visitDur;
+        }
+        // if it doesn't fit before close, try reduce duration
+        if (proposedEnd > closeMin) {
+          const avail = Math.max(0, closeMin - proposedStart);
+          if (avail < 15) {
+            // can't schedule this visit in this window
+            continue;
+          }
+          // reduce visit to fit available time
+          proposedEnd = closeMin;
+        }
+      }
+
+      const needed = (proposedEnd - cursorMin) || (travelMin + visitDur);
       if (needed <= remaining) {
         visits.push({
           id: cand.id,
           titulo: cand.titulo,
-          visit_minutes: visitDefault,
+          visit_minutes: (proposedEnd - proposedStart),
           travel_to_prev_minutes: travelMin,
+          start_min: proposedStart,
+          end_min: proposedEnd,
+          start_time: minutesToHHMM(proposedStart),
+          end_time: minutesToHHMM(proposedEnd),
           reason: cand.llm_reason || null,
           score: cand.combined_score || null
         });
         assigned.add(cand.id);
         remaining -= needed;
+        cursorMin = proposedEnd; // next cursor
         prev = cand;
       }
-      if (remaining < visitDefault + 5) break;
+      if (remaining < 15) break;
     }
-    itinerary.push({ date: dayDate, visits });
+    // transform visits to expected output shape
+    const visitsOut = visits.map(v => ({ id: v.id, titulo: v.titulo, visit_minutes: v.visit_minutes, travel_to_prev_minutes: v.travel_to_prev_minutes, start: v.start_time, end: v.end_time, reason: v.reason, score: v.score }));
+    itinerary.push({ date: dayDate, visits: visitsOut });
   }
-  // If nothing assigned (rare), assign at least one POI per day from top candidates
+
   const anyAssigned = itinerary.some(d => (d.visits && d.visits.length));
   if (!anyAssigned) {
     const fallbackDays = [];
     for (let d=0; d<days.length; d++) {
       const dayDate = days[d] instanceof Date ? days[d].toISOString().slice(0,10) : (new Date(days[d]).toISOString().slice(0,10));
       const cand = sorted[d % sorted.length];
-      fallbackDays.push({ date: dayDate, visits: [{ id: cand.id, titulo: cand.titulo, visit_minutes: visitDefault, travel_to_prev_minutes: 10, reason: 'fallback' }]});
+      fallbackDays.push({ date: dayDate, visits: [{ id: cand.id, titulo: cand.titulo, visit_minutes: defaultVisit, travel_to_prev_minutes: 10, start: minutesToHHMM(startMinGlobal), end: minutesToHHMM(startMinGlobal + defaultVisit), reason: 'fallback' }]});
     }
     return fallbackDays;
   }
@@ -415,6 +492,30 @@ router.get('/:id/itinerary', auth, async (req, res) => {
     candidates.sort((a,b) => (b.relevancia || 0) - (a.relevancia || 0));
     const topCandidates = candidates.slice(0, topK);
 
+    // --- ENRICH topCandidates with full location fields (opening_hours, avg_duration_min, photos, tags, timezone)
+    try {
+      const ids = topCandidates.map(p => p.id).filter(Boolean);
+      if (ids.length) {
+        const q = `SELECT id, opening_hours, opening_hours_parsed, photos, avg_duration_min, timezone, price_level, tags, imagenes FROM locations WHERE id = ANY($1)`;
+        const r = await pool.query(q, [ids]);
+        const map = new Map(r.rows.map(rr => [String(rr.id), rr]));
+        for (const p of topCandidates) {
+          const rr = map.get(String(p.id));
+          if (rr) {
+            p.opening_hours = rr.opening_hours || null;
+            p.opening_hours_parsed = rr.opening_hours_parsed || null;
+            p.photos = rr.photos || rr.imagenes || null;
+            p.avg_duration_min = Number(rr.avg_duration_min) || p.avg_duration_min || null;
+            p.timezone = rr.timezone || null;
+            p.price_level = rr.price_level || null;
+            p.tags = rr.tags || null;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('Could not enrich topCandidates from DB:', err?.message || err);
+    }
+
     // 4) Parse user preferences into a structured spec
     const prefPrompt = `
 You are a trip-spec parser. Input: user preferences and trip metadata. Output: EXACT JSON with keys:
@@ -452,7 +553,12 @@ Return only JSON.
 
     // 5) Score POIs semantically with HF (batched)
     const smallPois = topCandidates.map((p, idx) => ({
-      id: p.id, title: p.titulo, interest: p.fk_interest, country: p.country, relevancia: p.relevancia || 0, idx
+      id: p.id, title: p.titulo, interest: p.fk_interest, country: p.country, relevancia: p.relevancia || 0, idx,
+      opening_hours: p.opening_hours || null,
+      avg_duration_min: p.avg_duration_min || null,
+      photos: p.photos || null,
+      price_level: p.price_level || null,
+      tags: p.tags || null
     }));
     const batchSize = Number(process.env.HF_BATCH) || 12;
     const scoreResults = [];
@@ -486,7 +592,8 @@ Return only JSON.
       const s = scoreMap.get(p.id);
       p.llm_score = s ? Number(s.score) : 1.0;
       p.llm_reason = s ? String(s.reason).slice(0,200) : null;
-      p.combined_score = ((p.relevancia || 0) * 0.6) + ((p.llm_score || 1) * 2.0);
+      // use avg_duration_min if available for combined scoring influence
+      p.combined_score = ((p.relevancia || 0) * 0.5) + ((p.llm_score || 1) * 2.0) + ((p.avg_duration_min || 90) / 120);
     });
     topCandidates.sort((a,b)=> (b.combined_score || 0) - (a.combined_score || 0));
 
@@ -538,8 +645,8 @@ Return only JSON.
     // repair/validate
     function validateAndRepair(itin) {
       const maxDailyMinutes = spec.max_travel_minutes_per_day || 24*60;
-      const startMin = Number(spec.daily_hours?.start?.slice(0,2)) * 60 + Number(spec.daily_hours?.start?.slice(3,5) || 0);
-      const endMin = Number(spec.daily_hours?.end?.slice(0,2)) * 60 + Number(spec.daily_hours?.end?.slice(3,5) || 0);
+      const startMin = parseTimeToMinutes(spec.daily_hours?.start || '09:00');
+      const endMin = parseTimeToMinutes(spec.daily_hours?.end || '18:00');
       const dayCapacity = Math.max(60, endMin - startMin);
       for (const day of itin) {
         let total = 0;
@@ -582,8 +689,8 @@ Return only JSON.
         'INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, fk_locations, fk_trips, date, start_hour, end_hour, notes, created_at';
 
       const insertLocationSQL =
-        `INSERT INTO locations (titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country, opening_hours, timezone, avg_duration_min, popularity)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`;
+        `INSERT INTO locations (titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country, opening_hours, opening_hours_parsed, timezone, avg_duration_min, popularity)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12,$13) RETURNING id`;
 
       // helper
       const toNumOrNull = v => (v === null || v === undefined || v === '') ? null : (Number.isFinite(Number(v)) ? Number(v) : null);
@@ -645,6 +752,59 @@ Return only JSON.
             if (nearby.rows.length) fk_location = nearby.rows[0].id;
           }
 
+          // compute start/end if not provided using the visit_minutes and window heuristics
+          let startHour = v.start || v.start_hour || null;
+          let endHour = v.end || v.end_hour || null;
+
+          // If startHour missing, try to compute sequentially based on day's visits already planned
+          if (!startHour) {
+            // find how many places already planned for this day (in our current save loop)
+            const existingForDay = insertedPlaces.filter(p => p.date && p.date.toISOString().slice(0,10) === String(day.date));
+            // compute cursor: either last inserted end_hour or spec.daily_hours.start
+            let cursorMin = parseTimeToMinutes(spec.daily_hours?.start || '09:00');
+            if (existingForDay.length) {
+              const last = existingForDay[existingForDay.length-1];
+              if (last.end_hour) {
+                const mm = parseTimeToMinutes(last.end_hour);
+                if (mm !== null) cursorMin = mm;
+              }
+            }
+            const travelMin = v.travel_to_prev_minutes || v.travel_to_prev || 10;
+            const visitMin = v.visit_minutes || v.visit_minutes || v.visit_minutes === 0 ? v.visit_minutes : (v.visit_minutes || v.visit_minutes === 0 ? v.visit_minutes : (v.avg_duration_min || spec.visit_default_minutes || 90));
+            const proposedStart = cursorMin + (Number(travelMin) || 10);
+            const proposedEnd = proposedStart + (Number(visitMin) || 90);
+
+            // respect opening_hours if available (simple parse)
+            let window = null;
+            const candidateInfo = topCandidates.find(x => String(x.id) === String(v.id));
+            if (candidateInfo) {
+              if (candidateInfo.opening_hours_parsed && candidateInfo.opening_hours_parsed.is_open_now === true) {
+                // assume open during day
+              } else if (candidateInfo.opening_hours) {
+                window = extractOpeningWindowFromString(typeof candidateInfo.opening_hours === 'string' ? candidateInfo.opening_hours : String(candidateInfo.opening_hours));
+              }
+            }
+            let finalStart = proposedStart;
+            let finalEnd = proposedEnd;
+
+            if (window) {
+              const openMin = parseTimeToMinutes(window[0]);
+              const closeMin = parseTimeToMinutes(window[1]);
+              if (finalStart < openMin) finalStart = openMin;
+              if (finalEnd > closeMin) finalEnd = Math.max(openMin, closeMin); // clamp
+              if (finalEnd - finalStart < 10) {
+                // cannot schedule realistically
+                startHour = null; endHour = null;
+              } else {
+                startHour = minutesToHHMM(finalStart);
+                endHour = minutesToHHMM(finalEnd);
+              }
+            } else {
+              startHour = minutesToHHMM(finalStart);
+              endHour = minutesToHHMM(finalEnd);
+            }
+          }
+
           // 5) If still not found -> create location (if we have title or coords)
           if (!fk_location) {
             if (!title && (lat === null || lng === null)) {
@@ -654,10 +814,11 @@ Return only JSON.
 
             const fk_interest = null; // unknown at creation time
             const descripcion = v.descripcion || v.description || null;
-            const imagenes = v.imagenes || v.images || null;
+            const imagenes = v.imagenes || v.images || v.photos || null;
             const relevancia = toNumOrNull(v.relevancia) ?? 5;
             const countryVal = country || null;
-            const opening_hours = null;
+            const opening_hours = v.opening_hours ? (typeof v.opening_hours === 'object' ? JSON.stringify(v.opening_hours) : v.opening_hours) : null;
+            const opening_hours_parsed = v.opening_hours_parsed ? (typeof v.opening_hours_parsed === 'object' ? JSON.stringify(v.opening_hours_parsed) : v.opening_hours_parsed) : null;
             const timezone = v.timezone || null;
             const avg_duration_min = toNumOrNull(v.visit_minutes) || toNumOrNull(v.avg_duration_min) || 90;
             const popularity = null;
@@ -672,6 +833,7 @@ Return only JSON.
               relevancia,
               countryVal,
               opening_hours,
+              opening_hours_parsed,
               timezone,
               avg_duration_min,
               popularity
@@ -685,8 +847,8 @@ Return only JSON.
               fk_location,
               tripId,
               day.date || null,
-              v.start || v.start_hour || null,
-              v.end || v.end_hour || null,
+              startHour,
+              endHour,
               v.reason || v.notes || null
             ]);
             insertedPlaces.push(r.rows[0]);
@@ -723,6 +885,7 @@ Return only JSON.
     return res.status(status).json({ message: msg, detail: err.detail || undefined });
   }
 });
+
 
 /* (other routes unchanged below) */
 
