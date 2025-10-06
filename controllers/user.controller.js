@@ -1,4 +1,4 @@
-// controllers/user.controller.js aaaaaaaaaaaaaaaaaaaaa
+// controllers/user.controller.js aaaaaaaaaaaaaaaaaaaaaaaaa
 const express = require('express');
 const pool = require('../db');
 const auth = require('../middleware/auth');
