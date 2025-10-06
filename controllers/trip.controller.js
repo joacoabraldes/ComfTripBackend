@@ -337,7 +337,14 @@ function extractOpeningWindowFromString(openingStr) {
 
 function simpleGreedyGenerator({ candidates, days, spec }) {
   if (!Array.isArray(candidates) || candidates.length === 0) return [];
-  const defaultVisit = Number(spec?.visit_default_minutes || 90);
+    let defaultVisit = Number(spec?.visit_default_minutes || 90);
+  // if there are many candidates per day, reduce default visit to allow more stops
+  try {
+    if (candidates.length > days.length * 6) {
+      defaultVisit = Math.max(30, Math.round(defaultVisit * 0.6));
+    }
+  } catch (e) { /* defensive */ }
+
   const startMinGlobal = (() => {
     const s = spec?.daily_hours?.start || '09:00';
     return parseTimeToMinutes(s) ?? (9*60);
@@ -491,16 +498,58 @@ router.get('/:id/itinerary', auth, async (req, res) => {
     // sort by relevancia and take topK for the LLM
     candidates.sort((a,b) => (b.relevancia || 0) - (a.relevancia || 0));
     const topCandidates = candidates.slice(0, topK);
-
-    // --- ENRICH topCandidates with full location fields (opening_hours, avg_duration_min, photos, tags, timezone)
+  // --- ENRICH topCandidates with full location fields (opening_hours, avg_duration_min, photos, tags, timezone)
     try {
-      const ids = topCandidates.map(p => p.id).filter(Boolean);
-      if (ids.length) {
-        const q = `SELECT id, opening_hours, opening_hours_parsed, photos, avg_duration_min, timezone, price_level, tags, imagenes FROM locations WHERE id = ANY($1)`;
-        const r = await pool.query(q, [ids]);
-        const map = new Map(r.rows.map(rr => [String(rr.id), rr]));
+      // separate numeric DB ids from OSM-style ids
+      const numericIds = topCandidates.map(p => {
+        const n = Number(p.id);
+        return Number.isFinite(n) ? n : null;
+      }).filter(Boolean);
+
+      const osmIds = topCandidates.map(p => {
+        if (!p.id && p.osm_id) return String(p.osm_id);
+        return (typeof p.id === 'string' && !/^\d+$/.test(p.id)) ? String(p.id) : null;
+      }).filter(Boolean);
+
+      if (numericIds.length === 0 && osmIds.length === 0) {
+        // nothing to enrich
+      } else {
+        // build flexible WHERE: id = ANY($1::bigint[]) OR osm_id = ANY($2::text[])
+        const whereParts = [];
+        const params = [];
+        let idx = 1;
+        if (numericIds.length) {
+          whereParts.push(`id = ANY($${idx}::bigint[])`);
+          params.push(numericIds);
+          idx++;
+        }
+        if (osmIds.length) {
+          whereParts.push(`osm_id = ANY($${idx}::text[])`);
+          params.push(osmIds);
+          idx++;
+        }
+
+        const q = `
+          SELECT id, osm_id, opening_hours, opening_hours_parsed, photos, imagenes, avg_duration_min, timezone, price_level, tags, latitud, longitud
+          FROM locations
+          WHERE ${whereParts.join(' OR ')}
+        `;
+        const r = await pool.query(q, params);
+        // map results by id and osm_id
+        const byId = new Map();
+        const byOsm = new Map();
+        for (const rr of r.rows) {
+          if (rr.id != null) byId.set(String(rr.id), rr);
+          if (rr.osm_id) byOsm.set(String(rr.osm_id), rr);
+        }
+
         for (const p of topCandidates) {
-          const rr = map.get(String(p.id));
+          // try numeric id match first, then osm_id match, then if p.osm_id present
+          const key = (p.id === null || p.id === undefined) ? null : String(p.id);
+          const rr = (key && byId.has(key) && byId.get(key)) ||
+                     (key && byOsm.has(key) && byOsm.get(key)) ||
+                     (p.osm_id && byOsm.has(String(p.osm_id)) && byOsm.get(String(p.osm_id)));
+
           if (rr) {
             p.opening_hours = rr.opening_hours || null;
             p.opening_hours_parsed = rr.opening_hours_parsed || null;
@@ -509,11 +558,20 @@ router.get('/:id/itinerary', auth, async (req, res) => {
             p.timezone = rr.timezone || null;
             p.price_level = rr.price_level || null;
             p.tags = rr.tags || null;
+            // ensure we keep numeric lat/lng on the candidate for routing/haversine
+            p.lat = (p.lat || p.latitude || rr.latitud || rr.latitude) ?? null;
+            p.lng = (p.lng || p.longitude || rr.longitud || rr.longitude) ?? null;
+            // keep osm_id and a canonical id if available
+            if (rr.osm_id && !p.osm_id) p.osm_id = rr.osm_id;
+            if (rr.id && (!p.id || !/^\d+$/.test(String(p.id)))) {
+              // preserve original p.id as string but also expose db_id for clarity if you need it later
+              p.db_id = Number(rr.id);
+            }
           }
         }
       }
     } catch (err) {
-      console.warn('Could not enrich topCandidates from DB:', err?.message || err);
+      console.warn('Could not enrich topCandidates from DB:', err?.message || err, err?.stack || '');
     }
 
     // 4) Parse user preferences into a structured spec
@@ -597,8 +655,14 @@ Return only JSON.
     });
     topCandidates.sort((a,b)=> (b.combined_score || 0) - (a.combined_score || 0));
 
-    // 6) compute travel matrix for topCandidates (seconds) via routing service
-    const coords = topCandidates.map(c => ({ id: c.id, lat: c.lat, lng: c.lng }));
+        // 6) compute travel matrix for topCandidates (seconds) via routing service
+    // ensure lat/lng fields exist and are numeric
+    const coords = topCandidates.map(c => {
+      const lat = (c.lat ?? c.latitude ?? c.latitud) !== undefined ? Number(c.lat ?? c.latitude ?? c.latitud) : null;
+      const lng = (c.lng ?? c.longitude ?? c.longitud) !== undefined ? Number(c.lng ?? c.longitude ?? c.longitud) : null;
+      return { id: c.id, db_id: c.db_id ?? null, lat: Number.isFinite(lat) ? lat : null, lng: Number.isFinite(lng) ? lng : null };
+    });
+
     let travelMatrixSeconds = null;
     try {
       travelMatrixSeconds = await routingService.getMatrix(coords);
@@ -710,10 +774,17 @@ Return only JSON.
 
           // 2) match topCandidates by id or exact title (case-insensitive)
           if (!fk_location) {
-            const candidate = topCandidates.find(x =>
-              String(x.id) === String(v.id) ||
-              (v.titulo && x.titulo && String(x.titulo).toLowerCase() === String(v.titulo).toLowerCase())
-            );
+              const candidate = topCandidates.find(x => {
+              const xid = String(x.id ?? '');
+              const xosm = String(x.osm_id ?? '');
+              const vIdStr = String(v.id ?? '');
+              return (
+                xid === vIdStr ||
+                xosm === vIdStr ||
+                (x.db_id && String(x.db_id) === vIdStr) ||
+                (v.titulo && x.titulo && String(x.titulo).toLowerCase() === String(v.titulo).toLowerCase())
+              );
+            });
             if (candidate && (typeof candidate.id === 'number' || /^\d+$/.test(String(candidate.id)))) {
               fk_location = Number(candidate.id);
             }
