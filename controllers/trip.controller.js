@@ -887,8 +887,75 @@ Return only JSON.
 });
 
 
-/* (other routes unchanged below) */
+/* NEW: POST /trips/:id/share
+   Body: { mode: 'viewer'|'editor', public: boolean, shared_with_user_id (optional), expires_in_days (optional int) }
+   Requires owner of trip.
+   Returns { url, share } where url points to /api/share/trip/:uuid
+*/
+router.post('/:id/share', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const tripId = Number(req.params.id);
+    const userId = req.user.id;
+    if (!Number.isFinite(tripId) || tripId <= 0) return res.status(400).json({ message: 'Invalid trip id' });
 
+    const { mode = 'viewer', public: isPublic = false, shared_with_user_id, expires_in_days } = req.body || {};
+
+    // verify ownership
+    const ownerRes = await pool.query('SELECT user_id FROM trips WHERE id = $1', [tripId]);
+    if (!ownerRes.rows.length) return res.status(404).json({ message: 'Trip no encontrado' });
+    if (ownerRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
+
+    // validate mode
+    if (!['viewer','editor'].includes(mode)) return res.status(400).json({ message: 'Invalid mode' });
+
+    let sharedWith = null;
+    if (shared_with_user_id) {
+      const other = await pool.query('SELECT id FROM users WHERE id = $1 LIMIT 1', [Number(shared_with_user_id)]);
+      if (!other.rows.length) return res.status(404).json({ message: 'Usuario compartido no encontrado' });
+      sharedWith = Number(shared_with_user_id);
+      if (sharedWith === userId) {
+        return res.status(400).json({ message: 'No puedes compartir un viaje contigo mismo (usa público si quieres)' });
+      }
+    }
+
+    // compute expires_at timestamp if requested
+    let expiresAt = null;
+    if (expires_in_days && Number.isFinite(Number(expires_in_days)) && Number(expires_in_days) > 0) {
+      const days = Number(expires_in_days);
+      expiresAt = new Date(Date.now() + days * 24 * 3600 * 1000);
+    }
+
+    // insert share
+    await client.query('BEGIN');
+    const insertSQL = `INSERT INTO trip_shares (trip_id, shared_by, shared_with, mode, public, expires_at)
+                       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, trip_id, shared_by, shared_with, mode, public, share_uuid, expires_at, created_at`;
+    const values = [tripId, userId, sharedWith, mode, !!isPublic, expiresAt];
+    const r = await client.query(insertSQL, values);
+    await client.query('COMMIT');
+
+    const shareRow = r.rows[0];
+    // build URL that points to the backend share endpoint (share.controller)
+    const base = `${req.protocol}://${req.get('host')}`; // e.g., http://localhost:5432
+    const url = `${base}/api/share/trip/${shareRow.share_uuid}`;
+
+    return res.status(201).json({ url, share: shareRow });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(()=>{});
+    console.error('POST /trips/:id/share error:', err);
+    return res.status(500).json({ message: 'Error creating share' });
+  } finally {
+    client.release();
+  }
+});
+
+/* 
+  Modified GET / (list trips)
+  Now returns:
+   - trips owned by the user
+   - trips shared with the user (shared_with = user) OR public shares (public = true)
+  For shared trips we include a 'share_*' metadata fields so the frontend can show them specially.
+*/
 router.get('/', auth, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -896,12 +963,27 @@ router.get('/', auth, async (req, res) => {
     const sql = `
       SELECT
         t.id, t.user_id, t.destination, t.start_date, t.end_date, t.budget, t.notes, t.created_at,
-        COALESCE(tp.places, '[]') AS places
+        COALESCE(tp.places, '[]') AS places,
+        ts.id AS share_id,
+        ts.shared_by AS share_shared_by,
+        ts.shared_with AS share_shared_with,
+        ts.mode AS share_mode,
+        ts.public AS share_public,
+        ts.share_uuid AS share_uuid,
+        ts.expires_at AS share_expires_at
       FROM trips t
       LEFT JOIN (
         ${PLACES_AGG_SUBQUERY}
       ) tp ON tp.fk_trips = t.id
-      WHERE t.user_id = $1
+      LEFT JOIN LATERAL (
+        SELECT * FROM trip_shares
+        WHERE trip_id = t.id
+          AND (shared_with = $1 OR public = true)
+          AND (expires_at IS NULL OR expires_at > now())
+        ORDER BY (shared_with = $1) DESC, created_at DESC
+        LIMIT 1
+      ) ts ON true
+      WHERE t.user_id = $1 OR ts.id IS NOT NULL
       ORDER BY t.start_date DESC
     `;
 
@@ -909,6 +991,20 @@ router.get('/', auth, async (req, res) => {
     const trips = result.rows.map((r) => {
       const trip = normalizeTripRow(r);
       trip.places = r.places || [];
+      // attach share metadata if present
+      if (r.share_id) {
+        trip.share = {
+          id: r.share_id,
+          shared_by: r.share_shared_by,
+          shared_with: r.share_shared_with,
+          mode: r.share_mode,
+          public: r.share_public,
+          share_uuid: r.share_uuid,
+          expires_at: r.share_expires_at
+        };
+      } else {
+        trip.share = null;
+      }
       return trip;
     });
 
@@ -980,27 +1076,75 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
-/* GET /trips/:id, PUT, DELETE, POST /trips/:id/places, DELETE /trips/:id/places/:placeId unchanged below - omitted for brevity in snippet */
+/* GET /trips/:id - allow owner OR users with an active share (shared_with = me OR public & not expired) to read */
 router.get('/:id', auth, async (req, res) => {
   try {
     const id = Number(req.params.id);
     const userId = req.user.id;
+
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ message: 'Invalid id' });
+
     const sql = `
       SELECT
         t.id, t.user_id, t.destination, t.start_date, t.end_date, t.budget, t.notes, t.created_at,
-        COALESCE(tp.places, '[]') AS places
+        COALESCE(tp.places, '[]') AS places,
+        ts.id AS share_id,
+        ts.shared_by AS share_shared_by,
+        ts.shared_with AS share_shared_with,
+        ts.mode AS share_mode,
+        ts.public AS share_public,
+        ts.share_uuid AS share_uuid,
+        ts.expires_at AS share_expires_at
       FROM trips t
       LEFT JOIN (
         ${PLACES_AGG_SUBQUERY}
       ) tp ON tp.fk_trips = t.id
-      WHERE t.id = $1 AND t.user_id = $2
+      LEFT JOIN LATERAL (
+        SELECT * FROM trip_shares
+        WHERE trip_id = t.id
+          AND (shared_with = $2 OR public = true)
+          AND (expires_at IS NULL OR expires_at > now())
+        ORDER BY (shared_with = $2) DESC, created_at DESC
+        LIMIT 1
+      ) ts ON true
+      WHERE t.id = $1
       LIMIT 1
     `;
+
     const result = await pool.query(sql, [id, userId]);
     if (!result.rows.length) return res.status(404).json({ message: 'No encontrado' });
+
     const row = result.rows[0];
-    const trip = normalizeTripRow(row);
-    trip.places = row.places || [];
+
+    // if not owner and no share -> forbidden
+    if (row.user_id !== userId && !row.share_id) return res.status(403).json({ message: 'No autorizado' });
+
+    const trip = {
+      id: row.id,
+      user_id: row.user_id,
+      destination: row.destination,
+      start_date: row.start_date,
+      end_date: row.end_date,
+      budget: row.budget,
+      notes: row.notes,
+      created_at: row.created_at,
+      places: row.places || []
+    };
+
+    if (row.share_id) {
+      trip.share = {
+        id: row.share_id,
+        shared_by: row.share_shared_by,
+        shared_with: row.share_shared_with,
+        mode: row.share_mode,
+        public: row.share_public,
+        share_uuid: row.share_uuid,
+        expires_at: row.share_expires_at
+      };
+    } else {
+      trip.share = null;
+    }
+
     res.json(trip);
   } catch (err) {
     console.error('GET /trips/:id error:', err);
