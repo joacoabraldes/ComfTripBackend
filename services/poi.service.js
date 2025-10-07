@@ -62,12 +62,15 @@ function normalizeDbRow(r) {
   return {
     id: r.id,
     titulo: r.titulo,
-    fk_interest: r.fk_interest,
+    fk_interest: r.fk_interest || null,
     lat: r.latitud !== null && r.latitud !== undefined ? Number(r.latitud) : null,
     lng: r.longitud !== null && r.longitud !== undefined ? Number(r.longitud) : null,
     imagenes: r.imagenes || null,
     relevancia: r.relevancia !== null && r.relevancia !== undefined ? Number(r.relevancia) : 0,
     country: r.country || null,
+    city: r.city || null,
+    website: r.website || null,
+    category: r.category || null,
     source: "db"
   };
 }
@@ -122,34 +125,29 @@ function heuristicAvgDuration(tags) {
   return 90;
 }
 
+/**
+ * Normalize a raw OSM element into the reduced shape that fits your new schema.
+ * We keep enough metadata to construct `descripcion`, `imagenes`, `opening_hours`, `website`, and `category`.
+ */
 function normalizeOsmForInsert(el) {
   if (!el || !el.tags) return null;
   const tags = el.tags || {};
   const name = tags.name || tags['name:en'] || tags.int_name || null;
   const lat = (el.lat !== undefined && el.lat !== null) ? Number(el.lat) : (el.center && el.center.lat ? Number(el.center.lat) : null);
   const lon = (el.lon !== undefined && el.lon !== null) ? Number(el.lon) : (el.center && el.center.lon ? Number(el.center.lon) : null);
+
   const amenity = tags.amenity || null;
   const tourism = tags.tourism || null;
+  const leisure = tags.leisure || null;
 
   if (amenity && OSM_UNWANTED_AMENITIES.has(amenity)) return null;
   if (tourism && OSM_UNWANTED_TOURISM.has(tourism)) return null;
   if (!name || lat === null || lon === null) return null;
 
   const photos = pickFirstImageFromTags(tags);
-  const phone = tags.phone || tags['contact:phone'] || null;
   const website = tags.website || tags['contact:website'] || null;
   const opening_hours = tags.opening_hours || null;
-  // We don't attempt to parse opening_hours here (opening_hours lib optional),
-  // we store raw string; the populate script can enhance if library is installed.
-  const opening_hours_parsed = opening_hours ? { raw: opening_hours } : null;
-  const price_level = parsePriceLevel(tags);
-  const tags_json = tags;
-  const osm_id = el.id;
-  const osm_type = el.type;
-  const wikidata = tags.wikidata || null;
-  const wikipedia = tags.wikipedia || null;
-  const timezone = tags['addr:timezone'] || null;
-  const avg_duration_min = heuristicAvgDuration(tags);
+  const category = tourism || amenity || tags.historic || leisure || null;
 
   return {
     titulo: name.trim(),
@@ -157,19 +155,10 @@ function normalizeOsmForInsert(el) {
     longitud: lon,
     relevancia: 5,
     descripcion: JSON.stringify({ source: 'osm', tags }).slice(0, 2000),
-    opening_hours,
-    opening_hours_parsed,
-    phone,
+    opening_hours: opening_hours ? { raw: opening_hours } : null,
     website,
-    photos,
-    price_level,
-    tags_json,
-    osm_id,
-    osm_type,
-    wikidata,
-    wikipedia,
-    timezone,
-    avg_duration_min
+    imagenes: photos.length ? photos : null,
+    category
   };
 }
 
@@ -361,14 +350,13 @@ function normalizeOsmElement(el) {
 
 /* ---------- Persist OSM candidates to DB using bulk upsert (fast) ---------- */
 /*
- Strategy:
-  - normalize OSM elements to full candidate objects (with tags, photos, osm_id...)
-  - use a temp table and single multi-row INSERT into tmp_pois
-  - perform 3 set-based SQL ops:
-     1) update by exact title+country+city (coalesce missing fields)
-     2) update by proximity for rows with osm_id IS NULL (avoid overwriting authoritative osm rows)
-     3) insert remaining rows that do not exist by title+country+city or proximity
-  - finally SELECT matching rows from locations (by lower(titulo) and/or osm_id) and return them
+ Strategy (adapted to new schema):
+  - normalize OSM elements into objects matching new columns (titulo, descripcion, latitud, longitud, imagenes, relevancia, opening_hours, website, category)
+  - insert into a temp table tmp_pois
+  - 1) update locations by exact title+country+city
+  - 2) update by proximity (lat/lng epsilon) when match exists
+  - 3) insert remaining rows
+  - finally SELECT matching rows from locations by lower(titulo) and return them
 */
 const LAT_LNG_EPS = 0.0006; // ~50-70 meters
 
@@ -377,8 +365,8 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
   // normalize
   const norm = [];
   for (const c of osmCandidates) {
-    // if element is raw OSM element, convert to richer structure for insert
-    const candidate = normalizeOsmForInsert(c._raw || c._raw === undefined ? c : c._raw);
+    const raw = c._raw || c;
+    const candidate = normalizeOsmForInsert(raw);
     if (candidate) norm.push(candidate);
   }
   if (!norm.length) return [];
@@ -392,16 +380,14 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
       mustRelease = true;
     }
   } catch (e) {
-    // keep db as-is and try to use .query directly
     client = db;
     mustRelease = false;
   }
 
   try {
-    // Begin transaction
     await client.query('BEGIN');
 
-    // Create temp table
+    // temp table matching the reduced set of fields
     await client.query(`CREATE TEMP TABLE tmp_pois (
       titulo text,
       latitud double precision,
@@ -409,45 +395,30 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
       descripcion text,
       relevancia numeric,
       opening_hours jsonb,
-      opening_hours_parsed jsonb,
-      phone text,
       website text,
-      photos jsonb,
-      price_level smallint,
-      tags jsonb,
-      osm_id bigint,
-      osm_type text,
-      wikidata text,
-      wikipedia text,
-      timezone text,
-      avg_duration_min integer
+      imagenes jsonb,
+      category text
     ) ON COMMIT DROP;`);
 
-    // Bulk insert into tmp_pois with parameterized placeholders
     const vals = [];
     const placeholders = [];
     for (let i=0;i<norm.length;i++){
-      const idx = i*18;
-      placeholders.push(`($${idx+1},$${idx+2},$${idx+3},$${idx+4},$${idx+5},$${idx+6}::jsonb,$${idx+7}::jsonb,$${idx+8},$${idx+9},$${idx+10}::jsonb,$${idx+11},$${idx+12}::jsonb,$${idx+13},$${idx+14},$${idx+15},$${idx+16},$${idx+17},$${idx+18})`);
+      const idx = i*9;
+      placeholders.push(`($${idx+1},$${idx+2},$${idx+3},$${idx+4},$${idx+5},$${idx+6}::jsonb,$${idx+7},$${idx+8}::jsonb,$${idx+9})`);
       const c = norm[i];
       vals.push(
-        c.titulo, c.latitud, c.longitud, c.descripcion, c.relevancia || 5,
-        JSON.stringify(c.opening_hours ? { raw: c.opening_hours } : (c.opening_hours_parsed || null)),
-        JSON.stringify(c.opening_hours_parsed || null),
-        c.phone || null,
+        c.titulo,
+        c.latitud,
+        c.longitud,
+        c.descripcion,
+        c.relevancia || 5,
+        c.opening_hours ? JSON.stringify(c.opening_hours) : null,
         c.website || null,
-        JSON.stringify(c.photos || []),
-        c.price_level || null,
-        JSON.stringify(c.tags_json || {}),
-        c.osm_id || null,
-        c.osm_type || null,
-        c.wikidata || null,
-        c.wikipedia || null,
-        c.timezone || null,
-        c.avg_duration_min || 90
+        c.imagenes ? JSON.stringify(c.imagenes) : null,
+        c.category || null
       );
     }
-    const insertTmpSql = `INSERT INTO tmp_pois (titulo, latitud, longitud, descripcion, relevancia, opening_hours, opening_hours_parsed, phone, website, photos, price_level, tags, osm_id, osm_type, wikidata, wikipedia, timezone, avg_duration_min) VALUES ${placeholders.join(',')};`;
+    const insertTmpSql = `INSERT INTO tmp_pois (titulo, latitud, longitud, descripcion, relevancia, opening_hours, website, imagenes, category) VALUES ${placeholders.join(',')};`;
     await client.query(insertTmpSql, vals);
 
     // 1) update by exact title + country + city
@@ -459,22 +430,12 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
           latitud = COALESCE(l.latitud, t.latitud),
           longitud = COALESCE(l.longitud, t.longitud),
           opening_hours = COALESCE(l.opening_hours, t.opening_hours),
-          opening_hours_parsed = COALESCE(l.opening_hours_parsed, t.opening_hours_parsed),
-          phone = COALESCE(l.phone, t.phone),
           website = COALESCE(l.website, t.website),
-          photos = COALESCE(l.photos, t.photos),
-          price_level = COALESCE(l.price_level, t.price_level),
-          tags = COALESCE(l.tags, t.tags),
-          osm_id = COALESCE(l.osm_id, t.osm_id),
-          osm_type = COALESCE(l.osm_type, t.osm_type),
-          wikidata = COALESCE(l.wikidata, t.wikidata),
-          wikipedia = COALESCE(l.wikipedia, t.wikipedia),
-          timezone = COALESCE(l.timezone, t.timezone),
-          avg_duration_min = COALESCE(l.avg_duration_min, t.avg_duration_min),
+          imagenes = COALESCE(l.imagenes, t.imagenes),
+          relevancia = GREATEST(COALESCE(l.relevancia,0), COALESCE(t.relevancia,5)),
+          category = COALESCE(l.category, t.category),
           country = COALESCE(l.country, $1::text),
-          city = COALESCE(l.city, $2::text),
-          last_osm_sync = now(),
-          titulo_lower = lower(coalesce(l.titulo, t.titulo))
+          city = COALESCE(l.city, $2::text)
         FROM tmp_pois t
         WHERE lower(l.titulo) = lower(t.titulo)
           AND coalesce(l.country,'') = coalesce($1::text,'')
@@ -486,7 +447,7 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
     const upTitleRes = await client.query(updateByTitleSql, [country || null, city || null]);
     const updated_by_title = upTitleRes.rows && Number(upTitleRes.rows[0].cnt || 0) || 0;
 
-    // 2) update by proximity for rows that don't have osm_id
+    // 2) update by proximity for rows that have coordinates
     const updateByProxSql = `
       WITH updated AS (
         UPDATE locations l
@@ -495,25 +456,14 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
           latitud = COALESCE(l.latitud, t.latitud),
           longitud = COALESCE(l.longitud, t.longitud),
           opening_hours = COALESCE(l.opening_hours, t.opening_hours),
-          opening_hours_parsed = COALESCE(l.opening_hours_parsed, t.opening_hours_parsed),
-          phone = COALESCE(l.phone, t.phone),
           website = COALESCE(l.website, t.website),
-          photos = COALESCE(l.photos, t.photos),
-          price_level = COALESCE(l.price_level, t.price_level),
-          tags = COALESCE(l.tags, t.tags),
-          osm_id = COALESCE(l.osm_id, t.osm_id),
-          osm_type = COALESCE(l.osm_type, t.osm_type),
-          wikidata = COALESCE(l.wikidata, t.wikidata),
-          wikipedia = COALESCE(l.wikipedia, t.wikipedia),
-          timezone = COALESCE(l.timezone, t.timezone),
-          avg_duration_min = COALESCE(l.avg_duration_min, t.avg_duration_min),
+          imagenes = COALESCE(l.imagenes, t.imagenes),
+          relevancia = GREATEST(COALESCE(l.relevancia,0), COALESCE(t.relevancia,5)),
+          category = COALESCE(l.category, t.category),
           country = COALESCE(l.country, $3::text),
-          city = COALESCE(l.city, $4::text),
-          last_osm_sync = now(),
-          titulo_lower = lower(coalesce(l.titulo, t.titulo))
+          city = COALESCE(l.city, $4::text)
         FROM tmp_pois t
-        WHERE l.osm_id IS NULL
-          AND l.latitud IS NOT NULL AND l.longitud IS NOT NULL
+        WHERE l.latitud IS NOT NULL AND l.longitud IS NOT NULL
           AND abs(l.latitud - t.latitud) < $1::double precision AND abs(l.longitud - t.longitud) < $1::double precision
           AND coalesce(l.country,'') = coalesce($3::text,'')
           AND coalesce(l.city,'') = coalesce($4::text,'')
@@ -529,13 +479,11 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
       WITH ins AS (
         INSERT INTO locations (
           titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country, city,
-          opening_hours, opening_hours_parsed, phone, website, photos, price_level, tags,
-          osm_id, osm_type, wikidata, wikipedia, timezone, avg_duration_min, last_osm_sync, titulo_lower
+          opening_hours, website, category
         )
         SELECT
-          t.titulo, NULL, t.descripcion, t.latitud, t.longitud, NULL, COALESCE(t.relevancia,5), $1::text, $2::text,
-          t.opening_hours, t.opening_hours_parsed, t.phone, t.website, t.photos, t.price_level, t.tags,
-          t.osm_id, t.osm_type, t.wikidata, t.wikipedia, t.timezone, COALESCE(t.avg_duration_min,90), now(), lower(coalesce(t.titulo,''))
+          t.titulo, NULL, t.descripcion, t.latitud, t.longitud, t.imagenes, COALESCE(t.relevancia,5), $1::text, $2::text,
+          t.opening_hours, t.website, t.category
         FROM tmp_pois t
         WHERE NOT EXISTS (
           SELECT 1 FROM locations l
@@ -549,34 +497,15 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
     const insertRes = await client.query(insertSql, [country || null, city || null, LAT_LNG_EPS]);
     const inserted = insertRes.rows && Number(insertRes.rows[0].inserted_count || 0) || 0;
 
-    // Commit
     await client.query('COMMIT');
 
-    // Now fetch inserted/updated rows to return them.
-    // We'll pick by lower(titulo) IN (...) and osm_id IN (...). Build arrays.
+    // Fetch matching rows by titulo (lowered) to return them (we only inserted/updated by titulo/proximity)
     const tituloList = norm.map(n => (n.titulo || '').toLowerCase()).filter(Boolean);
-    const osmIdList = norm.map(n => n.osm_id).filter(v => v !== null && v !== undefined);
 
-    const fetchClauses = [];
-    const fetchParams = [];
-    let paramIdx = 1;
-    if (tituloList.length) {
-      fetchClauses.push(`lower(titulo) = ANY($${paramIdx})`);
-      fetchParams.push(tituloList);
-      paramIdx++;
-    }
-    if (osmIdList.length) {
-      fetchClauses.push(`osm_id = ANY($${paramIdx})`);
-      fetchParams.push(osmIdList);
-      paramIdx++;
-    }
-    // fallback: fetch near by bbox to catch any proximity-updates (rare)
-    if (!fetchClauses.length) {
-      // nothing to match; return empty
-      return [];
-    }
-    const fetchSql = `SELECT id, titulo, latitud, longitud, imagenes, relevancia, country FROM locations WHERE ${fetchClauses.join(' OR ')} LIMIT 500;`;
-    const fetchRes = await client.query(fetchSql, fetchParams);
+    if (!tituloList.length) return [];
+
+    const fetchSql = `SELECT id, titulo, latitud, longitud, imagenes, relevancia, country, city, opening_hours, website, category FROM locations WHERE lower(titulo) = ANY($1) LIMIT 500;`;
+    const fetchRes = await client.query(fetchSql, [tituloList]);
     const rows = (fetchRes.rows || []).map(r => ({
       id: r.id,
       titulo: r.titulo,
@@ -584,10 +513,10 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
       longitud: r.longitud,
       imagenes: r.imagenes || null,
       relevancia: r.relevancia || 5,
-      country: r.country || country || null
+      country: r.country || country || null,
+      city: r.city || city || null
     }));
 
-    // Return rows in similar shape to earlier persist function (so caller can merge)
     return rows;
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (e) {}
@@ -637,7 +566,7 @@ async function getCandidates(options = {}) {
       const idsParam = matchingIds.length ? matchingIds : [-999999];
 
       const qPrimary = `
-        SELECT l.id, l.titulo, l.fk_interest, l.latitud, l.longitud, l.imagenes, l.relevancia, l.country
+        SELECT l.id, l.titulo, l.fk_interest, l.latitud, l.longitud, l.imagenes, l.relevancia, l.country, l.city
         FROM locations l
         WHERE
           (l.fk_interest IS NOT NULL AND lower(l.fk_interest) = ANY($2))
@@ -648,7 +577,7 @@ async function getCandidates(options = {}) {
       const rPrimary = await db.query(qPrimary, [primaryLimit, slugs, idsParam]);
       const primaryRows = rPrimary.rows || [];
 
-      const qGeneral = `SELECT id, titulo, fk_interest, latitud, longitud, imagenes, relevancia, country FROM locations ORDER BY relevancia DESC NULLS LAST LIMIT $1`;
+      const qGeneral = `SELECT id, titulo, fk_interest, latitud, longitud, imagenes, relevancia, country, city FROM locations ORDER BY relevancia DESC NULLS LAST LIMIT $1`;
       const rGeneral = await db.query(qGeneral, [generalLimit]);
       const generalRows = rGeneral.rows || [];
 
@@ -659,7 +588,7 @@ async function getCandidates(options = {}) {
 
       rows = Array.from(byId.values());
     } else {
-      const q = `SELECT id, titulo, fk_interest, latitud, longitud, imagenes, relevancia, country FROM locations ORDER BY relevancia DESC NULLS LAST LIMIT $1`;
+      const q = `SELECT id, titulo, fk_interest, latitud, longitud, imagenes, relevancia, country, city FROM locations ORDER BY relevancia DESC NULLS LAST LIMIT $1`;
       const r = await db.query(q, [limit]);
       rows = r.rows || [];
     }
@@ -721,7 +650,6 @@ async function getCandidates(options = {}) {
   if (Array.isArray(osmCandidates) && osmCandidates.length && db) {
     try {
       const insertedRows = await persistOsmCandidatesToDb(osmCandidates, db, country, geo && geo.raw && geo.raw.display_name ? (geo.raw.display_name.split(',')[0] || null) : null);
-      // normalize inserted rows for merging - keep consistent shape as earlier
       if (insertedRows && insertedRows.length) {
         const normInserted = insertedRows.map(r => ({
           id: r.id,
@@ -732,6 +660,7 @@ async function getCandidates(options = {}) {
           imagenes: r.imagenes || null,
           relevancia: r.relevancia || 5,
           country: r.country || country || null,
+          city: r.city || null,
           source: 'db+osm'
         }));
         for (const ni of normInserted) {

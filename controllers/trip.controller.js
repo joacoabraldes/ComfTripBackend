@@ -55,6 +55,33 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
 }
 
 /* helpers unchanged (normalizeTripRow, PLACES_AGG_SUBQUERY, haversineMeters) */
+// simple in-memory cache for wikipedia/name lookups
+const wikiCache = new Map();
+
+// concurrency helper: runs worker(items[i]) with up to `concurrency` parallel tasks
+async function mapWithConcurrency(items, worker, concurrency) {
+  const results = new Array(items.length);
+  let idx = 0;
+  const running = [];
+  function next() {
+    if (idx >= items.length) return null;
+    const cur = idx++;
+    const p = (async () => {
+      try { results[cur] = await worker(items[cur], cur); }
+      catch (err) { results[cur] = { error: err }; }
+    })();
+    running.push(p);
+    p.then(() => { const i = running.indexOf(p); if (i >= 0) running.splice(i, 1); });
+    return p;
+  }
+  for (let i = 0; i < Math.min(concurrency, items.length); i++) next();
+  while (running.length) {
+    await Promise.race(running);
+    next();
+  }
+  return results;
+}
+
 function normalizeTripRow(row) {
   return {
     id: row.id,
@@ -82,18 +109,16 @@ const PLACES_AGG_SUBQUERY = `
              'id', l.id,
              'titulo', l.titulo,
              'fk_interest', l.fk_interest,
+             'descripcion', l.descripcion,
              'latitude', l.latitud,
              'longitude', l.longitud,
              'imagenes', l.imagenes,
              'relevancia', l.relevancia,
              'opening_hours', l.opening_hours,
-             'opening_hours_parsed', l.opening_hours_parsed,
-             'photos', l.photos,
-             'avg_duration_min', l.avg_duration_min,
-             'timezone', l.timezone,
-             'price_level', l.price_level,
-             'tags', l.tags,
-             'osm_id', l.osm_id
+             'website', l.website,
+             'category', l.category,
+             'country', l.country,
+             'city', l.city
            )
          ) ORDER BY tp.date, tp.start_hour) AS places
   FROM trip_places tp
@@ -444,7 +469,7 @@ function simpleGreedyGenerator({ candidates, days, spec }) {
     for (let d=0; d<days.length; d++) {
       const dayDate = days[d] instanceof Date ? days[d].toISOString().slice(0,10) : (new Date(days[d]).toISOString().slice(0,10));
       const cand = sorted[d % sorted.length];
-      fallbackDays.push({ date: dayDate, visits: [{ id: cand.id, titulo: cand.titulo, visit_minutes: defaultVisit, travel_to_prev_minutes: 10, start: minutesToHHMM(startMinGlobal), end: minutesToHHMM(startMinGlobal + defaultVisit), reason: 'fallback' }]});
+      fallbackDays.push({ date: dayDate, visits: [{ id: cand.id, titulo: cand.titulo, visit_minutes: defaultVisit, travel_to_prev_minutes: 10, start: minutesToHHMM(startMinGlobal), end: minutesToHHMM(startMinGlobal + defaultVisit), reason: 'fallback' }]} );
     }
     return fallbackDays;
   }
@@ -480,14 +505,20 @@ router.get('/:id/itinerary', auth, async (req, res) => {
     );
     const interestSlugs = uiRes.rows.map(r => r.slug);
 
-    // derive country from destination (best-effort)
+    // derive country and city from destination (best-effort)
     let country = null;
+    let cityVal = null;
     if (typeof trip.destination === 'string' && trip.destination.includes(',')) {
-      const parts = trip.destination.split(',');
-      country = parts[parts.length - 1].trim();
+      const parts = trip.destination.split(',').map(p => p.trim()).filter(Boolean);
+      if (parts.length) {
+        country = parts[parts.length - 1];
+        cityVal = parts.slice(0, parts.length - 1).join(', ');
+      }
     } else if (typeof trip.destination === 'string') {
       const parts = trip.destination.trim().split(' ');
       country = parts.length > 1 ? parts[parts.length - 1] : trip.destination.trim();
+      // best-effort city (first token)
+      cityVal = parts.length > 1 ? parts.slice(0, parts.length - 1).join(' ') : null;
     }
 
     // 3) fetch candidate POIs (db-first)
@@ -498,73 +529,61 @@ router.get('/:id/itinerary', auth, async (req, res) => {
     // sort by relevancia and take topK for the LLM
     candidates.sort((a,b) => (b.relevancia || 0) - (a.relevancia || 0));
     const topCandidates = candidates.slice(0, topK);
-  // --- ENRICH topCandidates with full location fields (opening_hours, avg_duration_min, photos, tags, timezone)
+  // --- ENRICH topCandidates with full location fields (opening_hours, imagenes, lat/lng, category, website, country, city)
     try {
-      // separate numeric DB ids from OSM-style ids
+      // separate numeric DB ids (we no longer use osm_id in the new schema)
       const numericIds = topCandidates.map(p => {
         const n = Number(p.id);
         return Number.isFinite(n) ? n : null;
       }).filter(Boolean);
 
-      const osmIds = topCandidates.map(p => {
-        if (!p.id && p.osm_id) return String(p.osm_id);
-        return (typeof p.id === 'string' && !/^\d+$/.test(p.id)) ? String(p.id) : null;
-      }).filter(Boolean);
-
-      if (numericIds.length === 0 && osmIds.length === 0) {
+      if (numericIds.length === 0) {
         // nothing to enrich
       } else {
-        // build flexible WHERE: id = ANY($1::bigint[]) OR osm_id = ANY($2::text[])
+        // build flexible WHERE: id = ANY($1::bigint[])
         const whereParts = [];
         const params = [];
         let idx = 1;
-        if (numericIds.length) {
-          whereParts.push(`id = ANY($${idx}::bigint[])`);
-          params.push(numericIds);
-          idx++;
-        }
-        if (osmIds.length) {
-          whereParts.push(`osm_id = ANY($${idx}::text[])`);
-          params.push(osmIds);
-          idx++;
-        }
+        whereParts.push(`id = ANY($${idx}::bigint[])`);
+        params.push(numericIds);
+        idx++;
 
         const q = `
-          SELECT id, osm_id, opening_hours, opening_hours_parsed, photos, imagenes, avg_duration_min, timezone, price_level, tags, latitud, longitud
+          SELECT id, opening_hours, imagenes, latitud, longitud, relevancia, country, city, website, category
           FROM locations
           WHERE ${whereParts.join(' OR ')}
         `;
         const r = await pool.query(q, params);
-        // map results by id and osm_id
+        // map results by id
         const byId = new Map();
-        const byOsm = new Map();
         for (const rr of r.rows) {
           if (rr.id != null) byId.set(String(rr.id), rr);
-          if (rr.osm_id) byOsm.set(String(rr.osm_id), rr);
         }
 
         for (const p of topCandidates) {
-          // try numeric id match first, then osm_id match, then if p.osm_id present
           const key = (p.id === null || p.id === undefined) ? null : String(p.id);
-          const rr = (key && byId.has(key) && byId.get(key)) ||
-                     (key && byOsm.has(key) && byOsm.get(key)) ||
-                     (p.osm_id && byOsm.has(String(p.osm_id)) && byOsm.get(String(p.osm_id)));
+          const rr = (key && byId.has(key) && byId.get(key));
 
           if (rr) {
             p.opening_hours = rr.opening_hours || null;
-            p.opening_hours_parsed = rr.opening_hours_parsed || null;
-            p.photos = rr.photos || rr.imagenes || null;
-            p.avg_duration_min = Number(rr.avg_duration_min) || p.avg_duration_min || null;
-            p.timezone = rr.timezone || null;
-            p.price_level = rr.price_level || null;
-            p.tags = rr.tags || null;
+            // imagenes column now holds photos / images
+            p.photos = rr.imagenes || null;
+            // avg_duration_min no longer in schema — preserve existing value if any, otherwise null
+            p.avg_duration_min = p.avg_duration_min || null;
+            // timezone, price_level, tags removed from schema — set to null
+            p.timezone = null;
+            p.price_level = null;
+            p.tags = null;
             // ensure we keep numeric lat/lng on the candidate for routing/haversine
-            p.lat = (p.lat || p.latitude || rr.latitud || rr.latitude) ?? null;
-            p.lng = (p.lng || p.longitude || rr.longitud || rr.longitude) ?? null;
-            // keep osm_id and a canonical id if available
-            if (rr.osm_id && !p.osm_id) p.osm_id = rr.osm_id;
+            p.lat = (p.lat || p.latitude || rr.latitud) ?? null;
+            p.lng = (p.lng || p.longitude || rr.longitud) ?? null;
+            // keep country/city/category/website
+            p.country = p.country || rr.country || null;
+            p.city = p.city || rr.city || null;
+            p.website = p.website || rr.website || null;
+            p.category = p.category || rr.category || null;
+            // If the DB record is numeric id and candidate had string id, expose db_id
             if (rr.id && (!p.id || !/^\d+$/.test(String(p.id)))) {
-              // preserve original p.id as string but also expose db_id for clarity if you need it later
               p.db_id = Number(rr.id);
             }
           }
@@ -614,7 +633,7 @@ Return only JSON.
       id: p.id, title: p.titulo, interest: p.fk_interest, country: p.country, relevancia: p.relevancia || 0, idx,
       opening_hours: p.opening_hours || null,
       avg_duration_min: p.avg_duration_min || null,
-      photos: p.photos || null,
+      photos: p.photos || p.imagenes || null,
       price_level: p.price_level || null,
       tags: p.tags || null
     }));
@@ -752,9 +771,10 @@ Return only JSON.
       const insertTripPlaceSQL =
         'INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, fk_locations, fk_trips, date, start_hour, end_hour, notes, created_at';
 
+      // New insert matching updated locations schema
       const insertLocationSQL =
-        `INSERT INTO locations (titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country, opening_hours, opening_hours_parsed, timezone, avg_duration_min, popularity)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12,$13) RETURNING id`;
+        `INSERT INTO locations (titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country, opening_hours, website, category, city)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12) RETURNING id`;
 
       // helper
       const toNumOrNull = v => (v === null || v === undefined || v === '') ? null : (Number.isFinite(Number(v)) ? Number(v) : null);
@@ -776,11 +796,9 @@ Return only JSON.
           if (!fk_location) {
               const candidate = topCandidates.find(x => {
               const xid = String(x.id ?? '');
-              const xosm = String(x.osm_id ?? '');
               const vIdStr = String(v.id ?? '');
               return (
                 xid === vIdStr ||
-                xosm === vIdStr ||
                 (x.db_id && String(x.db_id) === vIdStr) ||
                 (v.titulo && x.titulo && String(x.titulo).toLowerCase() === String(v.titulo).toLowerCase())
               );
@@ -792,7 +810,7 @@ Return only JSON.
 
           // 3) attempt DB title lookup (exact lower() or ILIKE)
           const title = (v.titulo || v.name || v.title || '').trim();
-          // gather coords (from visit, osm, or topCandidates)
+          // gather coords (from visit, or topCandidates)
           let lat = toNumOrNull(v.lat ?? v.latitude ?? v.latitud ?? (v.osm && v.osm.center && v.osm.center.lat) ?? null);
           let lng = toNumOrNull(v.lng ?? v.longitude ?? v.lon ?? v.longitud ?? (v.osm && v.osm.center && v.osm.center.lon) ?? null);
 
@@ -885,14 +903,14 @@ Return only JSON.
 
             const fk_interest = null; // unknown at creation time
             const descripcion = v.descripcion || v.description || null;
-            const imagenes = v.imagenes || v.images || v.photos || null;
+            // ensure imagenes is JSON or null
+            const imagenes = (v.imagenes || v.images || v.photos) ? (typeof (v.imagenes || v.images || v.photos) === 'string' ? JSON.parse(v.imagenes || v.images || v.photos) : (v.imagenes || v.images || v.photos)) : null;
             const relevancia = toNumOrNull(v.relevancia) ?? 5;
             const countryVal = country || null;
-            const opening_hours = v.opening_hours ? (typeof v.opening_hours === 'object' ? JSON.stringify(v.opening_hours) : v.opening_hours) : null;
-            const opening_hours_parsed = v.opening_hours_parsed ? (typeof v.opening_hours_parsed === 'object' ? JSON.stringify(v.opening_hours_parsed) : v.opening_hours_parsed) : null;
-            const timezone = v.timezone || null;
-            const avg_duration_min = toNumOrNull(v.visit_minutes) || toNumOrNull(v.avg_duration_min) || 90;
-            const popularity = null;
+            const opening_hours = v.opening_hours ? (typeof v.opening_hours === 'object' ? JSON.stringify(v.opening_hours) : JSON.stringify({ raw: v.opening_hours })) : null;
+            const websiteVal = v.website || v.url || null;
+            const categoryVal = v.category || null;
+            const cityToInsert = v.city || cityVal || null;
 
             const locRes = await client.query(insertLocationSQL, [
               title || 'unnamed',
@@ -904,10 +922,9 @@ Return only JSON.
               relevancia,
               countryVal,
               opening_hours,
-              opening_hours_parsed,
-              timezone,
-              avg_duration_min,
-              popularity
+              websiteVal,
+              categoryVal,
+              cityToInsert
             ]);
             fk_location = locRes.rows[0].id;
           }
@@ -936,7 +953,7 @@ Return only JSON.
       throw err;
     } finally {
       // release DB client used for save
-      client.release();
+      try { client.release(); } catch (e) {}
       client = null;
     }
 
@@ -957,6 +974,7 @@ Return only JSON.
   }
 });
 
+module.exports = router;
 
 /* NEW: POST /trips/:id/share
    Body: { mode: 'viewer'|'editor', public: boolean, shared_with_user_id (optional), expires_in_days (optional int) }
