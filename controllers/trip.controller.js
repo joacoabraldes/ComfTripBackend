@@ -1584,4 +1584,190 @@ router.delete('/:id/places/:placeId', auth, async (req, res) => {
   }
 });
 
+/**
+ * POST /trips/:id/places/auto
+ * Body: { place: { fk_location, date, start_hour?, end_hour?, notes? } }
+ * Adds a place to a trip by calculating the best insertion (using routing service).
+ * Only reorders / replaces places that share the same date as the new place.
+ */
+router.post('/:id/places/auto', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const tripId = Number(req.params.id);
+    const userId = req.user.id;
+    const { place } = req.body || {};
+
+    if (!place || !place.fk_location) {
+      return res.status(400).json({ message: 'Debe enviar un objeto place con fk_location' });
+    }
+    if (!place.date) {
+      return res.status(400).json({ message: 'place.date es requerido (YYYY-MM-DD or ISO)' });
+    }
+
+    // ownership check
+    const ownerRes = await client.query('SELECT user_id, destination, start_date, end_date, budget, notes FROM trips WHERE id = $1', [tripId]);
+    if (!ownerRes.rows.length) return res.status(404).json({ message: 'Trip no encontrado' });
+    if (ownerRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
+
+    const dateOnly = (place.date || '').split('T')[0];
+
+    await client.query('BEGIN');
+
+    // Fetch existing places for that date (preserve order by id/created_at)
+    const existingRes = await client.query(
+      `SELECT tp.id, tp.fk_locations, tp.date, tp.start_hour, tp.end_hour, tp.notes, l.latitude, l.longitude
+       FROM trip_places tp
+       JOIN locations l ON l.id = tp.fk_locations
+       WHERE tp.fk_trips = $1 AND tp.date::text = $2
+       ORDER BY tp.id ASC`, // ORDER BY created order; change if you have explicit order column
+      [tripId, dateOnly]
+    );
+    const existingPlaces = existingRes.rows;
+
+    // Fetch coords for the new location
+    const locRes = await client.query('SELECT id, latitude, longitude FROM locations WHERE id = $1 LIMIT 1', [Number(place.fk_location)]);
+    if (!locRes.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Location (fk_location) no encontrada' });
+    }
+    const newLoc = locRes.rows[0];
+
+    // Build coords array: existing places (in order) + new location at the end
+    // We'll compute best order (full permute for small n) or best insertion for larger n.
+    const coords = [];
+    const indexMap = []; // maps coords index -> { type: 'existing'|'new', existingIndex }
+    for (let i = 0; i < existingPlaces.length; i++) {
+      const p = existingPlaces[i];
+      coords.push({ id: p.fk_locations, lat: Number(p.latitude), lng: Number(p.longitude) });
+      indexMap.push({ type: 'existing', existingIndex: i });
+    }
+    // new place last
+    coords.push({ id: Number(place.fk_location), lat: Number(newLoc.latitude), lng: Number(newLoc.longitude) });
+    indexMap.push({ type: 'new', existingIndex: null });
+
+    // Ask routing service for matrix (seconds)
+    const matrix = await routing.getMatrix(coords.map(c => ({ lat: c.lat, lng: c.lng, id: c.id })));
+    // matrix is NxN seconds (integers) or fallback haversine estimates
+
+    // Helper to compute total duration for an order (array of indices into coords)
+    const totalDuration = (order) => {
+      if (!order || order.length <= 1) return 0;
+      let sum = 0;
+      for (let i = 0; i < order.length - 1; i++) {
+        const a = order[i];
+        const b = order[i+1];
+        const v = matrix[a] && matrix[a][b];
+        sum += (Number.isFinite(v) ? v : Number.MAX_SAFE_INTEGER/10);
+      }
+      return sum;
+    };
+
+    // Build best order:
+    const n = coords.length; // existingCount + 1
+    let bestOrder = null;
+
+    if (n <= 8) {
+      // Try all permutations (small n)
+      const permute = (arr) => {
+        const res = [];
+        const back = (curr, remaining) => {
+          if (remaining.length === 0) { res.push(curr.slice()); return; }
+          for (let i = 0; i < remaining.length; i++) {
+            curr.push(remaining[i]);
+            const nextRem = remaining.slice(0, i).concat(remaining.slice(i+1));
+            back(curr, nextRem);
+            curr.pop();
+          }
+        };
+        back([], arr);
+        return res;
+      };
+      const indices = Array.from({length: n}, (_,i) => i);
+      const perms = permute(indices);
+      let bestDur = Infinity;
+      for (const p of perms) {
+        const d = totalDuration(p);
+        if (d < bestDur) {
+          bestDur = d;
+          bestOrder = p;
+        }
+      }
+    } else {
+      // Heuristic: keep current existing order, try every insertion position for the new node
+      const existingIndices = Array.from({length: n-1}, (_,i) => i); // 0..n-2
+      let bestDur = Infinity;
+      for (let insertAt = 0; insertAt <= existingIndices.length; insertAt++) {
+        // create order: existingIndices with new index (n-1) inserted at insertAt
+        const order = existingIndices.slice(0, insertAt).concat([n-1], existingIndices.slice(insertAt));
+        const d = totalDuration(order);
+        if (d < bestDur) {
+          bestDur = d;
+          bestOrder = order;
+        }
+      }
+      // Note: this won't reorder existing items, only chooses insertion position (cheap)
+    }
+
+    if (!bestOrder) {
+      // fallback: append to end
+      bestOrder = Array.from({length: n-1}, (_,i) => i).concat([n-1]);
+    }
+
+    // Map bestOrder to place objects to insert into DB in that order
+    const newDayPlacesToInsert = [];
+    for (const idx of bestOrder) {
+      const mapEntry = indexMap[idx];
+      if (mapEntry.type === 'existing') {
+        const orig = existingPlaces[mapEntry.existingIndex];
+        newDayPlacesToInsert.push({
+          fk_location: orig.fk_locations,
+          date: dateOnly,
+          start_hour: orig.start_hour || null,
+          end_hour: orig.end_hour || null,
+          notes: orig.notes || null
+        });
+      } else {
+        // new place
+        newDayPlacesToInsert.push({
+          fk_location: Number(place.fk_location),
+          date: dateOnly,
+          start_hour: place.start_hour || null,
+          end_hour: place.end_hour || null,
+          notes: place.notes || null
+        });
+      }
+    }
+
+    // Replace only the places for that date atomically: delete then insert in order
+    await client.query('DELETE FROM trip_places WHERE fk_trips = $1 AND date::text = $2', [tripId, dateOnly]);
+
+    const insertPlaceSQL =
+      'INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, fk_locations, fk_trips, date, start_hour, end_hour, notes, created_at';
+
+    const created = [];
+    for (const p of newDayPlacesToInsert) {
+      const r = await client.query(insertPlaceSQL, [
+        p.fk_location,
+        tripId,
+        p.date,
+        p.start_hour,
+        p.end_hour,
+        p.notes
+      ]);
+      created.push(r.rows[0]);
+    }
+
+    await client.query('COMMIT');
+
+    return res.status(201).json({ places: created });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(()=>{});
+    console.error('POST /trips/:id/places/auto error:', err);
+    return res.status(500).json({ message: 'Error calculando inserción automática' });
+  } finally {
+    client.release();
+  }
+});
+
+
 module.exports = router;
