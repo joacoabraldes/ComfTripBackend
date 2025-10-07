@@ -1,6 +1,5 @@
 // services/poi.service.js
-// Improved POI fetcher that geocodes the trip destination and queries OSM using bbox.
-// Persists OSM candidates into `locations` using bulk upsert (temp table) for speed.
+// Improved POI fetcher that prefers DB city entries; falls back to geocode+OSM only when DB has none.
 
 "use strict";
 
@@ -83,7 +82,6 @@ const OSM_UNWANTED_AMENITIES = new Set([
 
 const OSM_UNWANTED_TOURISM = new Set(["hotel","guest_house","motel"]);
 
-// Broader mapping so culture/nature/shops are included
 const INTEREST_TO_OSM = {
   gastronomia: ['restaurant','cafe','bar','fast_food','pub'],
   deportes: ['stadium','pitch','sports_centre','fitness_centre','leisure','pitch'],
@@ -125,10 +123,6 @@ function heuristicAvgDuration(tags) {
   return 90;
 }
 
-/**
- * Normalize a raw OSM element into the reduced shape that fits your new schema.
- * We keep enough metadata to construct `descripcion`, `imagenes`, `opening_hours`, `website`, and `category`.
- */
 function normalizeOsmForInsert(el) {
   if (!el || !el.tags) return null;
   const tags = el.tags || {};
@@ -149,11 +143,14 @@ function normalizeOsmForInsert(el) {
   const opening_hours = tags.opening_hours || null;
   const category = tourism || amenity || tags.historic || leisure || null;
 
+  let relev = 5;
+  if (tags.wikidata || tags.wikipedia) relev = Math.max(relev, 7);
+
   return {
     titulo: name.trim(),
     latitud: lat,
     longitud: lon,
-    relevancia: 5,
+    relevancia: relev,
     descripcion: JSON.stringify({ source: 'osm', tags }).slice(0, 2000),
     opening_hours: opening_hours ? { raw: opening_hours } : null,
     website,
@@ -162,7 +159,7 @@ function normalizeOsmForInsert(el) {
   };
 }
 
-/* merge/dedupe - unchanged logic but preserved */
+/* merge/dedupe */
 function dedupeMerge(existing, incoming, distanceThresholdMeters = 50) {
   const merged = existing.slice();
   for (const inc of incoming) {
@@ -216,7 +213,7 @@ function extractMustVisitsFromNotes(notes) {
   return Array.from(found);
 }
 
-/* ---------- nominatim geocode ---------- */
+/* ---------- nominatim geocode (unchanged) ---------- */
 async function geocodeDestination(query) {
   if (!query || !String(query).trim()) return null;
   const q = encodeURIComponent(String(query));
@@ -296,7 +293,7 @@ async function queryOverpassByBBox(bbox, extraNameRegexes = [], limit = 200, int
   ${clauses.join('\n  ')}
   ${nameFilter}
 );
-out center ${Math.min(limit, 500)};`;
+out center ${Math.min(limit, 70)};`;
 
   try {
     const resp = await fetchWithTimeout(OVERPASS_URL, {
@@ -318,7 +315,6 @@ out center ${Math.min(limit, 500)};`;
   }
 }
 
-// keep older, simpler normalizer used for immediate query->candidate mapping
 function normalizeOsmElement(el) {
   const tags = el.tags || {};
   const amenity = tags.amenity || null;
@@ -349,20 +345,10 @@ function normalizeOsmElement(el) {
 }
 
 /* ---------- Persist OSM candidates to DB using bulk upsert (fast) ---------- */
-/*
- Strategy (adapted to new schema):
-  - normalize OSM elements into objects matching new columns (titulo, descripcion, latitud, longitud, imagenes, relevancia, opening_hours, website, category)
-  - insert into a temp table tmp_pois
-  - 1) update locations by exact title+country+city
-  - 2) update by proximity (lat/lng epsilon) when match exists
-  - 3) insert remaining rows
-  - finally SELECT matching rows from locations by lower(titulo) and return them
-*/
 const LAT_LNG_EPS = 0.0006; // ~50-70 meters
 
 async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, city = null) {
   if (!Array.isArray(osmCandidates) || osmCandidates.length === 0) return [];
-  // normalize
   const norm = [];
   for (const c of osmCandidates) {
     const raw = c._raw || c;
@@ -371,7 +357,6 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
   }
   if (!norm.length) return [];
 
-  // use client (db may be Pool or client)
   let client = db;
   let mustRelease = false;
   try {
@@ -386,8 +371,6 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
 
   try {
     await client.query('BEGIN');
-
-    // temp table matching the reduced set of fields
     await client.query(`CREATE TEMP TABLE tmp_pois (
       titulo text,
       latitud double precision,
@@ -421,7 +404,6 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
     const insertTmpSql = `INSERT INTO tmp_pois (titulo, latitud, longitud, descripcion, relevancia, opening_hours, website, imagenes, category) VALUES ${placeholders.join(',')};`;
     await client.query(insertTmpSql, vals);
 
-    // 1) update by exact title + country + city
     const updateByTitleSql = `
       WITH updated AS (
         UPDATE locations l
@@ -444,10 +426,8 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
       )
       SELECT COUNT(*) as cnt FROM updated;
     `;
-    const upTitleRes = await client.query(updateByTitleSql, [country || null, city || null]);
-    const updated_by_title = upTitleRes.rows && Number(upTitleRes.rows[0].cnt || 0) || 0;
+    await client.query(updateByTitleSql, [country || null, city || null]);
 
-    // 2) update by proximity for rows that have coordinates
     const updateByProxSql = `
       WITH updated AS (
         UPDATE locations l
@@ -471,10 +451,8 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
       )
       SELECT COUNT(*) as cnt FROM updated;
     `;
-    const upProxRes = await client.query(updateByProxSql, [LAT_LNG_EPS, /*unused*/null, country || null, city || null]);
-    const updated_by_proximity = upProxRes.rows && Number(upProxRes.rows[0].cnt || 0) || 0;
+    await client.query(updateByProxSql, [LAT_LNG_EPS, /*unused*/null, country || null, city || null]);
 
-    // 3) insert remaining rows that don't exist by title+country+city or proximity
     const insertSql = `
       WITH ins AS (
         INSERT INTO locations (
@@ -494,17 +472,13 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
       )
       SELECT COUNT(*) as inserted_count FROM ins;
     `;
-    const insertRes = await client.query(insertSql, [country || null, city || null, LAT_LNG_EPS]);
-    const inserted = insertRes.rows && Number(insertRes.rows[0].inserted_count || 0) || 0;
+    await client.query(insertSql, [country || null, city || null, LAT_LNG_EPS]);
 
     await client.query('COMMIT');
 
-    // Fetch matching rows by titulo (lowered) to return them (we only inserted/updated by titulo/proximity)
     const tituloList = norm.map(n => (n.titulo || '').toLowerCase()).filter(Boolean);
-
     if (!tituloList.length) return [];
-
-    const fetchSql = `SELECT id, titulo, latitud, longitud, imagenes, relevancia, country, city, opening_hours, website, category FROM locations WHERE lower(titulo) = ANY($1) LIMIT 500;`;
+    const fetchSql = `SELECT id, titulo, latitud, longitud, imagenes, relevancia, country, city, opening_hours, website, category FROM locations WHERE lower(titulo) = ANY($1) LIMIT 70;`;
     const fetchRes = await client.query(fetchSql, [tituloList]);
     const rows = (fetchRes.rows || []).map(r => ({
       id: r.id,
@@ -516,7 +490,6 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
       country: r.country || country || null,
       city: r.city || city || null
     }));
-
     return rows;
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (e) {}
@@ -527,7 +500,7 @@ async function persistOsmCandidatesToDb(osmCandidates = [], db, country = null, 
   }
 }
 
-/* ---------- Main exported function (unchanged logic but uses bulk persist) ---------- */
+/* ---------- Main exported function ---------- */
 /**
  * options: { db, interestSlugs, country, destination, limit, mustVisits, notes }
  * db = pg pool (has .query)
@@ -547,20 +520,160 @@ async function getCandidates(options = {}) {
   const parsedMusts = extractMustVisitsFromNotes(notes || '');
   const explicitMusts = Array.from(new Set([...(mustVisits || []), ...parsedMusts])).slice(0, 20);
 
-  // 1) geocode destination
+  // derive city/country guesses from destination (best-effort)
+  let cityGuess = null;
+  let countryGuess = country || null;
+  if (destination && typeof destination === 'string') {
+    if (destination.includes(',')) {
+      const parts = destination.split(',').map(p => p.trim()).filter(Boolean);
+      if (parts.length) {
+        countryGuess = countryGuess || parts[parts.length - 1];
+        cityGuess = parts.slice(0, parts.length - 1).join(', ');
+      }
+    } else {
+      const parts = destination.trim().split(/\s+/);
+      if (parts.length > 1) {
+        countryGuess = countryGuess || parts[parts.length - 1];
+        cityGuess = parts.slice(0, parts.length - 1).join(' ');
+      } else {
+        // single token: treat as city
+        cityGuess = destination.trim();
+      }
+    }
+  }
+
+  // 1) Try to fetch locations directly from DB by city if we have a city guess.
+  //    If any rows found for that city, use up to 100 of them and DO NOT call nominatim/overpass.
+  let rows = [];
+  try {
+    if (cityGuess) {
+      // first attempt exact equality on city
+      const qExact = `SELECT id, titulo, fk_interest, latitud, longitud, imagenes, relevancia, country, city, opening_hours, website, category
+                      FROM locations
+                      WHERE lower(city) = lower($1)
+                      ORDER BY relevancia DESC NULLS LAST
+                      LIMIT 100`;
+      const rExact = await db.query(qExact, [cityGuess]);
+      if (rExact.rows && rExact.rows.length) {
+        rows = rExact.rows;
+        // set countryGuess if missing from row
+        if (!countryGuess && rows[0] && rows[0].country) countryGuess = rows[0].country;
+      } else {
+        // partial match: city ILIKE '%cityGuess%'
+        const qLike = `SELECT id, titulo, fk_interest, latitud, longitud, imagenes, relevancia, country, city, opening_hours, website, category
+                       FROM locations
+                       WHERE city ILIKE $1
+                       ORDER BY relevancia DESC NULLS LAST
+                       LIMIT 100`;
+        const rLike = await db.query(qLike, [`%${cityGuess}%`]);
+        if (rLike.rows && rLike.rows.length) {
+          rows = rLike.rows;
+          if (!countryGuess && rows[0] && rows[0].country) countryGuess = rows[0].country;
+        } else {
+          // fallback: maybe destinations stored in country only - try exact country
+          if (countryGuess) {
+            const qCountry = `SELECT id, titulo, fk_interest, latitud, longitud, imagenes, relevancia, country, city, opening_hours, website, category
+                              FROM locations
+                              WHERE lower(country) = lower($1)
+                              ORDER BY relevancia DESC NULLS LAST
+                              LIMIT 100`;
+            const rCountry = await db.query(qCountry, [countryGuess]);
+            if (rCountry.rows && rCountry.rows.length) {
+              rows = rCountry.rows;
+            }
+          }
+        }
+      }
+
+      // if we found city rows, return them immediately (after normalization & scoring)
+      if (rows && rows.length) {
+        const dbCandidatesAll = rows.map(normalizeDbRow);
+
+        // compute geo center from first row so we can return distance_to_center
+        const first = dbCandidatesAll[0];
+        const geo = (first && first.lat && first.lng) ? { lat: first.lat, lon: first.lng, bbox: null, raw: null } : null;
+
+        // build interest tag set
+        const interestTags = new Set();
+        if (Array.isArray(interestSlugs)) {
+          for (const s of interestSlugs) {
+            const tags = INTEREST_TO_OSM[s];
+            if (Array.isArray(tags)) tags.forEach(t => interestTags.add(t));
+            interestTags.add(String(s).toLowerCase());
+          }
+        }
+
+        // compute maxRelev
+        const maxRelev = Math.max(1, ...dbCandidatesAll.map(c => (c.relevancia || 0)));
+
+        const candidates = dbCandidatesAll.map(c => {
+          const lat = c.lat;
+          const lng = c.lng;
+          let isMust = false;
+          if (explicitMusts.length && c.titulo) {
+            for (const mv of explicitMusts) { if (c.titulo.toLowerCase().includes(mv.toLowerCase())) { isMust = true; break; } }
+          }
+          const dbRelev = Number(c.relevancia || 0);
+          const normRelevScore = 1 + ((dbRelev / maxRelev) * 4);
+          let interestMatch = false;
+          if (c.fk_interest && typeof c.fk_interest === 'string') {
+            if (interestTags.has(c.fk_interest.toLowerCase())) interestMatch = true;
+          }
+          const interestBoost = interestMatch ? 0.35 : 0.0;
+          const mustBoost = isMust ? 0.5 : 0.0;
+          let combined = normRelevScore + interestBoost + mustBoost;
+          if (!Number.isFinite(combined)) combined = normRelevScore;
+          combined = Math.min(5, combined);
+          const distanceToCenter = (geo && geo.lat && lat && lng) ? Math.round(haversineMeters(geo.lat, geo.lon, lat, lng)) : null;
+
+          return {
+            id: c.id,
+            titulo: c.titulo,
+            fk_interest: c.fk_interest || null,
+            lat,
+            lng,
+            imagenes: c.imagenes || null,
+            relevancia: c.relevancia || 0,
+            source: c.source || 'db',
+            osm: c.osm || null,
+            isMust,
+            combined_score: combined,
+            distance_to_center: distanceToCenter
+          };
+        });
+
+        // sort and limit
+        candidates.sort((a,b) => {
+          if (a.isMust && !b.isMust) return -1;
+          if (!a.isMust && b.isMust) return 1;
+          const cs = (b.combined_score || 0) - (a.combined_score || 0);
+          if (Math.abs(cs) > 1e-6) return cs;
+          const da = a.distance_to_center || Number.POSITIVE_INFINITY;
+          const db = b.distance_to_center || Number.POSITIVE_INFINITY;
+          return da - db;
+        });
+
+        return candidates.slice(0, Math.min(limit, 70));
+      }
+    }
+  } catch (err) {
+    console.warn('DB city-first fetch failed:', err?.message || err);
+    // continue to fallback path (geocode + OSM)
+  }
+
+  // If we reach here, we didn't return on city-match. Continue with original logic:
+  // geocode destination (only now, when DB didn't contain city rows)
   let geo = null;
   if (destination) geo = await geocodeDestination(destination);
   else if (country) geo = await geocodeDestination(country);
 
-  // 2) Query DB but return primary interest-filtered + general high-relevancia batch
-  let rows = [];
+  // 2) Query DB fallback (interest-focused + general top relevancia)
   try {
     if (Array.isArray(interestSlugs) && interestSlugs.length) {
       const slugs = interestSlugs.map(s => String(s).toLowerCase());
-      const primaryLimit = Math.ceil(limit * 0.6); // interest-focused
-      const generalLimit = Math.max(10, Math.floor(limit * 0.4)); // general top relevancia
+      const primaryLimit = Math.ceil(limit * 0.6);
+      const generalLimit = Math.max(10, Math.floor(limit * 0.4));
 
-      // find interest ids (if fk_interest stored as id-string)
       const idsRes = await db.query('SELECT id, slug FROM interests WHERE slug = ANY($1)', [slugs]);
       const matchingIds = (idsRes.rows || []).map(r => Number(r.id)).filter(n => Number.isFinite(n));
       const idsParam = matchingIds.length ? matchingIds : [-999999];
@@ -581,7 +694,6 @@ async function getCandidates(options = {}) {
       const rGeneral = await db.query(qGeneral, [generalLimit]);
       const generalRows = rGeneral.rows || [];
 
-      // merge preserving order, dedupe by id
       const byId = new Map();
       for (const rr of primaryRows) byId.set(String(rr.id), rr);
       for (const rr of generalRows) if (!byId.has(String(rr.id))) byId.set(String(rr.id), rr);
@@ -616,7 +728,7 @@ async function getCandidates(options = {}) {
     });
   }
 
-  // 3) Query OSM when needed (focused by interestSlugs and/or explicit musts)
+  // 3) Query OSM when needed (only if dbCandidates insufficient or explicitMusts)
   let osmCandidates = [];
   const needExtra = dbCandidates.length < Math.min(limit, 60) || explicitMusts.length > 0 || !geo;
   if (geo && (needExtra || dbCandidates.length === 0)) {
@@ -646,10 +758,10 @@ async function getCandidates(options = {}) {
     }
   }
 
-  // Persist new OSM candidates into DB (so next request will pick them from DB) - bulk upsert
+  // Persist new OSM candidates into DB (so next request will pick them from DB)
   if (Array.isArray(osmCandidates) && osmCandidates.length && db) {
     try {
-      const insertedRows = await persistOsmCandidatesToDb(osmCandidates, db, country, geo && geo.raw && geo.raw.display_name ? (geo.raw.display_name.split(',')[0] || null) : null);
+      const insertedRows = await persistOsmCandidatesToDb(osmCandidates, db, countryGuess, geo && geo.raw && geo.raw.display_name ? (geo.raw.display_name.split(',')[0] || null) : null);
       if (insertedRows && insertedRows.length) {
         const normInserted = insertedRows.map(r => ({
           id: r.id,
@@ -659,7 +771,7 @@ async function getCandidates(options = {}) {
           lng: r.longitud !== null && r.longitud !== undefined ? Number(r.longitud) : null,
           imagenes: r.imagenes || null,
           relevancia: r.relevancia || 5,
-          country: r.country || country || null,
+          country: r.country || countryGuess || null,
           city: r.city || null,
           source: 'db+osm'
         }));
@@ -689,50 +801,65 @@ async function getCandidates(options = {}) {
     }
   }
 
-  // 6) Final scoring & boosts (stronger tourism/historic boosts and interest mapping)
-  const maxRelev = Math.max(1, ...candidates.map(c => c.relevancia || 0));
+  // 6) Use DB relevancia as primary signal; filter out items without coords (pref) and compute combined_score
+  candidates = candidates.filter(c => c && c.lat !== null && c.lng !== null);
+
+  if (!candidates.length) {
+    // fallback: return top db candidates (may include ones without coords)
+    return dbCandidatesAll.slice(0, limit).map(c => ({
+      id: c.id,
+      titulo: c.titulo,
+      fk_interest: c.fk_interest || null,
+      lat: c.lat,
+      lng: c.lng,
+      imagenes: c.imagenes || null,
+      relevancia: c.relevancia || 0,
+      source: c.source || 'db',
+      osm: c.osm || null,
+      isMust: (explicitMusts.length && c.titulo) ? explicitMusts.some(mv => c.titulo.toLowerCase().includes(mv.toLowerCase())) : false,
+      combined_score: c.relevancia || 0,
+      distance_to_center: (geo && geo.lat && c.lat && c.lng) ? Math.round(haversineMeters(geo.lat, geo.lon, c.lat, c.lng)) : null
+    }));
+  }
+
+  const maxRelev = Math.max(1, ...candidates.map(c => (c.relevancia || 0)));
+
   const interestTags = new Set();
   if (Array.isArray(interestSlugs)) {
     for (const s of interestSlugs) {
       const tags = INTEREST_TO_OSM[s];
       if (Array.isArray(tags)) tags.forEach(t => interestTags.add(t));
+      interestTags.add(String(s).toLowerCase());
     }
   }
 
   candidates = candidates.map(c => {
     const lat = c.lat !== null && c.lat !== undefined ? Number(c.lat) : null;
     const lng = c.lng !== null && c.lng !== undefined ? Number(c.lng) : null;
+
     let isMust = false;
     if (explicitMusts.length && c.titulo) {
       for (const mv of explicitMusts) { if (c.titulo.toLowerCase().includes(mv.toLowerCase())) { isMust = true; break; } }
     }
-    const base = (c.relevancia || 0) / maxRelev;
-    const osmBoost = (c.source && String(c.source).includes('osm')) ? 0.2 : 0;
 
-    // tourism/historic boosts
-    let tourismHistoricBoost = 0;
-    if (c.osm && c.osm.tags) {
-      const t = (c.osm.tags.tourism || '').toString().toLowerCase();
-      const h = (c.osm.tags.historic || '').toString().toLowerCase();
-      const amen = (c.osm.tags.amenity || '').toString().toLowerCase();
-      if (['museum','attraction','viewpoint','gallery','zoo','aquarium'].includes(t)) tourismHistoricBoost += 2.0;
-      if (['memorial','monument','castle','ruins','archaeological_site','yes'].includes(h)) tourismHistoricBoost += 2.0;
-      if (['park','garden','nature_reserve'].includes((c.osm.tags.leisure || '').toString().toLowerCase())) tourismHistoricBoost += 1.2;
+    const dbRelev = Number(c.relevancia || 0);
+    const normRelevScore = 1 + ((dbRelev / maxRelev) * 4);
+
+    let interestMatch = false;
+    if (c.fk_interest && typeof c.fk_interest === 'string') {
+      if (interestTags.has(c.fk_interest.toLowerCase())) interestMatch = true;
     }
-
-    // interest-based boost (if POI's tags match interest mapping)
-    let interestBoost = 0;
-    if (Array.isArray(interestSlugs) && interestSlugs.length && c.osm && c.osm.tags) {
+    if (!interestMatch && c.osm && c.osm.tags) {
       const amenOrTour = (c.osm.tags.amenity || c.osm.tags.tourism || c.osm.tags.leisure || '').toString().toLowerCase();
-      for (const slug of interestSlugs) {
-        const map = INTEREST_TO_OSM[String(slug).toLowerCase()];
-        if (Array.isArray(map) && map.includes(amenOrTour)) {
-          interestBoost += 1.6;
-        }
-      }
+      if (interestTags.has(amenOrTour)) interestMatch = true;
     }
-    const mustBoost = isMust ? 1.8 : 0;
-    const combined = (base * 3.0) + osmBoost + tourismHistoricBoost + mustBoost + interestBoost;
+    const interestBoost = interestMatch ? 0.35 : 0.0;
+    const mustBoost = isMust ? 0.5 : 0.0;
+
+    let combined = normRelevScore + interestBoost + mustBoost;
+    if (!Number.isFinite(combined)) combined = normRelevScore;
+    combined = Math.min(5, combined);
+
     const distanceToCenter = (geo && geo.lat && lat && lng) ? Math.round(haversineMeters(geo.lat, geo.lon, lat, lng)) : null;
 
     return {
@@ -751,7 +878,7 @@ async function getCandidates(options = {}) {
     };
   });
 
-  // 7) sort: prefer musts, then combined_score, then proximity
+  // sort
   candidates.sort((a,b) => {
     if (a.isMust && !b.isMust) return -1;
     if (!a.isMust && b.isMust) return 1;
@@ -762,7 +889,6 @@ async function getCandidates(options = {}) {
     return da - db;
   });
 
-  // 8) limit result
   return candidates.slice(0, limit);
 }
 
