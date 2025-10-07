@@ -334,6 +334,7 @@ async function callHF(promptOrMessages, opts = {}) {
  * Distributes topCandidates across days respecting daily_hours and visit_default_minutes.
  * Now uses candidate.avg_duration_min when available and respects a simple opening-hours window heuristic.
  */
+// (simpleGreedyGenerator and helper functions unchanged)
 function parseTimeToMinutes(t) {
   if (!t || typeof t !== 'string') return null;
   const hh = Number(t.slice(0,2));
@@ -477,13 +478,30 @@ function simpleGreedyGenerator({ candidates, days, spec }) {
 }
 
 /**
- * GET /trips/:id/itinerary
- * Generate itinerary (LLM + optimizer fallback) and ALWAYS persist trip_places.
- * Creates new locations rows when a visit cannot be resolved to an existing location.
+ * Shared itinerary handler used for POST and GET (GET kept for backward compatibility).
+ * Accepts optional params: save (bool), pace (string), places (array or CSV string), llm_notes (string), budget
  */
-router.get('/:id/itinerary', auth, async (req, res) => {
+async function handleItinerary(req, res) {
+  const method = (req.method || 'GET').toUpperCase();
+  // read params from body for POST, query for GET
+  const source = (method === 'POST') ? req.body || {} : req.query || {};
+
+  // Normalize params
+  const saveFlag = (source.save === undefined) ? true : ((String(source.save) === 'false' || source.save === false) ? false : true);
+  const pace = source.pace ? String(source.pace).trim() : null;
+  let places = [];
+  if (Array.isArray(source.places)) places = source.places.map(p => (typeof p === 'string' ? p.trim() : p)).filter(Boolean);
+  else if (typeof source.places === 'string' && source.places.trim()) {
+    // try JSON parse first
+    try { places = JSON.parse(source.places); if (!Array.isArray(places)) places = String(source.places).split(/[,;\n]+/).map(s => s.trim()).filter(Boolean); }
+    catch (e) { places = String(source.places).split(/[,;\n]+/).map(s => s.trim()).filter(Boolean); }
+  }
+  const llm_notes = source.llm_notes || source.notes || null;
+  const incomingBudget = (source.budget === undefined || source.budget === '') ? null : source.budget;
+
   const tripId = Number(req.params.id);
   const userId = req.user.id;
+
   const topK = Number(req.query.topK) || Number(process.env.LLM_TOP_K) || 20;
   const mode = req.query.mode || 'hf';
 
@@ -522,6 +540,7 @@ router.get('/:id/itinerary', auth, async (req, res) => {
     }
 
     // 3) fetch candidate POIs (db-first)
+    // Note: pass trip.notes to poiService as before; we'll also include llm_notes in prompts later
     let candidates = await poiService.getCandidates({ db: pool, interestSlugs, destination: trip.destination, limit: 300, notes: trip.notes });
 
     if (!candidates || !candidates.length) return res.status(404).json({ message: 'No candidate locations found' });
@@ -529,18 +548,15 @@ router.get('/:id/itinerary', auth, async (req, res) => {
     // sort by relevancia and take topK for the LLM
     candidates.sort((a,b) => (b.relevancia || 0) - (a.relevancia || 0));
     const topCandidates = candidates.slice(0, topK);
-  // --- ENRICH topCandidates with full location fields (opening_hours, imagenes, lat/lng, category, website, country, city)
+
+    // --- ENRICH topCandidates with full location fields (unchanged from your code) ---
     try {
-      // separate numeric DB ids (we no longer use osm_id in the new schema)
       const numericIds = topCandidates.map(p => {
         const n = Number(p.id);
         return Number.isFinite(n) ? n : null;
       }).filter(Boolean);
 
-      if (numericIds.length === 0) {
-        // nothing to enrich
-      } else {
-        // build flexible WHERE: id = ANY($1::bigint[])
+      if (numericIds.length > 0) {
         const whereParts = [];
         const params = [];
         let idx = 1;
@@ -554,7 +570,6 @@ router.get('/:id/itinerary', auth, async (req, res) => {
           WHERE ${whereParts.join(' OR ')}
         `;
         const r = await pool.query(q, params);
-        // map results by id
         const byId = new Map();
         for (const rr of r.rows) {
           if (rr.id != null) byId.set(String(rr.id), rr);
@@ -563,26 +578,19 @@ router.get('/:id/itinerary', auth, async (req, res) => {
         for (const p of topCandidates) {
           const key = (p.id === null || p.id === undefined) ? null : String(p.id);
           const rr = (key && byId.has(key) && byId.get(key));
-
           if (rr) {
             p.opening_hours = rr.opening_hours || null;
-            // imagenes column now holds photos / images
             p.photos = rr.imagenes || null;
-            // avg_duration_min no longer in schema — preserve existing value if any, otherwise null
             p.avg_duration_min = p.avg_duration_min || null;
-            // timezone, price_level, tags removed from schema — set to null
             p.timezone = null;
             p.price_level = null;
             p.tags = null;
-            // ensure we keep numeric lat/lng on the candidate for routing/haversine
             p.lat = (p.lat || p.latitude || rr.latitud) ?? null;
             p.lng = (p.lng || p.longitude || rr.longitud) ?? null;
-            // keep country/city/category/website
             p.country = p.country || rr.country || null;
             p.city = p.city || rr.city || null;
             p.website = p.website || rr.website || null;
             p.category = p.category || rr.category || null;
-            // If the DB record is numeric id and candidate had string id, expose db_id
             if (rr.id && (!p.id || !/^\d+$/.test(String(p.id)))) {
               p.db_id = Number(rr.id);
             }
@@ -594,6 +602,20 @@ router.get('/:id/itinerary', auth, async (req, res) => {
     }
 
     // 4) Parse user preferences into a structured spec
+    // Merge trip.notes + llm_notes into the prompt input so HF sees both
+    const combinedNotesForLLM = [trip.notes || '', llm_notes || ''].filter(Boolean).join('\n\n');
+
+    const prefInputObj = {
+      destination: trip.destination,
+      start_date: (new Date(trip.start_date)).toISOString().slice(0,10),
+      end_date: (new Date(trip.end_date)).toISOString().slice(0,10),
+      budget: incomingBudget ?? trip.budget,
+      interests: interestSlugs,
+      notes: combinedNotesForLLM,
+      pace: pace || null,
+      places: places || []
+    };
+
     const prefPrompt = `
 You are a trip-spec parser. Input: user preferences and trip metadata. Output: EXACT JSON with keys:
 {
@@ -605,14 +627,7 @@ You are a trip-spec parser. Input: user preferences and trip metadata. Output: E
  "max_travel_minutes_per_day": <int|null>
 }
 Input object:
-${JSON.stringify({
-      destination: trip.destination,
-      start_date: (new Date(trip.start_date)).toISOString().slice(0,10),
-      end_date: (new Date(trip.end_date)).toISOString().slice(0,10),
-      budget: trip.budget,
-      interests: interestSlugs,
-      notes: trip.notes || ''
-    }, null, 2)}
+${JSON.stringify(prefInputObj, null, 2)}
 Return only JSON.
 `;
     let spec = null;
@@ -626,6 +641,25 @@ Return only JSON.
     } catch (err) {
       console.warn('Spec parsing with HF failed, using heuristic fallback', err?.message || err);
       spec = { daily_hours: { start: '09:00', end: '18:00' }, visit_default_minutes: 90, relaxation: 'moderate', must_visit: [], avoid: [], max_travel_minutes_per_day: 180 };
+    }
+
+    // If incoming places exist, merge them into spec.must_visit (keep names/ids)
+    if (!Array.isArray(spec.must_visit)) spec.must_visit = [];
+    const incomingPlacesNormalized = (places || []).map(p => (typeof p === 'string' ? p.trim() : (p && p.name ? String(p.name).trim() : String(p))));
+    spec.must_visit = Array.from(new Set([ ...(spec.must_visit || []).filter(Boolean).map(String), ...incomingPlacesNormalized.filter(Boolean).map(String) ]));
+
+    // Apply pace mapping to tweak relaxation and visit_default_minutes
+    const paceMap = {
+      relajado: { relaxation: 'high', delta: +30 },
+      moderado: { relaxation: 'moderate', delta: 0 },
+      intenso: { relaxation: 'low', delta: -20 }
+    };
+    if (pace && paceMap[pace]) {
+      spec.relaxation = paceMap[pace].relaxation;
+      spec.visit_default_minutes = Math.max(20, (spec.visit_default_minutes || 90) + (paceMap[pace].delta || 0));
+    } else {
+      spec.visit_default_minutes = spec.visit_default_minutes || 90;
+      spec.relaxation = spec.relaxation || 'moderate';
     }
 
     // 5) Score POIs semantically with HF (batched)
@@ -645,7 +679,7 @@ Return only JSON.
         const scorePrompt = `
 You are a travel assistant. Given the user's preferences and the following POIs, return a JSON array exactly with elements:
 [{"id": <poi id>, "score": <1.0..5.0 float>, "reason": "short (max 15 words)"}]
-User prefs: ${JSON.stringify({...spec, notes: trip.notes || '', budget: trip.budget, interests: interestSlugs})}
+User prefs: ${JSON.stringify({...spec, notes: combinedNotesForLLM, budget: incomingBudget ?? trip.budget, interests: interestSlugs})}
 POIS: ${JSON.stringify(chunk)}
 Return only JSON.
 `;
@@ -669,13 +703,31 @@ Return only JSON.
       const s = scoreMap.get(p.id);
       p.llm_score = s ? Number(s.score) : 1.0;
       p.llm_reason = s ? String(s.reason).slice(0,200) : null;
-      // use avg_duration_min if available for combined scoring influence
-      p.combined_score = ((p.relevancia || 0) * 0.5) + ((p.llm_score || 1) * 2.0) + ((p.avg_duration_min || 90) / 120);
+      p.combined_score = ((p.relevancia || 0) * 0.5) + ((p.llm_score || 1) * 2.0) + ((p.avg_duration_min || spec.visit_default_minutes || 90) / 120);
     });
     topCandidates.sort((a,b)=> (b.combined_score || 0) - (a.combined_score || 0));
 
-        // 6) compute travel matrix for topCandidates (seconds) via routing service
-    // ensure lat/lng fields exist and are numeric
+    // Attempt to resolve spec.must_visit names to numeric candidate ids
+    const mustVisitResolvedIds = [];
+    const mustVisitNamesFallback = [];
+    for (const mv of (spec.must_visit || [])) {
+      const mvStr = String(mv || '').trim();
+      if (!mvStr) continue;
+      // match candidate title (case-insensitive) or city match or exact id
+      const candById = topCandidates.find(x => String(x.id) === mvStr);
+      if (candById) { mustVisitResolvedIds.push(candById.id); continue; }
+      const candByTitle = topCandidates.find(x => x.titulo && String(x.titulo).toLowerCase() === mvStr.toLowerCase());
+      if (candByTitle) { mustVisitResolvedIds.push(candByTitle.id); continue; }
+      // partial match
+      const candPartial = topCandidates.find(x => x.titulo && String(x.titulo).toLowerCase().includes(mvStr.toLowerCase()));
+      if (candPartial) { mustVisitResolvedIds.push(candPartial.id); continue; }
+      // else keep as a name fallback
+      mustVisitNamesFallback.push(mvStr);
+    }
+    spec.must_visit_ids = Array.from(new Set(mustVisitResolvedIds));
+    spec.must_visit_names = Array.from(new Set(mustVisitNamesFallback));
+
+    // 6) compute travel matrix for topCandidates (seconds) via routing service
     const coords = topCandidates.map(c => {
       const lat = (c.lat ?? c.latitude ?? c.latitud) !== undefined ? Number(c.lat ?? c.latitude ?? c.latitud) : null;
       const lng = (c.lng ?? c.longitude ?? c.longitud) !== undefined ? Number(c.lng ?? c.longitude ?? c.longitud) : null;
@@ -705,6 +757,7 @@ Return only JSON.
 
     try {
       const useOrtools = (process.env.ITINERARY_MODE === 'ortools' || req.query.useOrtools === '1');
+      // pass spec (now includes must_visit_ids/names, visit_default_minutes, relaxation)
       itinerary = await optimizer.generateItinerary({
         mode: useOrtools ? 'ortools' : 'greedy',
         candidates: topCandidates,
@@ -725,7 +778,7 @@ Return only JSON.
       itinerary = simpleGreedyGenerator({ candidates: topCandidates, days: daysArr, spec });
     }
 
-    // repair/validate
+    // repair/validate (unchanged)
     function validateAndRepair(itin) {
       const maxDailyMinutes = spec.max_travel_minutes_per_day || 24*60;
       const startMin = parseTimeToMinutes(spec.daily_hours?.start || '09:00');
@@ -859,7 +912,7 @@ Return only JSON.
               }
             }
             const travelMin = v.travel_to_prev_minutes || v.travel_to_prev || 10;
-            const visitMin = v.visit_minutes || v.visit_minutes || v.visit_minutes === 0 ? v.visit_minutes : (v.visit_minutes || v.visit_minutes === 0 ? v.visit_minutes : (v.avg_duration_min || spec.visit_default_minutes || 90));
+            const visitMin = v.visit_minutes || v.visit_minutes || v.visit_minutes === 0 ? v.visit_minutes : (v.avg_duration_min || spec.visit_default_minutes || 90);
             const proposedStart = cursorMin + (Number(travelMin) || 10);
             const proposedEnd = proposedStart + (Number(visitMin) || 90);
 
@@ -958,7 +1011,14 @@ Return only JSON.
     }
 
     // success: return itinerary and save metadata
-    return res.json({ itinerary, saved: true, insertedCount: insertedPlaces.length, insertedPlaces, skippedPlaces });
+    return res.json({
+      itinerary,
+      saved: true,
+      insertedCount: insertedPlaces.length,
+      insertedPlaces,
+      skippedPlaces,
+      specUsed: spec // return spec for debugging / front-end use
+    });
 
   } catch (err) {
     // ensure any still-open client is rolled back & released
@@ -967,14 +1027,16 @@ Return only JSON.
       try { client.release(); } catch(e) {}
       client = null;
     }
-    console.error('GET /trips/:id/itinerary error:', err);
+    console.error('GET/POST /trips/:id/itinerary error:', err);
     const status = err.status || 500;
     const msg = err.message || 'Error generating itinerary';
     return res.status(status).json({ message: msg, detail: err.detail || undefined });
   }
-});
+}
 
-module.exports = router;
+router.post('/:id/itinerary', auth, handleItinerary);
+router.get('/:id/itinerary', auth, handleItinerary);
+
 
 /* NEW: POST /trips/:id/share
    Body: { mode: 'viewer'|'editor', public: boolean, shared_with_user_id (optional), expires_in_days (optional int) }
