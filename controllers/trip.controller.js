@@ -334,7 +334,7 @@ async function callHF(promptOrMessages, opts = {}) {
  * Distributes topCandidates across days respecting daily_hours and visit_default_minutes.
  * Now uses candidate.avg_duration_min when available and respects a simple opening-hours window heuristic.
  */
-// (simpleGreedyGenerator and helper functions unchanged)
+// (simpleGreedyGenerator and helper functions - minor tweaks applied below)
 function parseTimeToMinutes(t) {
   if (!t || typeof t !== 'string') return null;
   const hh = Number(t.slice(0,2));
@@ -363,11 +363,14 @@ function extractOpeningWindowFromString(openingStr) {
 
 function simpleGreedyGenerator({ candidates, days, spec }) {
   if (!Array.isArray(candidates) || candidates.length === 0) return [];
-    let defaultVisit = Number(spec?.visit_default_minutes || 90);
-  // if there are many candidates per day, reduce default visit to allow more stops
+  // default visit length from spec
+  let defaultVisit = Number(spec?.visit_default_minutes || 90);
+
+  // If many candidates relative to days, reduce defaultVisit to allow more stops.
+  // Previously min was 30 — lower to 20 to allow "intenso" to schedule more.
   try {
     if (candidates.length > days.length * 6) {
-      defaultVisit = Math.max(30, Math.round(defaultVisit * 0.6));
+      defaultVisit = Math.max(20, Math.round(defaultVisit * 0.6));
     }
   } catch (e) { /* defensive */ }
 
@@ -380,7 +383,8 @@ function simpleGreedyGenerator({ candidates, days, spec }) {
     return parseTimeToMinutes(e) ?? (18*60);
   })();
   const dayCapacity = Math.max(60, endMinGlobal - startMinGlobal);
-  const speedMetersPerMin = 500; // ~30 km/h -> 500 m/min
+  // realistic walking speed: ~80-90 m/min (about 4.8-5.4 km/h)
+  const speedMetersPerMin = 80;
 
   const sorted = [...candidates].sort((a,b)=> (b.combined_score||0) - (a.combined_score||0));
   const assigned = new Set();
@@ -401,7 +405,7 @@ function simpleGreedyGenerator({ candidates, days, spec }) {
 
       // compute travel to this from prev
       let travelMin = 0;
-      if (prev && cand.lat != null && prev.lat != null) {
+      if (prev && cand.lat != null && prev.lat != null && cand.lng != null && prev.lng != null) {
         const dist = haversineMeters(prev.lat, prev.lng, cand.lat, cand.lng);
         travelMin = Math.ceil(dist / speedMetersPerMin);
       } else {
@@ -414,7 +418,7 @@ function simpleGreedyGenerator({ candidates, days, spec }) {
       // try respect simple opening hours heuristic if available
       let window = null;
       if (cand.opening_hours_parsed && cand.opening_hours_parsed.is_open_now === true) {
-        // if parsed exists and indicates open_now, accept
+        // parsed open now -> accept
       } else if (cand.opening_hours) {
         window = extractOpeningWindowFromString(typeof cand.opening_hours === 'string' ? cand.opening_hours : String(cand.opening_hours));
       }
@@ -477,10 +481,37 @@ function simpleGreedyGenerator({ candidates, days, spec }) {
   return itinerary;
 }
 
-/**
- * Shared itinerary handler used for POST and GET (GET kept for backward compatibility).
- * Accepts optional params: save (bool), pace (string), places (array or CSV string), llm_notes (string), budget
- */
+/* ---------- Additional helpers for more robust fallback scoring ---------- */
+
+// Heuristic scoring helper used when HF fails (returns score 1.0..5.0)
+function heuristicScorePOI(p, spec = {}) {
+  // p: { id, title, relevancia, opening_hours, photos, avg_duration_min, ...}
+  const rel = Math.max(0, Math.min(100, Number(p.relevancia || 0)));
+  let score = 1.0;
+  // map relevancia to up to +3.0
+  score += (rel / 100) * 3.0;
+  if (p.photos || p.imagenes) score += 0.45;
+  if (p.opening_hours) score += 0.3;
+  if (p.website) score += 0.2;
+  if (p.avg_duration_min && spec.visit_default_minutes) {
+    const diff = Math.abs(Number(p.avg_duration_min) - Number(spec.visit_default_minutes || 90));
+    const bonus = Math.max(0, 0.25 - Math.min(0.25, diff / 240));
+    score += bonus;
+  }
+  try {
+    if (Array.isArray(spec.must_visit_ids) && spec.must_visit_ids.includes(p.id)) score += 0.8;
+  } catch (e) { /* ignore */ }
+  score = Math.max(1.0, Math.min(5.0, Math.round(score * 10) / 10));
+  const reasons = [];
+  if (rel > 0) reasons.push(`relev:${rel}`);
+  if (p.photos) reasons.push('img');
+  if (p.opening_hours) reasons.push('hours');
+  if (p.website) reasons.push('web');
+  if (Array.isArray(spec.must_visit_ids) && spec.must_visit_ids.includes(p.id)) reasons.push('must');
+  return { score, reason: (reasons.slice(0,3).join(', ') || 'heuristic') };
+}
+
+/* ---------- main handler (POST/GET) ---------- */
 async function handleItinerary(req, res) {
   const method = (req.method || 'GET').toUpperCase();
   // read params from body for POST, query for GET
@@ -549,7 +580,7 @@ async function handleItinerary(req, res) {
     candidates.sort((a,b) => (b.relevancia || 0) - (a.relevancia || 0));
     const topCandidates = candidates.slice(0, topK);
 
-    // --- ENRICH topCandidates with full location fields (unchanged from your code) ---
+    // --- ENRICH topCandidates with full location fields (robust null-safe assignments) ---
     try {
       const numericIds = topCandidates.map(p => {
         const n = Number(p.id);
@@ -579,26 +610,54 @@ async function handleItinerary(req, res) {
           const key = (p.id === null || p.id === undefined) ? null : String(p.id);
           const rr = (key && byId.has(key) && byId.get(key));
           if (rr) {
-            p.opening_hours = rr.opening_hours || null;
-            p.photos = rr.imagenes || null;
-            p.avg_duration_min = p.avg_duration_min || null;
-            p.timezone = null;
-            p.price_level = null;
-            p.tags = null;
-            p.lat = (p.lat || p.latitude || rr.latitud) ?? null;
-            p.lng = (p.lng || p.longitude || rr.longitud) ?? null;
-            p.country = p.country || rr.country || null;
-            p.city = p.city || rr.city || null;
-            p.website = p.website || rr.website || null;
-            p.category = p.category || rr.category || null;
+            // Null-safe preference: DB values preferred but preserve existing if set
+            p.opening_hours = rr.opening_hours ?? p.opening_hours ?? null;
+            p.photos = rr.imagenes ?? p.photos ?? null;
+            p.avg_duration_min = p.avg_duration_min ?? null;
+            p.timezone = p.timezone ?? null;
+            p.price_level = p.price_level ?? null;
+            p.tags = p.tags ?? null;
+
+            // Null-safe numeric lat/lng assignment (avoid `||` which drops 0)
+            const latVal = (p.lat ?? p.latitude ?? rr.latitud ?? null);
+            const lngVal = (p.lng ?? p.longitude ?? rr.longitud ?? null);
+            p.lat = (latVal !== null && latVal !== undefined && !Number.isNaN(Number(latVal))) ? Number(latVal) : null;
+            p.lng = (lngVal !== null && lngVal !== undefined && !Number.isNaN(Number(lngVal))) ? Number(lngVal) : null;
+
+            p.country = p.country ?? rr.country ?? null;
+            p.city = p.city ?? rr.city ?? null;
+            p.website = p.website ?? rr.website ?? null;
+            p.category = p.category ?? rr.category ?? null;
+
             if (rr.id && (!p.id || !/^\d+$/.test(String(p.id)))) {
               p.db_id = Number(rr.id);
             }
+          } else {
+            // ensure lat/lng fields are normalized types even when no rr found
+            const latRaw = p.lat ?? p.latitude ?? null;
+            const lngRaw = p.lng ?? p.longitude ?? null;
+            p.lat = (latRaw !== null && latRaw !== undefined && !Number.isNaN(Number(latRaw))) ? Number(latRaw) : null;
+            p.lng = (lngRaw !== null && lngRaw !== undefined && !Number.isNaN(Number(lngRaw))) ? Number(lngRaw) : null;
           }
+        }
+      } else {
+        // ensure numeric normals for lat/lng if no numericIds
+        for (const p of topCandidates) {
+          const latRaw = p.lat ?? p.latitude ?? null;
+          const lngRaw = p.lng ?? p.longitude ?? null;
+          p.lat = (latRaw !== null && latRaw !== undefined && !Number.isNaN(Number(latRaw))) ? Number(latRaw) : null;
+          p.lng = (lngRaw !== null && lngRaw !== undefined && !Number.isNaN(Number(lngRaw))) ? Number(lngRaw) : null;
         }
       }
     } catch (err) {
       console.warn('Could not enrich topCandidates from DB:', err?.message || err, err?.stack || '');
+      // best-effort normalization
+      for (const p of topCandidates) {
+        const latRaw = p.lat ?? p.latitude ?? p.latitud ?? null;
+        const lngRaw = p.lng ?? p.longitude ?? p.longitud ?? null;
+        p.lat = (latRaw !== null && latRaw !== undefined && !Number.isNaN(Number(latRaw))) ? Number(latRaw) : null;
+        p.lng = (lngRaw !== null && lngRaw !== undefined && !Number.isNaN(Number(lngRaw))) ? Number(lngRaw) : null;
+      }
     }
 
     // 4) Parse user preferences into a structured spec
@@ -633,7 +692,7 @@ Return only JSON.
     let spec = null;
     try {
       if (mode === 'hf') {
-        const hfRaw = await callHF(prefPrompt, { max_new_tokens: 300, temperature: 0.0 });
+        const hfRaw = await callHF(prefPrompt, { max_new_tokens: 300, temperature: 0.0, timeout: 120000 });
         const parsed = parseHFResultToJson(hfRaw);
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) spec = parsed;
         else throw new Error('Spec parse returned non-object');
@@ -649,10 +708,11 @@ Return only JSON.
     spec.must_visit = Array.from(new Set([ ...(spec.must_visit || []).filter(Boolean).map(String), ...incomingPlacesNormalized.filter(Boolean).map(String) ]));
 
     // Apply pace mapping to tweak relaxation and visit_default_minutes
+    // NOTE: 'intenso' reduces default visit by a larger delta to allow more stops
     const paceMap = {
       relajado: { relaxation: 'high', delta: +30 },
       moderado: { relaxation: 'moderate', delta: 0 },
-      intenso: { relaxation: 'low', delta: -20 }
+      intenso: { relaxation: 'low', delta: -40 }
     };
     if (pace && paceMap[pace]) {
       spec.relaxation = paceMap[pace].relaxation;
@@ -662,7 +722,7 @@ Return only JSON.
       spec.relaxation = spec.relaxation || 'moderate';
     }
 
-    // 5) Score POIs semantically with HF (batched)
+    // 5) Score POIs semantically with HF (batched). Add retry + strong heuristic fallback
     const smallPois = topCandidates.map((p, idx) => ({
       id: p.id, title: p.titulo, interest: p.fk_interest, country: p.country, relevancia: p.relevancia || 0, idx,
       opening_hours: p.opening_hours || null,
@@ -684,26 +744,50 @@ POIS: ${JSON.stringify(chunk)}
 Return only JSON.
 `;
         try {
-          const hfRaw = await callHF(scorePrompt, { max_new_tokens: 400, temperature: 0.0 });
+          const hfRaw = await callHF(scorePrompt, { max_new_tokens: 400, temperature: 0.0, timeout: 120000 });
           const parsed = parseHFResultToJson(hfRaw);
           if (!Array.isArray(parsed)) throw new Error('HF scoring returned non-array');
           parsed.forEach(p => scoreResults.push(p));
         } catch (err) {
-          console.warn('HF POI scoring failed for chunk, using fallback heuristics', err?.message || err);
-          chunk.forEach(c => scoreResults.push({ id: c.id, score: Math.max(1, Math.min(5, 1 + ((c.relevancia||0)/10)*4)), reason: 'heuristic fallback' }));
+          console.warn('HF POI scoring failed for chunk, attempting single retry then heuristics', err?.message || err);
+
+          // single retry attempt (to recover from transient router aborts)
+          let retriedSuccessfully = false;
+          try {
+            const hfRawRetry = await callHF(scorePrompt, { max_new_tokens: 400, temperature: 0.0, timeout: 90000, forceRouter: false });
+            const parsedRetry = parseHFResultToJson(hfRawRetry);
+            if (Array.isArray(parsedRetry)) {
+              parsedRetry.forEach(p => scoreResults.push(p));
+              retriedSuccessfully = true;
+            }
+          } catch (retryErr) {
+            console.warn('HF retry failed for chunk, falling back to heuristic scoring:', retryErr?.message || retryErr);
+          }
+
+          if (!retriedSuccessfully) {
+            // heuristic fallback for each candidate in this chunk
+            for (const c of chunk) {
+              const h = heuristicScorePOI(c, spec);
+              scoreResults.push({ id: c.id, score: h.score, reason: h.reason });
+            }
+          }
         }
       }
     } else {
-      smallPois.forEach(c => scoreResults.push({ id: c.id, score: Math.max(1, Math.min(5, 1 + ((c.relevancia||0)/10)*4)), reason:'heuristic' } ));
+      smallPois.forEach(c => {
+        const h = heuristicScorePOI(c, spec);
+        scoreResults.push({ id: c.id, score: h.score, reason: h.reason });
+      });
     }
 
     // merge scores into topCandidates and compute combined_score
-    const scoreMap = new Map(scoreResults.map(s => [s.id, s]));
+    const scoreMap = new Map(scoreResults.map(s => [String(s.id), s]));
     topCandidates.forEach(p => {
-      const s = scoreMap.get(p.id);
+      const s = scoreMap.get(String(p.id));
       p.llm_score = s ? Number(s.score) : 1.0;
       p.llm_reason = s ? String(s.reason).slice(0,200) : null;
-      p.combined_score = ((p.relevancia || 0) * 0.5) + ((p.llm_score || 1) * 2.0) + ((p.avg_duration_min || spec.visit_default_minutes || 90) / 120);
+      // combined_score uses relevancia (DB), llm_score (1..5), and duration as mild factor
+      p.combined_score = ((p.relevancia || 0) * 0.55) + ((p.llm_score || 1) * 2.0) + ((p.avg_duration_min || spec.visit_default_minutes || 90) / 120);
     });
     topCandidates.sort((a,b)=> (b.combined_score || 0) - (a.combined_score || 0));
 
@@ -713,7 +797,7 @@ Return only JSON.
     for (const mv of (spec.must_visit || [])) {
       const mvStr = String(mv || '').trim();
       if (!mvStr) continue;
-      // match candidate title (case-insensitive) or city match or exact id
+      // match candidate title (case-insensitive) or id
       const candById = topCandidates.find(x => String(x.id) === mvStr);
       if (candById) { mustVisitResolvedIds.push(candById.id); continue; }
       const candByTitle = topCandidates.find(x => x.titulo && String(x.titulo).toLowerCase() === mvStr.toLowerCase());
@@ -728,10 +812,13 @@ Return only JSON.
     spec.must_visit_names = Array.from(new Set(mustVisitNamesFallback));
 
     // 6) compute travel matrix for topCandidates (seconds) via routing service
+    // robust coords mapping
     const coords = topCandidates.map(c => {
-      const lat = (c.lat ?? c.latitude ?? c.latitud) !== undefined ? Number(c.lat ?? c.latitude ?? c.latitud) : null;
-      const lng = (c.lng ?? c.longitude ?? c.longitud) !== undefined ? Number(c.lng ?? c.longitude ?? c.longitud) : null;
-      return { id: c.id, db_id: c.db_id ?? null, lat: Number.isFinite(lat) ? lat : null, lng: Number.isFinite(lng) ? lng : null };
+      const latRaw = c.lat ?? c.latitude ?? c.latitud ?? null;
+      const lngRaw = c.lng ?? c.longitude ?? c.longitud ?? null;
+      const latNum = (latRaw !== null && latRaw !== undefined && !Number.isNaN(Number(latRaw))) ? Number(latRaw) : null;
+      const lngNum = (lngRaw !== null && lngRaw !== undefined && !Number.isNaN(Number(lngRaw))) ? Number(lngRaw) : null;
+      return { id: c.id, db_id: c.db_id ?? null, lat: latNum, lng: lngNum };
     });
 
     let travelMatrixSeconds = null;
@@ -742,13 +829,30 @@ Return only JSON.
       travelMatrixSeconds = null;
     }
 
-    // Validate travelMatrixSeconds shape; fallback to approximate matrix if invalid
+    // Validate travelMatrixSeconds shape; fallback to robust distance->seconds matrix if invalid
     const n = topCandidates.length;
     if (!Array.isArray(travelMatrixSeconds) || travelMatrixSeconds.length !== n ||
         travelMatrixSeconds.some(row => !Array.isArray(row) || row.length !== n)) {
       console.warn('Invalid travelMatrixSeconds, falling back to default distance-based matrix');
-      travelMatrixSeconds = Array.from({length: n}, (_,i) => Array.from({length: n}, (_,j) => (i===j?0: (topCandidates[i] && topCandidates[j] && topCandidates[i].lat != null && topCandidates[j].lat != null ?
-        Math.round(haversineMeters(topCandidates[i].lat, topCandidates[i].lng, topCandidates[j].lat, topCandidates[j].lng) / 10) : 600))));
+      const walkingMetersPerSec = 1.4; // ~5 km/h => 1.388... m/s; use 1.4 for safety
+      travelMatrixSeconds = Array.from({ length: n }, (_, i) =>
+        Array.from({ length: n }, (_, j) => {
+          if (i === j) return 0;
+          const a = topCandidates[i], b = topCandidates[j];
+          const latA = (a.lat ?? a.latitude ?? a.latitud);
+          const lonA = (a.lng ?? a.longitude ?? a.longitud);
+          const latB = (b.lat ?? b.latitude ?? b.latitud);
+          const lonB = (b.lng ?? b.longitude ?? b.longitud);
+          if (latA == null || lonA == null || latB == null || lonB == null) {
+            // no coords -> default 10 minutes (600s)
+            return 600;
+          }
+          const dist = haversineMeters(Number(latA), Number(lonA), Number(latB), Number(lonB)); // meters
+          // convert meters -> seconds using walkingMetersPerSec (min 20s)
+          const secs = Math.max(20, Math.round(dist / walkingMetersPerSec));
+          return secs;
+        })
+      );
     }
 
     // 7) call optimizer (try/catch)
@@ -847,7 +951,7 @@ Return only JSON.
 
           // 2) match topCandidates by id or exact title (case-insensitive)
           if (!fk_location) {
-              const candidate = topCandidates.find(x => {
+            const candidate = topCandidates.find(x => {
               const xid = String(x.id ?? '');
               const vIdStr = String(v.id ?? '');
               return (
@@ -912,7 +1016,7 @@ Return only JSON.
               }
             }
             const travelMin = v.travel_to_prev_minutes || v.travel_to_prev || 10;
-            const visitMin = v.visit_minutes || v.visit_minutes || v.visit_minutes === 0 ? v.visit_minutes : (v.avg_duration_min || spec.visit_default_minutes || 90);
+            const visitMin = (v.visit_minutes !== undefined && v.visit_minutes !== null) ? Number(v.visit_minutes) : (v.avg_duration_min || spec.visit_default_minutes || 90);
             const proposedStart = cursorMin + (Number(travelMin) || 10);
             const proposedEnd = proposedStart + (Number(visitMin) || 90);
 
