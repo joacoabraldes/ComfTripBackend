@@ -9,27 +9,20 @@ const router = express.Router();
  * Helper: normalize DB row to API shape
  * We map latitud -> latitude and longitud -> longitude
  */
-function normalizeRow(row) {
+function normalizeRow(r) {
   return {
-    id: row.id,
-    titulo: row.titulo,
-    fk_interest: row.fk_interest,
-    descripcion: row.descripcion,
-    // alias DB latin names to english keys used on client
-    latitude:
-      row.latitude !== undefined
-        ? Number(row.latitude)
-        : row.latitud !== undefined
-        ? Number(row.latitud)
-        : null,
-    longitude:
-      row.longitude !== undefined
-        ? Number(row.longitude)
-        : row.longitud !== undefined
-        ? Number(row.longitud)
-        : null,
-    imagenes: row.imagenes,
-    relevancia: row.relevancia !== undefined && row.relevancia !== null ? Number(row.relevancia) : 0
+    id: r.id,
+    title: r.titulo || null,
+    interest: r.fk_interest || null,
+    description: r.descripcion || null,
+    latitude: r.latitud !== null && r.latitud !== undefined ? Number(r.latitud) : null,
+    longitude: r.longitud !== null && r.longitud !== undefined ? Number(r.longitud) : null,
+    images: r.imagenes || null,
+    relevance: r.relevancia !== null && r.relevancia !== undefined ? Number(r.relevancia) : null,
+    country: r.country || null,
+    city: r.city || null,
+    opening_hours: r.opening_hours || null,
+    website: r.website || null
   };
 }
 
@@ -39,37 +32,77 @@ function normalizeRow(row) {
  *  - interest (slug or id)
  *  - limit, offset (pagination)
  */
+// GET /locations
+// Query params:
+//   - interest (slug or id)           // existing behaviour
+//   - country (string, optional)     // new: case-insensitive partial match
+//   - limit, offset (pagination)
 router.get('/', async (req, res) => {
   try {
-    const { interest, limit = 50, offset = 0 } = req.query;
+    let { interest, country, limit = 50, offset = 0 } = req.query;
+
+    // safe ints + max limit guard
+    limit = Number.parseInt(limit, 10) || 50;
+    offset = Number.parseInt(offset, 10) || 0;
+    const MAX_LIMIT = 1000;
+    if (limit < 1) limit = 1;
+    if (limit > MAX_LIMIT) limit = MAX_LIMIT;
+    if (offset < 0) offset = 0;
+
+    // build WHERE clauses dynamically and parameterize
+    const where = [];
+    const params = [];
 
     if (interest) {
-      const sql = `
-        SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia
-        FROM locations
-        WHERE fk_interest = $1
-        ORDER BY relevancia DESC NULLS LAST, id
-        LIMIT $2 OFFSET $3
-      `;
-      const result = await pool.query(sql, [interest, limit, offset]);
-      const rows = result.rows.map(normalizeRow);
-      return res.json(rows);
-    } else {
-      const sql = `
-        SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia
-        FROM locations
-        ORDER BY relevancia DESC NULLS LAST, id
-        LIMIT $1 OFFSET $2
-      `;
-      const result = await pool.query(sql, [limit, offset]);
-      const rows = result.rows.map(normalizeRow);
-      return res.json(rows);
+      // keep previous behaviour: compare fk_interest to provided interest
+      params.push(interest);
+      where.push(`fk_interest = $${params.length}`);
     }
+
+    if (country) {
+      // case-insensitive partial match; use ILIKE with %..%
+      params.push(`%${country}%`);
+      where.push(`country ILIKE $${params.length}`);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+    // include country (and city, opening_hours, website) in select
+    const sql = `
+      SELECT
+        id,
+        titulo,
+        fk_interest,
+        descripcion,
+        latitud,
+        longitud,
+        imagenes,
+        relevancia,
+        country,
+        city,
+        opening_hours,
+        website
+      FROM locations
+      ${whereSql}
+      ORDER BY relevancia DESC NULLS LAST, id
+      LIMIT $${params.length + 1}
+      OFFSET $${params.length + 2}
+    `;
+
+    params.push(limit, offset);
+
+    const result = await pool.query(sql, params);
+    const rows = (result.rows || []).map(normalizeRow);
+
+    return res.json(rows);
   } catch (err) {
     console.error('GET /locations error:', err?.message || err);
     return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
   }
 });
+
+
+
 
 /**
  * GET /locations/:id
