@@ -51,7 +51,7 @@ const PLACES_AGG_SUBQUERY = `
 `;
 
 // ----------------------
-// Itinerary generator helpers (the code you requested)
+// Itinerary generator helpers
 // ----------------------
 
 // Simple helper to add days to an ISO date string and return YYYY-MM-DD
@@ -81,13 +81,8 @@ function normalizePace(p) {
 // Parse trip.destination into city/country pieces
 function parseDestinationParts(dest) {
   if (!dest) return { city: null, country: null };
-  // common forms: "Barcelona, Spain", "Spain", "Barcelona"
   const parts = String(dest).split(',').map(p => p.trim()).filter(Boolean);
-  if (parts.length === 1) {
-    const maybe = parts[0];
-    return { city: maybe, country: null };
-  }
-  // last part usually country
+  if (parts.length === 1) return { city: parts[0], country: null };
   const country = parts[parts.length - 1];
   const city = parts.slice(0, parts.length - 1).join(', ');
   return { city: city || null, country: country || null };
@@ -113,11 +108,9 @@ function kmeans(points, k, maxIter = 10) {
   if (k <= 0) return [];
   if (points.length === 0) return Array.from({length:k}, () => []);
 
-  // initialize centers with kmeans++ style
   const centers = [];
   centers.push({ lat: points[0].lat, lng: points[0].lng });
   while (centers.length < k) {
-    // pick farthest from existing centers
     let bestIdx = 0; let bestDist = -1;
     for (let i = 0; i < points.length; i++) {
       const p = points[i];
@@ -134,7 +127,6 @@ function kmeans(points, k, maxIter = 10) {
   let clusters = [];
   for (let iter = 0; iter < maxIter; iter++) {
     clusters = Array.from({length:k}, () => []);
-    // assign
     for (let i = 0; i < points.length; i++) {
       const p = points[i];
       let best = 0; let bestD = Infinity;
@@ -144,7 +136,6 @@ function kmeans(points, k, maxIter = 10) {
       }
       clusters[best].push(i);
     }
-    // recompute
     let moved = false;
     for (let j = 0; j < k; j++) {
       if (clusters[j].length === 0) continue;
@@ -162,7 +153,6 @@ function kmeans(points, k, maxIter = 10) {
 // Estimate travel minutes between two points assuming average transport speed
 function estimateTravelMinutes(a, b, mode = 'fast') {
   const km = haversineKm(a, b);
-  // mode 'walk' ~5 km/h, 'fast' ~30 km/h, 'bike' ~12 km/h
   const speedKmh = mode === 'walk' ? 5 : (mode === 'bike' ? 12 : 30);
   return (km / speedKmh) * 60; // minutes
 }
@@ -187,16 +177,8 @@ function isGastronomia(place) {
 
 /**
  * POST /trips/:id/itinerary
- * Generates an itinerary heuristically using:
- *  - pace: 'relajado'|'medio'|'intenso' (also accepts UI forms)
- *  - places: array of mandatory place names (strings)
- *  - save: boolean (whether to persist generated places into trip_places)
- *
- * Improvements:
- *  - Strongly prefer locations matching trip.destination (city/country)
- *  - Ensure mandatory places are included (prefer local matches)
- *  - Cluster activities so each day covers a zone
- *  - Place gastronomic items at meal times
+ * Strict country behavior: if trip.destination includes a country, only return candidates from that country.
+ * If none, return 400 (no itinerary).
  */
 async function handleItinerary(req, res) {
   const client = await pool.connect();
@@ -244,57 +226,65 @@ async function handleItinerary(req, res) {
     const destCountryLower = destCountry ? destCountry.toLowerCase() : null;
     const destCityLower = destCity ? destCity.toLowerCase() : null;
 
-    // Resolve mandatory places by title (best-effort ILIKE)
-    const mandatoryLocations = [];
-    for (const name of mandatoryPlaceNames) {
-      const r = await client.query('SELECT id, titulo, latitud, longitud, relevancia, category, country, city FROM locations WHERE titulo ILIKE $1 LIMIT 1', [`%${name}%`]);
-      if (r.rows.length) mandatoryLocations.push(r.rows[0]);
+    // Validate mandatory places: only accept as satisfied if they exist inside destination country (if country provided)
+    if (destCountry && mandatoryPlaceNames.length) {
+      const missing = [];
+      for (const name of mandatoryPlaceNames) {
+        const r = await client.query('SELECT id FROM locations WHERE titulo ILIKE $1 AND country ILIKE $2 LIMIT 1', [`%${name}%`, `%${destCountry}%`]);
+        if (!r.rows.length) missing.push(name);
+      }
+      if (missing.length) {
+        return res.status(400).json({ message: 'Algunas ubicaciones obligatorias no se encuentran en el país destino', missing });
+      }
     }
 
-    // Build candidates query: prefer interest matches or same city/country as trip.destination
+    // Build candidate query: **STRICT** behavior when destCountry present: only fetch locations in that country
     let candidateSQL = `SELECT id, titulo, latitud, longitud, relevancia, fk_interest, country, city, category FROM locations`;
-    const whereClauses = [];
     const queryValues = [];
     let idx = 1;
 
-    // interest filter (if user has interests)
-    if (interestIds.length) {
-      const placeholders = interestIds.map((_,i)=>`$${idx+i}`).join(',');
-      whereClauses.push(`fk_interest::text IN (${placeholders})`);
-      for (let i=0;i<interestIds.length;i++) queryValues.push(String(interestIds[i]));
-      idx += interestIds.length;
-    }
-
-    // strong destination filters: prefer country and city
     if (destCountry) {
-      whereClauses.push(`country ILIKE $${idx}`);
+      // strict: only locations whose country matches destCountry
+      candidateSQL += ` WHERE country ILIKE $${idx}`;
       queryValues.push(`%${destCountry}%`);
       idx++;
-    }
-    if (destCity) {
-      whereClauses.push(`city ILIKE $${idx}`);
-      queryValues.push(`%${destCity}%`);
-      idx++;
-      // also match title containing city (some rows store city in title)
-      whereClauses.push(`titulo ILIKE $${idx}`);
-      queryValues.push(`%${destCity}%`);
-      idx++;
-    }
+      candidateSQL += ` ORDER BY relevancia DESC NULLS LAST, titulo ASC LIMIT $${idx}`;
+      queryValues.push(Math.max(totalNeeded * 4, 200));
+    } else {
+      // flexible behavior when no country specified: prefer interests/city/title
+      const whereClauses = [];
 
-    // if we have WHERE clauses, use them; otherwise fall back to relevancia top results
-    if (whereClauses.length) candidateSQL += ` WHERE (${whereClauses.join(' OR ')})`;
-    candidateSQL += ` ORDER BY relevancia DESC NULLS LAST, titulo ASC LIMIT $${idx}`;
-    queryValues.push(Math.max(totalNeeded * 4, 200)); // larger pool
+      if (interestIds.length) {
+        const placeholders = interestIds.map((_,i)=>`$${idx+i}`).join(',');
+        whereClauses.push(`fk_interest::text IN (${placeholders})`);
+        for (let i=0;i<interestIds.length;i++) queryValues.push(String(interestIds[i]));
+        idx += interestIds.length;
+      }
+      if (destCity) {
+        whereClauses.push(`city ILIKE $${idx}`);
+        queryValues.push(`%${destCity}%`);
+        idx++;
+        whereClauses.push(`titulo ILIKE $${idx}`);
+        queryValues.push(`%${destCity}%`);
+        idx++;
+      }
+      if (whereClauses.length) candidateSQL += ` WHERE (${whereClauses.join(' OR ')})`;
+      candidateSQL += ` ORDER BY relevancia DESC NULLS LAST, titulo ASC LIMIT $${idx}`;
+      queryValues.push(Math.max(totalNeeded * 4, 200));
+    }
 
     const candRes = await client.query(candidateSQL, queryValues);
     let candidates = candRes.rows || [];
 
-    // If candidates are empty or too few, broaden search to top relevancia worldwide (fallback)
-    if (!candidates.length || candidates.length < Math.max(10, totalNeeded)) {
+    // If destCountry was specified and we found zero candidates, fail loudly (strict requirement).
+    if (destCountry && (!candidates || candidates.length === 0)) {
+      return res.status(400).json({ message: `No se encontraron ubicaciones en el país destino: ${destCountry}. Generador interrumpido.` });
+    }
+
+    // If no country specified and too few candidates, we may broaden (existing behavior)
+    if (!destCountry && (!candidates.length || candidates.length < Math.max(10, totalNeeded))) {
       const broadRes = await client.query(`SELECT id, titulo, latitud, longitud, relevancia, fk_interest, country, city, category FROM locations ORDER BY relevancia DESC NULLS LAST LIMIT $1`, [Math.max(totalNeeded * 6, 300)]);
       const broad = broadRes.rows || [];
-      // Put local candidates first (if any), then broad
-      // Combine unique by id
       const combined = [];
       const seenIds = new Set();
       for (const c of candidates) { seenIds.add(String(c.id)); combined.push(c); }
@@ -304,39 +294,25 @@ async function handleItinerary(req, res) {
       candidates = combined;
     }
 
-    // Post-filter/preference: if we have a destination country, prioritize those candidates
-    let preferredByCountry = [];
+    // If destCountry is provided, do not reorder to include non-country items — keep only country items
     if (destCountry) {
-      preferredByCountry = candidates.filter(c => c.country && c.country.toString().toLowerCase().includes(destCountryLower));
-    }
-    // if there are many preferred by country, keep only those (strong preference)
-    if (preferredByCountry.length >= Math.min(candidates.length, Math.max(totalNeeded * 1.2, 10))) {
-      candidates = preferredByCountry;
-    } else if (preferredByCountry.length > 0) {
-      // otherwise, sort candidates with country matches first
-      candidates.sort((a,b) => {
-        const aMatch = a.country && destCountry && a.country.toString().toLowerCase().includes(destCountryLower) ? 1 : 0;
-        const bMatch = b.country && destCountry && b.country.toString().toLowerCase().includes(destCountryLower) ? 1 : 0;
-        if (aMatch !== bMatch) return bMatch - aMatch;
-        return (b.relevancia || 0) - (a.relevancia || 0);
-      });
+      candidates = candidates.filter(c => c.country && c.country.toString().toLowerCase().includes(destCountryLower));
+      // if mandatory were provided earlier we already validated they exist in country
+      // proceed with these strict-country candidates
     }
 
-    // ensure mandatory locations included (fetch any missing by title explicitly)
-    const mandatoryById = new Map();
-    for (const m of mandatoryLocations) mandatoryById.set(String(m.id), m);
+    // Ensure mandatory (if any) are included in the candidate pool (they were validated earlier when country provided)
     for (const name of mandatoryPlaceNames) {
-      const exists = candidates.find(c => c.titulo && c.titulo.toString().toLowerCase().includes(name.toString().toLowerCase()));
+      const exists = candidates.find(c => c.titulo && c.titulo.toString().toLowerCase().includes(name.toLowerCase()));
       if (!exists) {
-        const r = await client.query('SELECT id, titulo, latitud, longitud, relevancia, fk_interest, country, city, category FROM locations WHERE titulo ILIKE $1 LIMIT 1', [`%${name}%`]);
-        if (r.rows.length) {
-          const row = r.rows[0];
-          // put mandatory at front
-          candidates.unshift(row);
-          mandatoryById.set(String(row.id), row);
+        // If there is still a chance (no country specified), try to fetch specific mandatory and add it
+        if (!destCountry) {
+          const r = await client.query('SELECT id, titulo, latitud, longitud, relevancia, fk_interest, country, city, category FROM locations WHERE titulo ILIKE $1 LIMIT 1', [`%${name}%`]);
+          if (r.rows.length) candidates.unshift(r.rows[0]);
+        } else {
+          // country specified & mandatory not in candidate pool -> error (we validated earlier but keep safe)
+          return res.status(400).json({ message: `Ubicación obligatoria "${name}" no encontrada en ${destCountry}` });
         }
-      } else {
-        mandatoryById.set(String(exists.id), exists);
       }
     }
 
@@ -352,22 +328,6 @@ async function handleItinerary(req, res) {
     }
     candidates = dedup;
 
-    // If after all this there are zero candidates in the destination country but user specified destination country,
-    // allow the mandatory items (they requested) plus try fallback to broad pool but warn (we will still proceed).
-    if (destCountry && candidates.every(c => !(c.country && c.country.toString().toLowerCase().includes(destCountryLower)))) {
-      // attempt to fetch by country exact match (maybe database stores different casing)
-      const tryCountryRes = await client.query('SELECT id, titulo, latitud, longitud, relevancia, fk_interest, country, city, category FROM locations WHERE country ILIKE $1 ORDER BY relevancia DESC NULLS LAST LIMIT $2', [`%${destCountry}%`, 300]);
-      if (tryCountryRes.rows && tryCountryRes.rows.length) {
-        // prioritize these
-        const trows = tryCountryRes.rows;
-        const merged = [];
-        const seen2 = new Set();
-        for (const r of trows) { merged.push(r); seen2.add(String(r.id)); }
-        for (const c of candidates) if (!seen2.has(String(c.id))) merged.push(c);
-        candidates = merged.slice(0, Math.max(totalNeeded * 4, 200));
-      }
-    }
-
     // build points array for clustering (only those with coords)
     const points = [];
     const candWithCoords = [];
@@ -378,13 +338,11 @@ async function handleItinerary(req, res) {
       }
     }
 
-    // perform clustering into `days` clusters -- but cap k at number of distinct coordinate clusters
+    // perform clustering into `days` clusters
     const k = Math.min(days, Math.max(1, points.length));
     const clustersIndices = k >= 1 && points.length ? kmeans(points, k, 12) : Array.from({length:Math.max(1,k)}, () => []);
 
-    // map cluster index -> candidate list
     const clusterCandidates = Array.from({length:Math.max(1,k)}, () => []);
-    // pointIdxToCand mapping for cluster indices (points array indices)
     const pointIdxToCand = {};
     for (let i = 0; i < candWithCoords.length; i++) pointIdxToCand[i] = candWithCoords[i];
 
@@ -400,23 +358,19 @@ async function handleItinerary(req, res) {
     const noCoordCands = candidates.filter(c => c.latitud == null || c.longitud == null);
     if (noCoordCands.length) clusterCandidates[0].push(...noCoordCands);
 
-    // Prepare day buckets
-    const daysArr = [];
-    for (let d = 0; d < days; d++) daysArr.push({ date: addDaysToIso(startDate, d), places: [] });
-
-    // order clusters by size descending (larger cluster -> earlier day)
-    const clusterOrder = clusterCandidates.map((c, i) => ({ i, len: c.length })).sort((a,b) => b.len - a.len).map(x => x.i);
-
-    // Build per-day candidate pools
+    // Prepare per-day pools
     const perDayCandidates = Array.from({length:days}, () => []);
 
-    // Assign mandatory locations to nearest cluster/day
+    const clusterOrder = clusterCandidates.map((c, i) => ({ i, len: c.length })).sort((a,b) => b.len - a.len).map(x => x.i);
+
+    // Assign mandatory locations to nearest cluster/day (if any)
+    const mandatoryById = new Map();
+    for (const name of mandatoryPlaceNames) {
+      const found = candidates.find(c => c.titulo && c.titulo.toString().toLowerCase().includes(name.toLowerCase()));
+      if (found) mandatoryById.set(String(found.id), found);
+    }
     for (const [mid, mloc] of mandatoryById.entries()) {
-      if (!mloc || mloc.latitud == null || mloc.longitud == null) {
-        // if no coords, push to first day pool
-        perDayCandidates[0].push(mloc);
-        continue;
-      }
+      if (!mloc || mloc.latitud == null || mloc.longitud == null) { perDayCandidates[0].push(mloc); continue; }
       let bestCluster = 0; let bestD = Infinity;
       for (let ci = 0; ci < clusterCandidates.length; ci++) {
         const cluster = clusterCandidates[ci];
@@ -434,7 +388,6 @@ async function handleItinerary(req, res) {
       const clusterIdx = clusterOrder[di] ?? clusterOrder[0] ?? 0;
       const pool = (clusterCandidates[clusterIdx] || []).slice();
 
-      // sort pool: country match first, then relevancia desc
       pool.sort((a,b) => {
         const aCm = a.country && destCountry && a.country.toString().toLowerCase().includes(destCountryLower) ? 1 : 0;
         const bCm = b.country && destCountry && b.country.toString().toLowerCase().includes(destCountryLower) ? 1 : 0;
@@ -445,31 +398,25 @@ async function handleItinerary(req, res) {
       for (const c of pool) {
         if (perDayCandidates[di].find(x => x && String(x.id) === String(c.id))) continue;
         perDayCandidates[di].push(c);
-        // keep some headroom (we'll pick perDay later)
         if (perDayCandidates[di].length >= perDay * 3) break;
       }
     }
 
-    // Now pick final per-day places respecting limits, prioritizing mandatory and gastronomia for meal slots
+    // Build final itinerary days, schedule times, insert gastronomia at meal times
     const itineraryDays = [];
     for (let di = 0; di < days; di++) {
       const date = addDaysToIso(startDate, di);
       const pool = perDayCandidates[di] || [];
 
-      // ensure mandatory first
       const mandatoryHere = pool.filter(p => p && mandatoryById.has(String(p.id)));
       const nonMandatory = pool.filter(p => !mandatoryById.has(String(p.id)));
 
-      // meal slot times (minutes)
       const mealSlots = { lunch: 13*60, merienda: 17*60, dinner: 20*60 };
-      const assigned = [];
       const usedIds = new Set();
 
-      // gastronomic candidates (prefer those within destination country)
       const gastrCandidates = pool.filter(p => isGastronomia(p) && !(usedIds.has(String(p.id))));
 
       const pickGastrFor = () => {
-        // prefer local gastronomy first
         const local = gastrCandidates.find(g => g.country && destCountry && g.country.toString().toLowerCase().includes(destCountryLower) && !usedIds.has(String(g.id)));
         if (local) { usedIds.add(String(local.id)); return local; }
         const any = gastrCandidates.find(g => !usedIds.has(String(g.id)));
@@ -483,7 +430,6 @@ async function handleItinerary(req, res) {
 
       const dayPlaces = [];
 
-      // add mandatory first (highest relevancia first)
       mandatoryHere.sort((a,b) => (b.relevancia || 0) - (a.relevancia || 0));
       for (const m of mandatoryHere) {
         if (!m) continue;
@@ -492,7 +438,6 @@ async function handleItinerary(req, res) {
         if (dayPlaces.length >= perDay) break;
       }
 
-      // fill remaining with top non-mandatory
       for (const nm of nonMandatory) {
         if (dayPlaces.length >= perDay) break;
         if (!nm) continue;
@@ -501,14 +446,12 @@ async function handleItinerary(req, res) {
         usedIds.add(String(nm.id));
       }
 
-      // ensure meal places present: insert near middle or replace last if needed
       const ensureMealPlace = (mealPlace) => {
         if (!mealPlace) return null;
         if (dayPlaces.find(p => String(p.id) === String(mealPlace.id))) return null;
         if (dayPlaces.length < perDay) {
           dayPlaces.splice(Math.floor(dayPlaces.length/2), 0, mealPlace);
         } else {
-          // prefer to replace a non-mandatory low relevance item
           let replaced = false;
           for (let i = dayPlaces.length - 1; i >= 0; i--) {
             const cand = dayPlaces[i];
@@ -518,10 +461,7 @@ async function handleItinerary(req, res) {
               break;
             }
           }
-          if (!replaced) {
-            // last resort replace last
-            dayPlaces[dayPlaces.length - 1] = mealPlace;
-          }
+          if (!replaced) dayPlaces[dayPlaces.length - 1] = mealPlace;
         }
         usedIds.add(String(mealPlace.id));
         return mealPlace;
@@ -531,24 +471,20 @@ async function handleItinerary(req, res) {
       ensureMealPlace(meriendaPlace);
       ensureMealPlace(dinnerPlace);
 
-      // final trim to perDay
       const finalPlaces = dayPlaces.slice(0, perDay);
 
-      // schedule times: start 09:00, attraction~90min, gastronomy~60min, travel buffer
       let currentMin = 9 * 60;
       const scheduled = [];
       for (let i = 0; i < finalPlaces.length; i++) {
         const p = finalPlaces[i];
         if (!p) continue;
         const isG = isGastronomia(p);
-        // travel from previous
         if (scheduled.length > 0) {
           const last = scheduled[scheduled.length-1];
           const travelMin = estimateTravelMinutes({lat: Number(last.lat), lng: Number(last.lng)}, {lat: Number(p.latitud || p.lat), lng: Number(p.longitud || p.lng)});
-          currentMin += Math.round(travelMin) + 10; // buffer
+          currentMin += Math.round(travelMin) + 10;
         }
 
-        // align meal slots if this is one of them
         let preferredMin = null;
         if (lunchPlace && String(lunchPlace.id) === String(p.id)) preferredMin = mealSlots.lunch;
         if (meriendaPlace && String(meriendaPlace.id) === String(p.id)) preferredMin = mealSlots.merienda;
@@ -562,9 +498,9 @@ async function handleItinerary(req, res) {
         const startStr = minutesToTimeStr(currentMin);
         const endStr = minutesToTimeStr(currentMin + duration);
 
-        scheduled.push({ id: p.id, titulo: p.titulo, lat: Number(p.latitud || p.lat), lng: Number(p.longitud || p.lng), category: p.category, relevance: p.relevancia, start_hour: startStr, end_hour: endStr });
+        scheduled.push({ id: p.id, titulo: p.titulo, lat: Number(p.latitud || p.lat || 0), lng: Number(p.longitud || p.lng || 0), category: p.category, relevance: p.relevancia, start_hour: startStr, end_hour: endStr });
 
-        currentMin += duration + 15; // gap
+        currentMin += duration + 15;
       }
 
       itineraryDays.push({ date, places: scheduled });
@@ -577,17 +513,16 @@ async function handleItinerary(req, res) {
     const genRes = await client.query(
       `INSERT INTO itinerary_generations (trip_id, user_id, model, status, progress, generated_json, created_at, finished_at)
        VALUES ($1,$2,$3,$4,$5,$6, now(), now()) RETURNING id`,
-      [tripId, userId, 'heuristic-v2-clustered-v2', 'finished', 100, JSON.stringify(itinerary)]
+      [tripId, userId, 'heuristic-strict-country-v1', 'finished', 100, JSON.stringify(itinerary)]
     );
     const genId = genRes.rows[0].id;
 
     const savedPlaces = [];
     if (save) {
-      // remove existing places within trip range to avoid duplicates
       await client.query('DELETE FROM trip_places WHERE fk_trips = $1 AND date >= $2 AND date <= $3', [tripId, startDate, endDate]);
 
       const insertSQL = 'INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *';
-      for (const day of itineraryDays) {
+      for (const day of itinerary.days) {
         for (const p of day.places) {
           const start = p.start_hour || null;
           const end = p.end_hour || null;
@@ -632,7 +567,7 @@ async function getLastItinerary(req, res) {
   }
 }
 
-// Wire itinerary routes (replaces the previous incorrect mapping)
+// Wire itinerary routes
 router.post('/:id/itinerary', auth, handleItinerary);
 router.get('/:id/itinerary', auth, getLastItinerary);
 
@@ -642,9 +577,6 @@ router.get('/:id/itinerary', auth, getLastItinerary);
 // ----------------------
 
 // NEW: POST /trips/:id/share
-// Body: { mode: 'viewer'|'editor', public: boolean, shared_with_user_id (optional), expires_in_days (optional int) }
-// Requires owner of trip.
-// Returns { url, share } where url points to /api/share/trip/:uuid
 router.post('/:id/share', auth, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -654,12 +586,10 @@ router.post('/:id/share', auth, async (req, res) => {
 
     const { mode = 'viewer', public: isPublic = false, shared_with_user_id, expires_in_days } = req.body || {};
 
-    // verify ownership
     const ownerRes = await pool.query('SELECT user_id FROM trips WHERE id = $1', [tripId]);
     if (!ownerRes.rows.length) return res.status(404).json({ message: 'Trip no encontrado' });
     if (ownerRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
 
-    // validate mode
     if (!['viewer','editor'].includes(mode)) return res.status(400).json({ message: 'Invalid mode' });
 
     let sharedWith = null;
@@ -672,14 +602,12 @@ router.post('/:id/share', auth, async (req, res) => {
       }
     }
 
-    // compute expires_at timestamp if requested
     let expiresAt = null;
     if (expires_in_days && Number.isFinite(Number(expires_in_days)) && Number(expires_in_days) > 0) {
       const days = Number(expires_in_days);
       expiresAt = new Date(Date.now() + days * 24 * 3600 * 1000);
     }
 
-    // insert share
     await client.query('BEGIN');
     const insertSQL = `INSERT INTO trip_shares (trip_id, shared_by, shared_with, mode, public, expires_at)
                        VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, trip_id, shared_by, shared_with, mode, public, share_uuid, expires_at, created_at`;
@@ -701,13 +629,7 @@ router.post('/:id/share', auth, async (req, res) => {
   }
 });
 
-/* 
-  Modified GET / (list trips)
-  Now returns:
-   - trips owned by the user
-   - trips shared with the user (shared_with = user) OR public shares (public = true)
-  For shared trips we include a 'share_*' metadata fields so the frontend can show them specially.
-*/
+/* GET / (list trips) */
 router.get('/', auth, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -827,7 +749,7 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
-/* GET /trips/:id - allow owner OR users with an active share (shared_with = me OR public & not expired) to read */
+/* GET /trips/:id */
 router.get('/:id', auth, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -867,7 +789,6 @@ router.get('/:id', auth, async (req, res) => {
 
     const row = result.rows[0];
 
-    // if not owner and no share -> forbidden
     if (row.user_id !== userId && !row.share_id) return res.status(403).json({ message: 'No autorizado' });
 
     const trip = {
@@ -903,10 +824,7 @@ router.get('/:id', auth, async (req, res) => {
   }
 });
 
- /**
- * PUT /trips/:id
- * Update trip fields. Optionally include `places` array to replace existing places (atomic).
- */
+/* PUT /trips/:id */
 router.put('/:id', auth, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -914,23 +832,19 @@ router.put('/:id', auth, async (req, res) => {
     const userId = req.user.id;
     const { destination, start_date, end_date, budget, notes, places } = req.body;
 
-    // check ownership
     const ownerRes = await pool.query('SELECT user_id FROM trips WHERE id = $1', [id]);
     if (!ownerRes.rows.length) return res.status(404).json({ message: 'No encontrado' });
     if (ownerRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
 
     await client.query('BEGIN');
 
-    // update trip
     await client.query(
       'UPDATE trips SET destination=$1, start_date=$2, end_date=$3, budget=$4, notes=$5 WHERE id=$6 AND user_id=$7',
       [destination || null, start_date || null, end_date || null, budget || null, notes || null, id, userId]
     );
 
-    // optionally replace places
     let newPlaces = [];
     if (Array.isArray(places)) {
-      // delete existing
       await client.query('DELETE FROM trip_places WHERE fk_trips = $1', [id]);
 
       const insertPlaceSQL =
@@ -966,24 +880,19 @@ router.put('/:id', auth, async (req, res) => {
   }
 });
 
-/**
- * DELETE /trips/:id
- * Delete trip and its places (ownership enforced). Uses transaction.
- */
+/* DELETE /trips/:id */
 router.delete('/:id', auth, async (req, res) => {
   const client = await pool.connect();
   try {
     const id = Number(req.params.id);
     const userId = req.user.id;
 
-    // verify ownership
     const ownerRes = await client.query('SELECT user_id FROM trips WHERE id = $1', [id]);
     if (!ownerRes.rows.length) return res.status(404).json({ message: 'No encontrado' });
     if (ownerRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
 
     await client.query('BEGIN');
 
-    // delete associated places first (safer), then trip
     await client.query('DELETE FROM trip_places WHERE fk_trips = $1', [id]);
     await client.query('DELETE FROM trips WHERE id = $1 AND user_id = $2', [id, userId]);
 
@@ -999,10 +908,7 @@ router.delete('/:id', auth, async (req, res) => {
   }
 });
 
-/**
- * POST /trips/:id/places
- * Add one or more places to an existing trip.
- */
+/* POST /trips/:id/places */
 router.post('/:id/places', auth, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1014,7 +920,6 @@ router.post('/:id/places', auth, async (req, res) => {
       return res.status(400).json({ message: 'Debe enviar un arreglo "places" con al menos un elemento' });
     }
 
-    // ownership check
     const ownerRes = await client.query('SELECT user_id FROM trips WHERE id = $1', [tripId]);
     if (!ownerRes.rows.length) return res.status(404).json({ message: 'No encontrado' });
     if (ownerRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
@@ -1052,10 +957,7 @@ router.post('/:id/places', auth, async (req, res) => {
   }
 });
 
-/**
- * DELETE /trips/:id/places/:placeId
- * Remove a specific trip_place (ownership enforced for the trip)
- */
+/* DELETE /trips/:id/places/:placeId */
 router.delete('/:id/places/:placeId', auth, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1063,7 +965,6 @@ router.delete('/:id/places/:placeId', auth, async (req, res) => {
     const placeId = Number(req.params.placeId);
     const userId = req.user.id;
 
-    // verify trip ownership
     const ownerRes = await client.query('SELECT user_id FROM trips WHERE id = $1', [tripId]);
     if (!ownerRes.rows.length) return res.status(404).json({ message: 'No encontrado' });
     if (ownerRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
@@ -1080,11 +981,7 @@ router.delete('/:id/places/:placeId', auth, async (req, res) => {
   }
 });
 
-/**
- * POST /trips/:id/places/auto
- * Adds a place to a trip by calculating the best insertion (uses routing service externally).
- * Only reorders / replaces places that share the same date as the new place.
- */
+/* POST /trips/:id/places/auto */
 router.post('/:id/places/auto', auth, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1099,7 +996,6 @@ router.post('/:id/places/auto', auth, async (req, res) => {
       return res.status(400).json({ message: 'place.date es requerido (YYYY-MM-DD or ISO)' });
     }
 
-    // ownership check
     const ownerRes = await client.query('SELECT user_id, destination, start_date, end_date, budget, notes FROM trips WHERE id = $1', [tripId]);
     if (!ownerRes.rows.length) return res.status(404).json({ message: 'Trip no encontrado' });
     if (ownerRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
@@ -1108,9 +1004,8 @@ router.post('/:id/places/auto', auth, async (req, res) => {
 
     await client.query('BEGIN');
 
-    // Fetch existing places for that date (preserve order by id/created_at)
     const existingRes = await client.query(
-      `SELECT tp.id, tp.fk_locations, tp.date, tp.start_hour, tp.end_hour, tp.notes, l.latitude, l.longitude
+      `SELECT tp.id, tp.fk_locations, tp.date, tp.start_hour, tp.end_hour, tp.notes, l.latitud AS latitude, l.longitud AS longitude
        FROM trip_places tp
        JOIN locations l ON l.id = tp.fk_locations
        WHERE tp.fk_trips = $1 AND tp.date::text = $2
@@ -1119,15 +1014,13 @@ router.post('/:id/places/auto', auth, async (req, res) => {
     );
     const existingPlaces = existingRes.rows;
 
-    // Fetch coords for the new location
-    const locRes = await client.query('SELECT id, latitude, longitude FROM locations WHERE id = $1 LIMIT 1', [Number(place.fk_location)]);
+    const locRes = await client.query('SELECT id, latitud AS latitude, longitud AS longitude FROM locations WHERE id = $1 LIMIT 1', [Number(place.fk_location)]);
     if (!locRes.rows.length) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Location (fk_location) no encontrada' });
     }
     const newLoc = locRes.rows[0];
 
-    // Build coords array: existing places (in order) + new location at the end
     const coords = [];
     const indexMap = [];
     for (let i = 0; i < existingPlaces.length; i++) {
@@ -1138,7 +1031,6 @@ router.post('/:id/places/auto', auth, async (req, res) => {
     coords.push({ id: Number(place.fk_location), lat: Number(newLoc.latitude), lng: Number(newLoc.longitude) });
     indexMap.push({ type: 'new', existingIndex: null });
 
-    // Ask routing service for matrix (this expects a `routing` module available in runtime)
     const matrix = await routing.getMatrix(coords.map(c => ({ lat: c.lat, lng: c.lng, id: c.id })));
 
     const totalDuration = (order) => {
