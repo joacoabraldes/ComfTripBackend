@@ -68,14 +68,110 @@ const PACE_MAP = {
   intenso: 6
 };
 
+// Haversine distance (km)
+function haversineKm(a, b) {
+  const toRad = (v) => (v * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad((b.lat - a.lat));
+  const dLon = toRad((b.lng - a.lng));
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const sinDLat = Math.sin(dLat/2);
+  const sinDLon = Math.sin(dLon/2);
+  const x = sinDLat*sinDLat + Math.cos(lat1)*Math.cos(lat2)*sinDLon*sinDLon;
+  const c = 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1-x));
+  return R * c;
+}
+
+// Simple k-means clustering on lat/lng with small iteration count
+function kmeans(points, k, maxIter = 10) {
+  if (k <= 0) return [];
+  if (points.length === 0) return Array.from({length:k}, () => []);
+
+  // initialize centers with kmeans++ style
+  const centers = [];
+  centers.push({ lat: points[0].lat, lng: points[0].lng });
+  while (centers.length < k) {
+    // pick farthest from existing centers
+    let bestIdx = 0; let bestDist = -1;
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      let dmin = Infinity;
+      for (const c of centers) {
+        const d = haversineKm(p, c);
+        if (d < dmin) dmin = d;
+      }
+      if (dmin > bestDist) { bestDist = dmin; bestIdx = i; }
+    }
+    centers.push({ lat: points[bestIdx].lat, lng: points[bestIdx].lng });
+  }
+
+  let clusters = [];
+  for (let iter = 0; iter < maxIter; iter++) {
+    clusters = Array.from({length:k}, () => []);
+    // assign
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      let best = 0; let bestD = Infinity;
+      for (let j = 0; j < centers.length; j++) {
+        const d = haversineKm(p, centers[j]);
+        if (d < bestD) { bestD = d; best = j; }
+      }
+      clusters[best].push(i);
+    }
+    // recompute
+    let moved = false;
+    for (let j = 0; j < k; j++) {
+      if (clusters[j].length === 0) continue;
+      let sumLat = 0, sumLng = 0;
+      for (const idx of clusters[j]) { sumLat += points[idx].lat; sumLng += points[idx].lng; }
+      const newC = { lat: sumLat / clusters[j].length, lng: sumLng / clusters[j].length };
+      if (Math.abs(newC.lat - centers[j].lat) > 1e-6 || Math.abs(newC.lng - centers[j].lng) > 1e-6) moved = true;
+      centers[j] = newC;
+    }
+    if (!moved) break;
+  }
+  return clusters;
+}
+
+// Estimate travel minutes between two points assuming average transport speed
+function estimateTravelMinutes(a, b, mode = 'fast') {
+  const km = haversineKm(a, b);
+  // mode 'walk' ~5 km/h, 'fast' ~30 km/h, 'bike' ~12 km/h
+  const speedKmh = mode === 'walk' ? 5 : (mode === 'bike' ? 12 : 30);
+  return (km / speedKmh) * 60; // minutes
+}
+
+// Format time (HH:MM) given start minutes from midnight
+function minutesToTimeStr(mins) {
+  const h = Math.floor(mins / 60);
+  const m = Math.round(mins % 60);
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:00`;
+}
+
+// Determine if a place is gastronomia by category or keywords
+function isGastronomia(place) {
+  const cat = (place.category || '').toString().toLowerCase();
+  if (!cat) return false;
+  if (cat.includes('gastronom') || cat.includes('restaurant') || cat.includes('cafe') || cat.includes('bar') || cat.includes('pub') || cat.includes('fast_food')) return true;
+  // fallback: titulo keywords
+  const t = (place.titulo || '').toString().toLowerCase();
+  if (t.includes('rest') || t.includes('café') || t.includes('cafe') || t.includes('bar') || t.includes('cafeter') || t.includes('parrilla')) return true;
+  return false;
+}
+
 /**
  * POST /trips/:id/itinerary
  * Generates an itinerary heuristically using:
  *  - pace: 'relajado'|'medio'|'intenso'
  *  - places: array of mandatory place names (strings)
  *  - save: boolean (whether to persist generated places into trip_places)
- * The generator prioritizes mandatory places, then candidate locations based on
- * the user's interests and relevancia. It returns a day-by-day distribution.
+ *
+ * This improved generator:
+ *  - ensures mandatory places are included and respected
+ *  - clusters activities geographically so each day covers a zone
+ *  - schedules gastronomic places at meal times (almuerzo/merienda/cena)
+ *  - leaves reasonable travel/visit durations and gaps between activities
  */
 async function handleItinerary(req, res) {
   const client = await pool.connect();
@@ -115,15 +211,24 @@ async function handleItinerary(req, res) {
     );
     const interestIds = uiRes.rows.map(r => r.id);
 
-    // Resolve mandatory places by title (best-effort ILIKE)
+    // Resolve mandatory places by title (best-effort ILIKE) - ensure they are located in the trip destination if possible
     const mandatoryLocations = [];
     for (const name of mandatoryPlaceNames) {
-      const r = await client.query('SELECT id, titulo, latitud, longitud, relevancia FROM locations WHERE titulo ILIKE $1 LIMIT 1', [`%${name}%`]);
-      if (r.rows.length) mandatoryLocations.push(r.rows[0]);
+      const r = await client.query('SELECT id, titulo, latitud, longitud, relevancia, category, country, city FROM locations WHERE titulo ILIKE $1 LIMIT 1', [`%${name}%`]);
+      if (r.rows.length) {
+        const row = r.rows[0];
+        // if trip.destination exists try to filter by same country/city
+        if (trip.destination && row.country && row.country.toString().toLowerCase().includes(trip.destination.toString().toLowerCase())) {
+          mandatoryLocations.push(row);
+        } else {
+          // accept it anyway but prefer ones matching destination
+          mandatoryLocations.push(row);
+        }
+      }
     }
 
     // Build candidates query: prefer interest matches or same city/country as trip.destination
-    let candidateSQL = `SELECT id, titulo, latitud, longitud, relevancia, fk_interest, country, city FROM locations`;
+    let candidateSQL = `SELECT id, titulo, latitud, longitud, relevancia, fk_interest, country, city, category FROM locations`;
     const whereClauses = [];
     const queryValues = [];
     let idx = 1;
@@ -136,47 +241,247 @@ async function handleItinerary(req, res) {
     }
 
     if (trip.destination) {
-      whereClauses.push(`(country ILIKE $${idx} OR city ILIKE $${idx})`);
+      // attempt to match country or city
+      whereClauses.push(`(country ILIKE $${idx} OR city ILIKE $${idx} OR titulo ILIKE $${idx})`);
       queryValues.push(`%${trip.destination}%`);
       idx++;
     }
 
+    // if no where clauses, avoid selecting the whole world; allow fallback later
     if (whereClauses.length) candidateSQL += ` WHERE (${whereClauses.join(' OR ')})`;
     candidateSQL += ` ORDER BY relevancia DESC NULLS LAST, titulo ASC LIMIT $${idx}`;
-    queryValues.push(totalNeeded * 2 + 20);
+    queryValues.push(totalNeeded * 3 + 50); // get a larger pool to allow clustering and cuisine picks
 
     const candRes = await client.query(candidateSQL, queryValues);
-    const candidates = candRes.rows;
+    let candidates = candRes.rows || [];
 
-    // Merge mandatory + candidates, dedupe
-    const chosenById = new Map();
-    for (const m of mandatoryLocations) chosenById.set(String(m.id), m);
-    for (const c of candidates) {
-      if (!chosenById.has(String(c.id))) chosenById.set(String(c.id), c);
-      if (chosenById.size >= totalNeeded) break;
+    // if no candidates found that match destination/interests, broaden query to trip.destination only as free text or take top by relevancia
+    if (candidates.length === 0) {
+      const broadRes = await client.query(`SELECT id, titulo, latitud, longitud, relevancia, fk_interest, country, city, category FROM locations ORDER BY relevancia DESC NULLS LAST LIMIT $1`, [totalNeeded * 3 + 50]);
+      candidates = broadRes.rows || [];
     }
 
-    const chosen = Array.from(chosenById.values()).slice(0, totalNeeded);
+    // ensure mandatory locations included (fetch any missing by id/title explicitly)
+    const mandatoryById = new Map();
+    for (const m of mandatoryLocations) mandatoryById.set(String(m.id), m);
+    for (const name of mandatoryPlaceNames) {
+      const exists = candidates.find(c => c.titulo && c.titulo.toString().toLowerCase().includes(name.toString().toLowerCase()));
+      if (!exists) {
+        const r = await client.query('SELECT id, titulo, latitud, longitud, relevancia, fk_interest, country, city, category FROM locations WHERE titulo ILIKE $1 LIMIT 1', [`%${name}%`]);
+        if (r.rows.length) {
+          const row = r.rows[0];
+          candidates.unshift(row); // high priority
+          mandatoryById.set(String(row.id), row);
+        }
+      } else {
+        mandatoryById.set(String(exists.id), exists);
+      }
+    }
 
-    // Distribute sequentially into days
+    // dedupe candidates (by id) and limit pool
+    const seen = new Set();
+    const dedup = [];
+    for (const c of candidates) {
+      if (!c || !c.id) continue;
+      if (seen.has(String(c.id))) continue;
+      seen.add(String(c.id));
+      dedup.push(c);
+      if (dedup.length >= Math.max(totalNeeded * 3, 50)) break;
+    }
+    candidates = dedup;
+
+    // build points array for clustering
+    const points = candidates.filter(c => c.latitud != null && c.longitud != null).map(c => ({ lat: Number(c.latitud), lng: Number(c.longitud) }));
+
+    // perform clustering into `days` clusters
+    const k = Math.min(days, Math.max(1, points.length));
+    const clustersIndices = k >= 1 && points.length ? kmeans(points, k, 12) : Array.from({length:k}, () => []);
+
+    // map cluster index -> candidate list
+    const clusterCandidates = Array.from({length:k}, () => []);
+    // map point index to candidate object
+    const pointIdxToCand = {};
+    let pIdx = 0;
+    for (let i = 0; i < candidates.length; i++) {
+      const c = candidates[i];
+      if (c.latitud == null || c.longitud == null) continue;
+      const key = `${Number(c.latitud)}:${Number(c.longitud)}:${c.id}`;
+      pointIdxToCand[pIdx] = c;
+      pIdx++;
+    }
+    // fill clusterCandidates using clustersIndices
+    for (let ci = 0; ci < clustersIndices.length; ci++) {
+      const arr = clustersIndices[ci];
+      for (const idxPoint of arr) {
+        const cand = pointIdxToCand[idxPoint];
+        if (cand) clusterCandidates[ci].push(cand);
+      }
+    }
+
+    // Some candidates may have no coords (push them to first cluster)
+    const noCoordCands = candidates.filter(c => c.latitud == null || c.longitud == null);
+    if (noCoordCands.length) clusterCandidates[0].push(...noCoordCands);
+
+    // Prepare day buckets, each day gets a cluster; if clusters < days, some days will be empty and we'll fill later
     const daysArr = [];
     for (let d = 0; d < days; d++) daysArr.push({ date: addDaysToIso(startDate, d), places: [] });
 
-    let cursor = 0;
-    for (const loc of chosen) {
-      const di = Math.min(Math.floor(cursor / perDay), days - 1);
-      daysArr[di].places.push({ id: loc.id, titulo: loc.titulo, lat: loc.latitud, lng: loc.longitud, relevancia: loc.relevancia || null });
-      cursor++;
+    // assign clusters to days in order of cluster size (largest clusters first to earlier days)
+    const clusterOrder = clusterCandidates.map((c, i) => ({ i, len: c.length })).sort((a,b) => b.len - a.len).map(x => x.i);
+
+    // We'll populate a per-day candidate list prioritizing mandatory places
+    const perDayCandidates = Array.from({length:days}, () => []);
+
+    // For each mandatory location, put it into the nearest cluster/day
+    for (const [mid, mloc] of mandatoryById.entries()) {
+      if (!mloc || mloc.latitud == null || mloc.longitud == null) continue;
+      // find nearest cluster center (approx using first element of cluster or compute mean)
+      let bestCluster = 0; let bestD = Infinity;
+      for (let ci = 0; ci < clusterCandidates.length; ci++) {
+        const cluster = clusterCandidates[ci];
+        if (!cluster || cluster.length === 0) continue;
+        // use first candidate as proxy
+        const proxy = cluster[0];
+        const d = haversineKm({lat: Number(mloc.latitud), lng: Number(mloc.longitud)}, {lat: Number(proxy.latitud), lng: Number(proxy.longitud)});
+        if (d < bestD) { bestD = d; bestCluster = ci; }
+      }
+      // map cluster index to day index (use clusterOrder ordering)
+      const dayIndex = Math.min(days - 1, clusterOrder.indexOf(bestCluster) >= 0 ? clusterOrder.indexOf(bestCluster) : 0);
+      perDayCandidates[dayIndex].push(mloc);
     }
 
-    const itinerary = { trip_id: tripId, pace, days: daysArr, generated_at: new Date().toISOString() };
+    // Fill each day's candidate list with cluster candidates (de-duplicated) preferring relevancia
+    for (let di = 0; di < days; di++) {
+      const clusterIdx = clusterOrder[di] ?? clusterOrder[0] ?? 0;
+      const pool = clusterCandidates[clusterIdx] || [];
+      // sort pool by relevancia desc
+      pool.sort((a,b) => (b.relevancia || 0) - (a.relevancia || 0));
+      for (const c of pool) {
+        if (perDayCandidates[di].find(x => String(x.id) === String(c.id))) continue;
+        perDayCandidates[di].push(c);
+        if (perDayCandidates[di].length >= perDay * 2) break; // keep some headroom
+      }
+    }
+
+    // Now pick final per-day places respecting limits, prioritizing mandatory and gastronomia for meal slots
+    const itineraryDays = [];
+    for (let di = 0; di < days; di++) {
+      const date = addDaysToIso(startDate, di);
+      const pool = perDayCandidates[di] || [];
+
+      // ensure mandatory first
+      const mandatoryHere = pool.filter(p => mandatoryById.has(String(p.id)));
+      const nonMandatory = pool.filter(p => !mandatoryById.has(String(p.id)));
+
+      // plan meal slots: lunch ~13:00 (780 min), merienda ~17:00 (1020), dinner ~20:00 (1200)
+      const mealSlots = { lunch: 13*60, merienda: 17*60, dinner: 20*60 };
+      const assigned = [];
+
+      // try to pick one gastronomic for lunch and dinner if available
+      const gastrCandidates = pool.filter(isGastronomia);
+      const usedIds = new Set();
+
+      // prefer gastrCandidates located near other planned items; but here we simply pick top relevancia in pool
+      const pickGastrFor = (slot) => {
+        for (const g of gastrCandidates) {
+          if (usedIds.has(String(g.id))) continue;
+          usedIds.add(String(g.id));
+          return g;
+        }
+        return null;
+      };
+
+      const lunchPlace = pickGastrFor('lunch');
+      const dinnerPlace = pickGastrFor('dinner');
+      const meriendaPlace = pickGastrFor('merienda');
+
+      // assemble day's places list starting with morning attractions
+      const dayPlaces = [];
+
+      // add mandatory first (highest relevancia first)
+      mandatoryHere.sort((a,b) => (b.relevancia || 0) - (a.relevancia || 0));
+      for (const m of mandatoryHere) {
+        dayPlaces.push(m);
+        usedIds.add(String(m.id));
+        if (dayPlaces.length >= perDay) break;
+      }
+
+      // fill remaining with top non-mandatory
+      for (const nm of nonMandatory) {
+        if (dayPlaces.length >= perDay) break;
+        if (usedIds.has(String(nm.id))) continue;
+        dayPlaces.push(nm);
+        usedIds.add(String(nm.id));
+      }
+
+      // if there is room for gastronomic slots but not included yet, ensure they appear (replace last if necessary)
+      const ensureMealPlace = (mealPlace, timeMin) => {
+        if (!mealPlace) return null;
+        // if already included, done
+        if (dayPlaces.find(p => String(p.id) === String(mealPlace.id))) return null;
+        // try to insert near middle of day
+        if (dayPlaces.length < perDay) {
+          dayPlaces.splice(Math.floor(dayPlaces.length/2), 0, mealPlace);
+        } else {
+          // replace last low-relevance
+          dayPlaces[dayPlaces.length-1] = mealPlace;
+        }
+        usedIds.add(String(mealPlace.id));
+        return mealPlace;
+      };
+
+      ensureMealPlace(lunchPlace, mealSlots.lunch);
+      ensureMealPlace(meriendaPlace, mealSlots.merienda);
+      ensureMealPlace(dinnerPlace, mealSlots.dinner);
+
+      // Trim to perDay
+      const finalPlaces = dayPlaces.slice(0, perDay);
+
+      // --- schedule times for the day's places with simple sequential planning ---
+      // Start day at 09:00 (540 minutes). We'll give each attraction ~90min, gastronomy ~60min.
+      let currentMin = 9 * 60;
+      const scheduled = [];
+      for (let i = 0; i < finalPlaces.length; i++) {
+        const p = finalPlaces[i];
+        const isG = isGastronomia(p);
+        // if there's a meal slot reserved for this place, align it
+        let preferredMin = null;
+        if (lunchPlace && String(lunchPlace.id) === String(p.id)) preferredMin = mealSlots.lunch; 
+        if (meriendaPlace && String(meriendaPlace.id) === String(p.id)) preferredMin = mealSlots.merienda;
+        if (dinnerPlace && String(dinnerPlace.id) === String(p.id)) preferredMin = mealSlots.dinner;
+
+        // compute travel time from last scheduled
+        if (scheduled.length > 0) {
+          const last = scheduled[scheduled.length-1];
+          const travelMin = estimateTravelMinutes({lat: Number(last.lat), lng: Number(last.lng)}, {lat: Number(p.latitud || p.lat), lng: Number(p.longitud || p.lng)});
+          currentMin += Math.round(travelMin) + 10; // +10 minutes buffer
+        }
+
+        // enforce preferred meal time if set (but allow small adjustments)
+        if (preferredMin != null && preferredMin > currentMin + 30) {
+          // wait until preferred minus small buffer
+          currentMin = preferredMin - (isG ? 10 : 30);
+        }
+        const duration = isG ? 60 : 90; // minutes
+        const startStr = minutesToTimeStr(currentMin);
+        const endStr = minutesToTimeStr(currentMin + duration);
+
+        scheduled.push({ id: p.id, titulo: p.titulo, lat: Number(p.latitud || p.lat), lng: Number(p.longitud || p.lng), category: p.category, relevance: p.relevancia, start_hour: startStr, end_hour: endStr });
+
+        currentMin += duration + 15; // add small gap after each activity
+      }
+
+      itineraryDays.push({ date, places: scheduled });
+    }
+
+    const itinerary = { trip_id: tripId, pace, days: itineraryDays, generated_at: new Date().toISOString() };
 
     // Save generation record and optionally persist places
     await client.query('BEGIN');
     const genRes = await client.query(
       `INSERT INTO itinerary_generations (trip_id, user_id, model, status, progress, generated_json, created_at, finished_at)
        VALUES ($1,$2,$3,$4,$5,$6, now(), now()) RETURNING id`,
-      [tripId, userId, 'heuristic-v1', 'finished', 100, JSON.stringify(itinerary)]
+      [tripId, userId, 'heuristic-v2-clustered', 'finished', 100, JSON.stringify(itinerary)]
     );
     const genId = genRes.rows[0].id;
 
@@ -186,9 +491,13 @@ async function handleItinerary(req, res) {
       await client.query('DELETE FROM trip_places WHERE fk_trips = $1 AND date >= $2 AND date <= $3', [tripId, startDate, endDate]);
 
       const insertSQL = 'INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *';
-      for (const day of daysArr) {
+      for (const day of itineraryDays) {
         for (const p of day.places) {
-          const r = await client.query(insertSQL, [p.id, tripId, day.date, null, null, null]);
+          // convert HH:MM:SS to time string acceptable by Postgres (time with timezone optional)
+          const start = p.start_hour || null;
+          const end = p.end_hour || null;
+          // attempt to find location id (already present as p.id). We assume p.id is location id
+          const r = await client.query(insertSQL, [p.id, tripId, day.date, start, end, null]);
           savedPlaces.push(r.rows[0]);
         }
       }
@@ -708,7 +1017,7 @@ router.post('/:id/places/auto', auth, async (req, res) => {
 
     // Fetch existing places for that date (preserve order by id/created_at)
     const existingRes = await client.query(
-      `SELECT tp.id, tp.fk_locations, tp.date, tp.start_hour, tp.end_hour, tp.notes, l.latitude, l.longitude
+      `SELECT tp.id, tp.fk_locations, tp.date, tp.start_hour, tp.end_hour, tp.notes, l.latitud AS latitude, l.longitud AS longitude
        FROM trip_places tp
        JOIN locations l ON l.id = tp.fk_locations
        WHERE tp.fk_trips = $1 AND tp.date::text = $2
@@ -718,7 +1027,7 @@ router.post('/:id/places/auto', auth, async (req, res) => {
     const existingPlaces = existingRes.rows;
 
     // Fetch coords for the new location
-    const locRes = await client.query('SELECT id, latitude, longitude FROM locations WHERE id = $1 LIMIT 1', [Number(place.fk_location)]);
+    const locRes = await client.query('SELECT id, latitud AS latitude, longitud AS longitude FROM locations WHERE id = $1 LIMIT 1', [Number(place.fk_location)]);
     if (!locRes.rows.length) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Location (fk_location) no encontrada' });
