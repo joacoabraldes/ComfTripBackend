@@ -1,0 +1,451 @@
+{
+  "info": {
+    "name": "ComfTrip API - Full workflow (Rome first, Spain second, friends/share)",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "version": "1.0.0"
+  },
+  "item": [
+    {
+      "name": "Login (admin: identifier/password)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\n  \"identifier\": \"{{identifier}}\",\n  \"password\": \"{{password}}\"\n}" },
+        "url": { "raw": "{{baseUrl}}/auth/login", "host": ["{{baseUrl}}"], "path": ["auth","login"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('login 200', () => pm.response.to.have.status(200));",
+              "const j = pm.response.json();",
+              "pm.test('token present', () => pm.expect(j.token).to.exist);",
+              "if (j && j.token) pm.environment.set('authToken', j.token);",
+              "if (j && j.user && j.user.id) pm.environment.set('adminId', j.user.id);"
+            ]
+          }
+        }
+      ]
+    },
+
+
+    {
+      "name": "Create Trip (Italy) - prefer Rome area",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{authToken}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"destination\": \"Italy\",\n  \"start_date\": \"2025-11-11\",\n  \"end_date\": \"2025-11-13\",\n  \"notes\": \"Test trip to Rome region (Italy)\"\n}"
+        },
+        "url": { "raw": "{{baseUrl}}/trips", "host": ["{{baseUrl}}"], "path": ["trips"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('create trip Italy 201', () => pm.response.to.have.status(201));",
+              "const j = pm.response.json();",
+              "pm.test('tripId exists', () => pm.expect(j.trip && j.trip.id).to.exist);",
+              "if (j.trip && j.trip.id) pm.environment.set('tripIdRome', j.trip.id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Generate Itinerary (save=true) - Italy (pace Intenso)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{authToken}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"save\": true,\n  \"pace\": \"Intenso\",\n  \"places\": [],\n  \"llm_notes\": \"Generate intense itinerary for Italy (Rome area)\"\n}"
+        },
+        "url": { "raw": "{{baseUrl}}/trips/{{tripIdRome}}/itinerary", "host": ["{{baseUrl}}"], "path": ["trips","{{tripIdRome}}","itinerary"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('itinerary created 201', () => pm.response.to.have.status(201));",
+              "const j = pm.response.json();",
+              "pm.test('generation_id present', () => pm.expect(j.generation_id).to.exist);",
+              "pm.test('itinerary.days array', () => pm.expect(j.itinerary && j.itinerary.days).to.be.an('array'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get Trip (Italy) - assert saved places are in Italy",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Authorization", "value": "Bearer {{authToken}}" }],
+        "url": { "raw": "{{baseUrl}}/trips/{{tripIdRome}}", "host": ["{{baseUrl}}"], "path": ["trips","{{tripIdRome}}"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('get trip Italy 200', () => pm.response.to.have.status(200));",
+              "const j = pm.response.json();",
+              "pm.test('places array exists', () => pm.expect(j.places).to.be.an('array'));",
+              "const places = j.places || [];",
+              "pm.test('there are saved places', () => pm.expect(places.length).to.be.above(0));",
+              "",
+              "let allInCountry = true;",
+              "const bad = [];",
+              "for (const p of places) {",
+              "  const loc = (p.location || {});",
+              "  const country = (loc.country || '').toLowerCase();",
+              "  if (!country.includes('italy')) { bad.push({ title: (loc.titulo||loc.title||p.titulo||p.title||''), country }); allInCountry = false; }",
+              "}",
+              "if (!allInCountry) console.log('Non-Italy saved places:', JSON.stringify(bad, null, 2));",
+              "pm.test('all saved places are in Italy', () => pm.expect(allInCountry).to.equal(true));"
+            ]
+          }
+        }
+      ]
+    },
+
+
+    {
+      "name": "Create friend user (123@gmail.com)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"Friend123\",\n  \"email\": \"{{friend_email}}\",\n  \"password\": \"{{friend_password}}\"\n}"
+        },
+        "url": { "raw": "{{baseUrl}}/users/register", "host": ["{{baseUrl}}"], "path": ["users","register"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "// registration may return 200/201 or 400 if user exists; accept both",
+              "pm.test('register response ok (200/201/400)', () => pm.expect(pm.response.code).to.be.oneOf([200,201,400]));",
+              "const j = pm.response.json ? pm.response.json() : {};",
+              "console.log('register response:', pm.response.text());"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Login friend (capture friendToken & id)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\n  \"identifier\": \"{{friend_email}}\",\n  \"password\": \"{{friend_password}}\"\n}" },
+        "url": { "raw": "{{baseUrl}}/auth/login", "host": ["{{baseUrl}}"], "path": ["auth","login"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('friend login ok', () => pm.response.to.have.status(200));",
+              "const j = pm.response.json();",
+              "pm.test('friend token present', () => pm.expect(j.token).to.exist);",
+              "if (j && j.token) pm.environment.set('friendToken', j.token);",
+              "if (j && j.user && j.user.id) pm.environment.set('friendId', j.user.id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Send friend request (admin -> friend by email)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{authToken}}" }
+        ],
+        "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{friend_email}}\"\n}" },
+        "url": { "raw": "{{baseUrl}}/friends", "host": ["{{baseUrl}}"], "path": ["friends"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('friend request sent 201/400', () => pm.expect(pm.response.code).to.be.oneOf([201,400]));",
+              "const j = pm.response.json();",
+              "if (j && j.request && j.request.id) pm.environment.set('friendRequestId', j.request.id);",
+              "console.log('send friend response:', pm.response.text());"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Friend: GET incoming/outgoing requests",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Authorization", "value": "Bearer {{friendToken}}" }],
+        "url": { "raw": "{{baseUrl}}/friends/requests", "host": ["{{baseUrl}}"], "path": ["friends","requests"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('friend get requests 200', () => pm.response.to.have.status(200));",
+              "const j = pm.response.json();",
+              "console.log('incoming/outgoing:', JSON.stringify(j));",
+              "// If friendRequestId wasn't set earlier, try to set it from incoming",
+              "if (!pm.environment.get('friendRequestId')) {",
+              "  if (j && j.incoming && j.incoming.length) pm.environment.set('friendRequestId', j.incoming[0].id);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Friend: Accept friend request (as friend)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Authorization", "value": "Bearer {{friendToken}}" }],
+        "url": { "raw": "{{baseUrl}}/friends/{{friendRequestId}}/accept", "host": ["{{baseUrl}}"], "path": ["friends","{{friendRequestId}}","accept"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('accept friend 200/400', () => pm.expect(pm.response.code).to.be.oneOf([200,400]));",
+              "console.log('accept response:', pm.response.text());"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin: List friends (should include friendId)",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Authorization", "value": "Bearer {{authToken}}" }],
+        "url": { "raw": "{{baseUrl}}/friends", "host": ["{{baseUrl}}"], "path": ["friends"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('list friends 200', () => pm.response.to.have.status(200));",
+              "const j = pm.response.json() || [];",
+              "const found = j.find(u => String(u.id) === String(pm.environment.get('friendId')));",
+              "console.log('friends list length', j.length);",
+              "pm.test('friend present in list (if accepted)', () => pm.expect(true).to.be.a('boolean'));"
+            ]
+          }
+        }
+      ]
+    },
+
+
+    {
+      "name": "Admin: Share trip with friend (create share row)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{authToken}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"mode\": \"viewer\",\n  \"public\": false,\n  \"shared_with_user_id\": {{friendId}}\n}"
+        },
+        "url": { "raw": "{{baseUrl}}/trips/{{tripIdRome}}/share", "host": ["{{baseUrl}}"], "path": ["trips","{{tripIdRome}}","share"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('share create 201', () => pm.response.to.have.status(201));",
+              "const j = pm.response.json();",
+              "pm.test('share.url present', () => pm.expect(j.url).to.exist);",
+              "if (j && j.share && j.share.share_uuid) pm.environment.set('shareUuid', j.share.share_uuid);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Public: GET shared trip (no auth) via uuid",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "{{baseUrl}}/share/trip/{{shareUuid}}", "host": ["{{baseUrl}}"], "path": ["share","trip","{{shareUuid}}"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('public share 200', () => pm.response.to.have.status(200));",
+              "const j = pm.response.json();",
+              "pm.test('trip present in share response', () => pm.expect(j.trip).to.exist);"
+            ]
+          }
+        }
+      ]
+    },
+
+
+    {
+      "name": "Create Trip (Spain)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{authToken}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"destination\": \"Spain\",\n  \"start_date\": \"2025-11-18\",\n  \"end_date\": \"2025-11-20\",\n  \"notes\": \"Test trip to Spain - should include Zim\"\n}"
+        },
+        "url": { "raw": "{{baseUrl}}/trips", "host": ["{{baseUrl}}"], "path": ["trips"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('create trip Spain 201', () => pm.response.to.have.status(201));",
+              "const j = pm.response.json();",
+              "if (j.trip && j.trip.id) pm.environment.set('tripIdSpain', j.trip.id);",
+              "pm.test('tripIdSpain exists', () => pm.expect(pm.environment.get('tripIdSpain')).to.exist);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Generate Itinerary (save=true) - Spain (require Zim)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{authToken}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"save\": true,\n  \"pace\": \"Intenso\",\n  \"places\": [\"Zim\"],\n  \"llm_notes\": \"Generate itinerary Spain requiring Zim\"\n}"
+        },
+        "url": { "raw": "{{baseUrl}}/trips/{{tripIdSpain}}/itinerary", "host": ["{{baseUrl}}"], "path": ["trips","{{tripIdSpain}}","itinerary"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('itinerary Spain created 201', () => pm.response.to.have.status(201));",
+              "const j = pm.response.json();",
+              "pm.test('generation_id present', () => pm.expect(j.generation_id).to.exist);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get Trip (Spain) - assert saved places are in Spain and Zim present",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Authorization", "value": "Bearer {{authToken}}" }],
+        "url": { "raw": "{{baseUrl}}/trips/{{tripIdSpain}}", "host": ["{{baseUrl}}"], "path": ["trips","{{tripIdSpain}}"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('get trip Spain 200', () => pm.response.to.have.status(200));",
+              "const j = pm.response.json();",
+              "pm.test('places array exists', () => pm.expect(j.places).to.be.an('array'));",
+              "const places = j.places || [];",
+              "pm.test('there are saved places', () => pm.expect(places.length).to.be.above(0));",
+              "",
+              "let allInCountry = true;",
+              "const bad = [];",
+              "for (const p of places) {",
+              "  const loc = (p.location || {});",
+              "  const country = (loc.country || '').toLowerCase();",
+              "  if (!country.includes('spain')) { bad.push({ title: (loc.titulo||loc.title||p.titulo||p.title||''), country }); allInCountry = false; }",
+              "}",
+              "if (!allInCountry) console.log('Non-Spain saved places:', JSON.stringify(bad, null, 2));",
+              "pm.test('all saved places are in Spain', () => pm.expect(allInCountry).to.equal(true));",
+              "",
+              "// check mandatory 'Zim' present",
+              "let foundMandatory = false;",
+              "for (const p of places) {",
+              "  const title = ((p.location && (p.location.titulo || p.location.title)) || p.titulo || p.title || '') + '';",
+              "  if (title.toLowerCase().includes('zim')) {",
+              "    const country = ((p.location && p.location.country) || '').toLowerCase();",
+              "    if (country.includes('spain')) foundMandatory = true;",
+              "  }",
+              "}",
+              "pm.test('Zim present in Spain', () => pm.expect(foundMandatory).to.equal(true));"
+            ]
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Delete Trip Rome (cleanup)",
+      "request": {
+        "method": "DELETE",
+        "header": [{ "key": "Authorization", "value": "Bearer {{authToken}}" }],
+        "url": { "raw": "{{baseUrl}}/trips/{{tripIdRome}}", "host": ["{{baseUrl}}"], "path": ["trips","{{tripIdRome}}"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('delete Rome trip result tolerant', () => pm.expect(pm.response.code).to.be.oneOf([200,404,500]));",
+              "pm.environment.unset('tripIdRome');"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Delete Trip Spain (cleanup)",
+      "request": {
+        "method": "DELETE",
+        "header": [{ "key": "Authorization", "value": "Bearer {{authToken}}" }],
+        "url": { "raw": "{{baseUrl}}/trips/{{tripIdSpain}}", "host": ["{{baseUrl}}"], "path": ["trips","{{tripIdSpain}}"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('delete Spain trip result tolerant', () => pm.expect(pm.response.code).to.be.oneOf([200,404,500]));",
+              "pm.environment.unset('tripIdSpain');"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

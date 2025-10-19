@@ -519,11 +519,29 @@ async function handleItinerary(req, res) {
 
     const savedPlaces = [];
     if (save) {
+      // Remove existing places in the trip range
       await client.query('DELETE FROM trip_places WHERE fk_trips = $1 AND date >= $2 AND date <= $3', [tripId, startDate, endDate]);
 
       const insertSQL = 'INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *';
+
+      // IMPORTANT SAFEGUARD: before inserting each place, confirm its location.country matches destCountry (if provided).
       for (const day of itinerary.days) {
         for (const p of day.places) {
+          // If destination country was specified, double-check the location row
+          if (destCountry) {
+            const locRow = await client.query('SELECT id, country FROM locations WHERE id = $1 LIMIT 1', [Number(p.id)]);
+            if (!locRow.rows.length) {
+              // location missing - skip
+              console.warn(`Skipping save: location id ${p.id} not found`);
+              continue;
+            }
+            const locCountry = (locRow.rows[0].country || '').toString().toLowerCase();
+            if (!locCountry.includes(destCountryLower)) {
+              // skip inserting locations that are not in destination country
+              console.warn(`Skipping save: location id ${p.id} country "${locRow.rows[0].country}" does not match destination "${destCountry}"`);
+              continue;
+            }
+          }
           const start = p.start_hour || null;
           const end = p.end_hour || null;
           const r = await client.query(insertSQL, [p.id, tripId, day.date, start, end, null]);
@@ -965,7 +983,7 @@ router.delete('/:id/places/:placeId', auth, async (req, res) => {
     const placeId = Number(req.params.placeId);
     const userId = req.user.id;
 
-    const ownerRes = await client.query('SELECT user_id FROM trips WHERE id = $1', [tripId]);
+    const ownerRes = await pool.query('SELECT user_id FROM trips WHERE id = $1', [tripId]);
     if (!ownerRes.rows.length) return res.status(404).json({ message: 'No encontrado' });
     if (ownerRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
 

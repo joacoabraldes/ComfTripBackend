@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="ComfTrip API - Itinerary strict-country tests (fixed)" tests="6" time="6.177">
+  <testsuite name="Login (identifier/password)" id="1f2ca252-abf0-4419-8ebe-33bde67bb36b" timestamp="2025-10-19T21:13:43.786Z" tests="2" failures="0" errors="0" time="0.509">
+    <testcase name="login 200" time="0.509" classname="ComfTripApiItineraryStrictCountryTestsFixed"/>
+    <testcase name="token present" time="0.509" classname="ComfTripApiItineraryStrictCountryTestsFixed"/>
+  </testsuite>
+  <testsuite name="Create Trip (destination = Spain)" id="2c44348f-900a-4ff1-af81-3112fc1a6685" timestamp="2025-10-19T21:13:43.786Z" tests="2" failures="0" errors="0" time="0.534">
+    <testcase name="create trip 201" time="0.534" classname="ComfTripApiItineraryStrictCountryTestsFixed"/>
+    <testcase name="trip exists" time="0.534" classname="ComfTripApiItineraryStrictCountryTestsFixed"/>
+  </testsuite>
+  <testsuite name="Generate Itinerary (save=true) - require Zim in Spain" id="b4c8acb7-7522-42e2-9492-f88926110df8" timestamp="2025-10-19T21:13:43.786Z" tests="3" failures="0" errors="0" time="2.920">
+    <testcase name="itinerary create 201" time="2.920" classname="ComfTripApiItineraryStrictCountryTestsFixed"/>
+    <testcase name="generation_id present" time="2.920" classname="ComfTripApiItineraryStrictCountryTestsFixed"/>
+    <testcase name="itinerary has days" time="2.920" classname="ComfTripApiItineraryStrictCountryTestsFixed"/>
+  </testsuite>
+  <testsuite name="Get Trip (validate saved places are in Spain and Zim present)" id="b96bffbf-48ad-4523-a2d1-1eabb799e469" timestamp="2025-10-19T21:13:43.786Z" tests="5" failures="1" errors="0" time="0.305">
+    <testcase name="get trip 200" time="0.305" classname="ComfTripApiItineraryStrictCountryTestsFixed"/>
+    <testcase name="places array exists" time="0.305" classname="ComfTripApiItineraryStrictCountryTestsFixed"/>
+    <testcase name="there are saved places after generation" time="0.305" classname="ComfTripApiItineraryStrictCountryTestsFixed"/>
+    <testcase name="all saved places have country matching Spain" time="0.305" classname="ComfTripApiItineraryStrictCountryTestsFixed">
+      <failure type="AssertionFailure" message="expected false to equal true">
+        <![CDATA[Failed 1 times.]]>
+        <![CDATA[Collection JSON ID: ab3202ec-2256-4062-bc2f-0a296d81e5ed.]]>
+        <![CDATA[Collection name: ComfTrip API - Itinerary strict-country tests (fixed).]]>
+        <![CDATA[Request name: Get Trip (validate saved places are in Spain and Zim present).]]>
+        <![CDATA[Test description: all saved places have country matching Spain.]]>
+        <![CDATA[Error message: expected false to equal true.]]>
+        <![CDATA[Stacktrace: AssertionError: expected false to equal true
+   at Object.eval sandbox-script.js:4:4).]]>
+      </failure>
+    </testcase>
+    <testcase name="Zim (mandatory) present in Spain" time="0.305" classname="ComfTripApiItineraryStrictCountryTestsFixed"/>
+  </testsuite>
+  <testsuite name="Generate Itinerary (save=false) - non-persisted generation smoke" id="acd160b3-f07f-4c2b-998b-62ca03921cdc" timestamp="2025-10-19T21:13:43.786Z" tests="2" failures="0" errors="0" time="1.138">
+    <testcase name="gen (no save) success 200/201" time="1.138" classname="ComfTripApiItineraryStrictCountryTestsFixed"/>
+    <testcase name="itinerary returned" time="1.138" classname="ComfTripApiItineraryStrictCountryTestsFixed"/>
+  </testsuite>
+  <testsuite name="Delete Trip (cleanup)" id="0430f2ed-b7d7-4a91-9082-17667dab8f1f" timestamp="2025-10-19T21:13:43.786Z" tests="1" failures="0" errors="0" time="0.771">
+    <testcase name="delete 200 or 404 or 500" time="0.771" classname="ComfTripApiItineraryStrictCountryTestsFixed"/>
+  </testsuite>
+</testsuites>

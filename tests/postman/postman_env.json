@@ -1,0 +1,20 @@
+{
+  "id": "env-comftrip-full",
+  "name": "ComfTrip Env Full",
+  "values": [
+    { "key": "baseUrl", "value": "https://comf-trip-backend.vercel.app/api", "enabled": true },
+    { "key": "identifier", "value": "admin", "enabled": true },
+    { "key": "password", "value": "admin", "enabled": true },
+    { "key": "authToken", "value": "", "enabled": true },
+    { "key": "adminId", "value": "", "enabled": true },
+    { "key": "tripIdRome", "value": "", "enabled": true },
+    { "key": "tripIdSpain", "value": "", "enabled": true },
+    { "key": "friend_email", "value": "123@gmail.com", "enabled": true },
+    { "key": "friend_password", "value": "123", "enabled": true },
+    { "key": "friendToken", "value": "", "enabled": true },
+    { "key": "friendId", "value": "", "enabled": true },
+    { "key": "friendRequestId", "value": "", "enabled": true },
+    { "key": "shareUuid", "value": "", "enabled": true }
+  ],
+  "_postman_variable_scope": "environment"
+}
