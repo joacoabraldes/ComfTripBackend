@@ -63,6 +63,7 @@ router.post('/', auth, async (req, res) => {
       [requesterId, addresseeId, 'pending']
     );
 
+    // return the created request row (so Postman can capture id)
     res.status(201).json({ request: ins.rows[0] });
   } catch (err) {
     console.error('POST / (send friend) error:', err);
@@ -103,8 +104,50 @@ router.get('/requests', auth, async (req, res) => {
 });
 
 /**
+ * POST /accept
+ * Accept a friend request. Accepts body/query { id } OR, if no id provided,
+ * attempts to accept the earliest incoming pending request for the logged user.
+ */
+router.post('/accept', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = req.user.id;
+    const providedId = req.body.id || req.query.id || null;
+    let reqId = null;
+
+    if (providedId) {
+      reqId = Number(providedId);
+      if (!Number.isFinite(reqId)) return res.status(400).json({ message: 'Invalid request id' });
+    } else {
+      // Try to find an incoming pending request for this user
+      const r = await pool.query('SELECT id FROM friend_requests WHERE addressee_id = $1 AND status = $2 ORDER BY created_at ASC LIMIT 1', [userId, 'pending']);
+      if (!r.rows.length) return res.status(404).json({ message: 'No pending incoming requests' });
+      reqId = r.rows[0].id;
+    }
+
+    const r = await client.query('SELECT * FROM friend_requests WHERE id = $1 LIMIT 1', [reqId]);
+    if (!r.rows.length) return res.status(404).json({ message: 'Solicitud no encontrada' });
+    const fr = r.rows[0];
+    if (fr.addressee_id !== userId) return res.status(403).json({ message: 'No autorizado' });
+    if (fr.status === 'accepted') return res.status(400).json({ message: 'Ya aceptada' });
+
+    await client.query('BEGIN');
+    await client.query('UPDATE friend_requests SET status=$1 WHERE id=$2', ['accepted', reqId]);
+    await client.query('COMMIT');
+
+    res.json({ message: 'Solicitud aceptada', id: reqId });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('POST /accept error:', err);
+    res.status(500).json({ message: 'Error' });
+  } finally {
+    client.release();
+  }
+});
+
+/**
  * POST /:id/accept
- * Accept an incoming request (id = friend_requests.id)
+ * (Kept for compatibility) Accept an incoming request by id.
  */
 router.post('/:id/accept', auth, async (req, res) => {
   try {
@@ -125,8 +168,48 @@ router.post('/:id/accept', auth, async (req, res) => {
 });
 
 /**
+ * POST /reject
+ * Reject a friend request. Accepts body/query { id } or will reject the earliest incoming one if no id provided.
+ */
+router.post('/reject', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = req.user.id;
+    const providedId = req.body.id || req.query.id || null;
+    let reqId = null;
+
+    if (providedId) {
+      reqId = Number(providedId);
+      if (!Number.isFinite(reqId)) return res.status(400).json({ message: 'Invalid request id' });
+    } else {
+      const r = await pool.query('SELECT id FROM friend_requests WHERE addressee_id = $1 AND status = $2 ORDER BY created_at ASC LIMIT 1', [userId, 'pending']);
+      if (!r.rows.length) return res.status(404).json({ message: 'No pending incoming requests' });
+      reqId = r.rows[0].id;
+    }
+
+    const r = await client.query('SELECT * FROM friend_requests WHERE id = $1 LIMIT 1', [reqId]);
+    if (!r.rows.length) return res.status(404).json({ message: 'Solicitud no encontrada' });
+    const fr = r.rows[0];
+    if (fr.addressee_id !== userId) return res.status(403).json({ message: 'No autorizado' });
+    if (fr.status === 'rejected') return res.status(400).json({ message: 'Ya rechazada' });
+
+    await client.query('BEGIN');
+    await client.query('UPDATE friend_requests SET status=$1 WHERE id=$2', ['rejected', reqId]);
+    await client.query('COMMIT');
+
+    res.json({ message: 'Solicitud rechazada', id: reqId });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('POST /reject error:', err);
+    res.status(500).json({ message: 'Error' });
+  } finally {
+    client.release();
+  }
+});
+
+/**
  * POST /:id/reject
- * Reject an incoming request
+ * (Kept for compatibility) Reject an incoming request by id.
  */
 router.post('/:id/reject', auth, async (req, res) => {
   try {
