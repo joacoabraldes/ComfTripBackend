@@ -80,14 +80,28 @@ function normalizePace(p) {
 }
 
 // Parse trip.destination into city/country pieces
+// Parse trip.destination into city/country pieces
 function parseDestinationParts(dest) {
   if (!dest) return { city: null, country: null };
   const parts = String(dest).split(',').map(p => p.trim()).filter(Boolean);
-  if (parts.length === 1) return { city: parts[0], country: null };
+  if (parts.length === 1) {
+    // If it's a single token, check if it matches a known country variant.
+    const single = parts[0];
+    const n = normalizeStr(single);
+    for (const key of Object.keys(COUNTRY_EQUIV)) {
+      // COUNTRY_EQUIV contains small arrays of variants (e.g. 'spain' -> ['spain','espana',...])
+      if (COUNTRY_EQUIV[key].includes(n)) {
+        return { city: null, country: single }; // treat single token as country
+      }
+    }
+    // fallback: treat single token as city if no country match
+    return { city: single, country: null };
+  }
   const country = parts[parts.length - 1];
   const city = parts.slice(0, parts.length - 1).join(', ');
   return { city: city || null, country: country || null };
 }
+
 
 // Haversine distance (km)
 function haversineKm(a, b) {

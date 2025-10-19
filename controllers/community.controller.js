@@ -44,19 +44,26 @@ router.post('/', auth, async (req, res) => {
       [requesterId, addresseeId]
     );
 
-    if (existing.rows.length) {
+        if (existing.rows.length) {
       const ex = existing.rows[0];
-      if (ex.status === 'accepted') return res.status(400).json({ message: 'Ya son amigos' });
+      if (ex.status === 'accepted') {
+        // Already friends: keep code 400 for compatibility with your tests,
+        // but include the existing row so the client can capture id if needed.
+        return res.status(400).json({ message: 'Ya son amigos', request: ex });
+      }
       if (ex.status === 'pending') {
         // If reverse pending (addressee sent request to me), accept directly
         if (ex.requester_id === addresseeId && ex.addressee_id === requesterId) {
           await pool.query('UPDATE friend_requests SET status=$1 WHERE id=$2', ['accepted', ex.id]);
-          return res.json({ message: 'Solicitud aceptada automáticamente (tenías una solicitud entrante)' });
+          // Return success + request info (accepted)
+          return res.status(200).json({ message: 'Solicitud aceptada automáticamente (tenías una solicitud entrante)', request: { id: ex.id, requester_id: ex.requester_id, addressee_id: ex.addressee_id, status: 'accepted' } });
         }
-        return res.status(400).json({ message: 'Ya existe una solicitud pendiente' });
+        // Pending exists: return 400 but include the request so the client can pick up id
+        return res.status(400).json({ message: 'Ya existe una solicitud pendiente', request: ex });
       }
-      // if rejected, allow to create new (we'll proceed)
+      // for rejected or other statuses, allow creating a new one (we proceed below)
     }
+
 
     const ins = await pool.query(
       'INSERT INTO friend_requests (requester_id, addressee_id, status) VALUES ($1,$2,$3) RETURNING id, requester_id, addressee_id, status, created_at',
