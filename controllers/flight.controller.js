@@ -1,3 +1,4 @@
+// controllers/flight.controller.js
 'use strict';
 
 const express = require('express');
@@ -70,6 +71,65 @@ router.put('/:flight_id', auth, async (req, res) => {
   } catch (err) {
     console.error('PUT /flights/:flight_id error:', err);
     res.status(500).json({ message: 'Error actualizando vuelo' });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /flights
+ * List flights for the authenticated user.
+ * Optional query param: ?trip_id=NUMBER to filter for a specific trip.
+ */
+router.get('/', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = req.user.id;
+    const tripIdQ = req.query.trip_id;
+    let rows;
+
+    if (typeof tripIdQ !== 'undefined' && tripIdQ !== null && String(tripIdQ).trim() !== '') {
+      const tripId = Number(tripIdQ);
+      if (!Number.isFinite(tripId)) return res.status(400).json({ message: 'trip_id inválido' });
+      const q = 'SELECT flight_id, user_id, trip_id, created_at FROM flights WHERE user_id = $1 AND trip_id = $2 ORDER BY created_at DESC';
+      const r = await client.query(q, [userId, tripId]);
+      rows = r.rows;
+    } else {
+      const q = 'SELECT flight_id, user_id, trip_id, created_at FROM flights WHERE user_id = $1 ORDER BY created_at DESC';
+      const r = await client.query(q, [userId]);
+      rows = r.rows;
+    }
+
+    return res.json({ flights: rows });
+  } catch (err) {
+    console.error('GET /flights error:', err);
+    return res.status(500).json({ message: 'Error listando vuelos' });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /flights/:flight_id
+ * Returns a single flight by its flight_id if it belongs to the authenticated user.
+ */
+router.get('/:flight_id', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = req.user.id;
+    const flightId = String(req.params.flight_id || '').trim();
+    if (!flightId) return res.status(400).json({ message: 'flight_id inválido' });
+
+    const r = await client.query('SELECT flight_id, user_id, trip_id, created_at FROM flights WHERE flight_id = $1 LIMIT 1', [flightId]);
+    if (!r.rows.length) return res.status(404).json({ message: 'Vuelo no encontrado' });
+
+    const row = r.rows[0];
+    if (row.user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
+
+    return res.json({ flight: row });
+  } catch (err) {
+    console.error('GET /flights/:flight_id error:', err);
+    return res.status(500).json({ message: 'Error obteniendo vuelo' });
   } finally {
     client.release();
   }
