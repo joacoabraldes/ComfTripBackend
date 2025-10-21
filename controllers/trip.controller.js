@@ -1675,9 +1675,7 @@ router.post('/:id/places/auto', auth, async (req, res) => {
       return sum;
     };
 
-    // compute best order for a set of locList indices
-    // ------------------ REEMPLAZAR computeBestOrderForIndices ------------------
-// helpers: shuffle y twoOpt
+   // ------------------- Helpers: shuffle, twoOpt, projectionOrder -------------------
 function shuffle(arr) {
   const a = arr.slice();
   for (let i = a.length - 1; i > 0; i--) {
@@ -1688,12 +1686,8 @@ function shuffle(arr) {
 }
 
 function twoOpt(order, matrix) {
-  // order: array of node indices (ints)
-  // matrix: travel time matrix
   if (!order || order.length < 3) return order.slice();
-  let improved = true;
-  let best = order.slice();
-  const n = best.length;
+  const n = order.length;
   const calcCost = (ord) => {
     let s = 0;
     for (let i = 0; i < ord.length - 1; i++) {
@@ -1703,20 +1697,21 @@ function twoOpt(order, matrix) {
     }
     return s;
   };
-  let bestCost = calcCost(best);
 
+  let best = order.slice();
+  let bestCost = calcCost(best);
+  let improved = true;
   while (improved) {
     improved = false;
-    // i from 0..n-3, k from i+1..n-2 (we don't close the loop - path not cycle)
     for (let i = 0; i < n - 2; i++) {
-      for (let k = i + 1; k < n - 0; k++) {
+      for (let k = i + 1; k < n; k++) {
         const newOrder = best.slice(0, i).concat(best.slice(i, k + 1).reverse(), best.slice(k + 1));
         const c = calcCost(newOrder);
-        if (c + 1e-6 < bestCost) {
+        if (c < bestCost - 1e-9) {
           best = newOrder;
           bestCost = c;
           improved = true;
-          break; // restart outer loops when improvement found
+          break;
         }
       }
       if (improved) break;
@@ -1725,13 +1720,68 @@ function twoOpt(order, matrix) {
   return best;
 }
 
+// If locList with lat/lng is available, produce an ordering by projecting onto principal axis.
+// Returns array of indices (same elements as `indices` param) sorted by projection.
+function projectionOrder(indices) {
+  try {
+    if (typeof locList === 'undefined' || !Array.isArray(locList) || indices.length <= 1) return indices.slice();
+
+    // build array of [x,y] for indices
+    const pts = indices.map(i => {
+      const L = locList[i];
+      return { i, x: (L && (L.lat || L.latitud || L.latitude)) ? Number(L.lat || L.latitud || L.latitude) : null, y: (L && (L.lng || L.long || L.longitude)) ? Number(L.lng || L.long || L.longitude) : null };
+    }).filter(p => p.x != null && p.y != null);
+
+    if (pts.length <= 1) return indices.slice();
+
+    // compute mean
+    let mx = 0, my = 0;
+    for (const p of pts) { mx += p.x; my += p.y; }
+    mx /= pts.length; my /= pts.length;
+
+    // covariance elements
+    let Sxx = 0, Sxy = 0, Syy = 0;
+    for (const p of pts) {
+      const dx = p.x - mx, dy = p.y - my;
+      Sxx += dx*dx; Sxy += dx*dy; Syy += dy*dy;
+    }
+
+    // principal axis angle (2x2 analytic)
+    const theta = 0.5 * Math.atan2(2*Sxy, Sxx - Syy);
+    const vx = Math.cos(theta), vy = Math.sin(theta);
+
+    // project and sort
+    const proj = pts.map(p => ({ i: p.i, v: (p.x - mx)*vx + (p.y - my)*vy }));
+    proj.sort((a,b) => a.v - b.v);
+    const ordered = proj.map(p => p.i);
+
+    // For any indices missing (no coords) append them at end preserving original order
+    const missing = indices.filter(x => !ordered.includes(x));
+    return [...ordered, ...missing];
+  } catch (e) {
+    console.warn('projectionOrder failed:', e && e.message);
+    return indices.slice();
+  }
+}
+
+// ------------------- Nueva computeBestOrderForIndices (usa matrix y locList del scope) -------------------
 const computeBestOrderForIndices = (indices) => {
   const uniq = Array.from(new Set(indices));
   if (uniq.length <= 1) return { order: uniq.slice(), cost: 0 };
 
-  // small -> brute-force exact
+  // cost function using matrix
+  const calcCostFor = (arr) => {
+    let c = 0;
+    for (let i = 0; i < arr.length - 1; i++) {
+      const a = arr[i], b = arr[i+1];
+      const v = matrix[a] && matrix[a][b];
+      c += Number.isFinite(v) ? v : Number.MAX_SAFE_INTEGER/10;
+    }
+    return c;
+  };
+
+  // 1) exact brute-force for small n
   if (uniq.length <= 8) {
-    // brute-force permutations
     const perms = [];
     const back = (curr, rem) => {
       if (rem.length === 0) { perms.push(curr.slice()); return; }
@@ -1743,92 +1793,79 @@ const computeBestOrderForIndices = (indices) => {
       }
     };
     back([], uniq.slice());
-    let best = null; let bestCost = Infinity;
+    let best = null, bestCost = Infinity;
     for (const p of perms) {
-      // cost uses matrix variable from outer scope
-      let c = 0;
-      for (let i = 0; i < p.length - 1; i++) {
-        const a = p[i], b = p[i+1];
-        const v = matrix[a] && matrix[a][b];
-        c += Number.isFinite(v) ? v : Number.MAX_SAFE_INTEGER/10;
-      }
+      const c = calcCostFor(p);
       if (c < bestCost) { bestCost = c; best = p.slice(); }
     }
-    console.info('computeBestOrderForIndices (brute) result', { nodes: uniq.length, order: best, cost: bestCost });
+    console.info('computeBestOrderForIndices (brute) ->', { nodes: uniq.length, order: best, cost: bestCost });
     return { order: best || uniq.slice(), cost: bestCost === Infinity ? 0 : bestCost };
   }
 
-  // Otherwise: nearest-neighbor + 2-opt with multiple restarts
-  let bestOrder = null;
-  let bestCost = Infinity;
-
+  // 2) Heuristic: generate multiple seeds, apply 2-opt, pick best
   const candidates = uniq.slice();
-  // prepare start points: prefer all unique nodes but limit restarts for performance
-  const startPoints = candidates.slice(0, Math.min(candidates.length, 12)); // up to 12 starts
-  for (const start of startPoints) {
-    // build NN tour starting at `start`
+  const triedOrders = [];
+
+  // Seed A: projection order (and its reverse) — great for near-colinear cases
+  try {
+    const proj = projectionOrder(candidates);
+    triedOrders.push(proj.slice());
+    triedOrders.push(proj.slice().reverse());
+  } catch (e) { /* ignore */ }
+
+  // Seed B: NN from several starts (prefer high-relevance starts if available)
+  // pick up to 8 start nodes (spread)
+  const maxStarts = Math.min(8, candidates.length);
+  for (let s = 0; s < maxStarts; s++) {
+    const start = candidates[Math.floor((s * candidates.length) / maxStarts)];
+    // build NN
     const pool = candidates.filter(x => x !== start);
     const tour = [start];
     while (pool.length) {
-      let last = tour[tour.length - 1];
-      let bestIdx = 0;
-      let bestD = Infinity;
+      const last = tour[tour.length - 1];
+      let bestIdx = 0, bestD = Infinity;
       for (let i = 0; i < pool.length; i++) {
         const p = pool[i];
         const d = matrix[last] && matrix[last][p];
         if (Number.isFinite(d) && d < bestD) { bestD = d; bestIdx = i; }
-        else if (!Number.isFinite(d) && bestD === Infinity) { bestIdx = i; } // fallback
+        else if (!Number.isFinite(d) && bestD === Infinity) { bestIdx = i; }
       }
-      tour.push(pool.splice(bestIdx, 1)[0]);
+      tour.push(pool.splice(bestIdx,1)[0]);
     }
-
-    // improve using 2-opt
-    const improvedTour = twoOpt(tour, matrix);
-    // compute cost
-    let c = 0;
-    for (let i = 0; i < improvedTour.length - 1; i++) {
-      const a = improvedTour[i], b = improvedTour[i+1];
-      const v = matrix[a] && matrix[a][b];
-      c += Number.isFinite(v) ? v : Number.MAX_SAFE_INTEGER/10;
-    }
-    if (c < bestCost) {
-      bestCost = c;
-      bestOrder = improvedTour.slice();
-    }
+    triedOrders.push(tour.slice());
+    triedOrders.push(tour.slice().reverse());
   }
 
-  // add a few random restarts to avoid local minima
-  const randomRestarts = Math.min(8, Math.max(3, Math.floor(candidates.length / 2)));
-  for (let r = 0; r < randomRestarts; r++) {
-    const shuffled = shuffle(candidates);
-    const tour = shuffled.slice();
-    const improvedTour = twoOpt(tour, matrix);
-    let c = 0;
-    for (let i = 0; i < improvedTour.length - 1; i++) {
-      const a = improvedTour[i], b = improvedTour[i+1];
-      const v = matrix[a] && matrix[a][b];
-      c += Number.isFinite(v) ? v : Number.MAX_SAFE_INTEGER/10;
-    }
-    if (c < bestCost) {
-      bestCost = c;
-      bestOrder = improvedTour.slice();
-    }
+  // Seed C: relevance-sorted insertion (existing approach) as a seed
+  try {
+    const relSorted = candidates.slice().sort((a,b) => ((locList[b]?.relevancia||0) - (locList[a]?.relevancia||0)));
+    triedOrders.push(relSorted.slice());
+  } catch(e){}
+
+  // Seed D: some random shuffles
+  for (let r = 0; r < Math.min(6, candidates.length); r++) {
+    triedOrders.push(shuffle(candidates));
   }
 
-  // fallback safety
+  // Evaluate each seed: apply 2-opt and compute cost
+  let bestOrder = null, bestCost = Infinity;
+  for (const seed of triedOrders) {
+    const improved = twoOpt(seed, matrix);
+    const c = calcCostFor(improved);
+    console.info('computeBestOrderForIndices: seed result', { seedPreview: seed.slice(0,5), improvedPreview: improved.slice(0,5), cost: c });
+    if (c < bestCost) { bestCost = c; bestOrder = improved.slice(); }
+  }
+
+  // final fallback: identity
   if (!bestOrder) {
     bestOrder = uniq.slice();
-    bestCost = 0;
-    for (let i = 0; i < bestOrder.length - 1; i++) {
-      const a = bestOrder[i], b = bestOrder[i+1];
-      const v = matrix[a] && matrix[a][b];
-      bestCost += Number.isFinite(v) ? v : Number.MAX_SAFE_INTEGER/10;
-    }
+    bestCost = calcCostFor(bestOrder);
   }
 
-  console.info('computeBestOrderForIndices (nn+2opt) result', { nodes: uniq.length, order: bestOrder, cost: bestCost });
+  console.info('computeBestOrderForIndices (final) ->', { nodes: uniq.length, order: bestOrder, cost: bestCost });
   return { order: bestOrder, cost: bestCost };
 };
+
 
 
     // Evaluate insertion into each day: for each day, compute best order for that day's existing locs + new loc,
