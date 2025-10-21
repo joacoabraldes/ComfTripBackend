@@ -1261,8 +1261,13 @@ router.delete('/:id/places/:placeId', auth, async (req, res) => {
   }
 });
 
-/* POST /trips/:id/places/auto */
-/* (kept unchanged from your provided file) */
+/* POST /trips/:id/places/auto
+   Insert a new fk_location into the trip WITHOUT removing any existing places.
+   It selects the best day (does not move existing places between days),
+   reorders that day's places (existing + new) to minimize travel, updates their times,
+   and inserts the new place row.
+   Body: { place: { fk_location: <id>, notes?: string } }
+*/
 router.post('/:id/places/auto', auth, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1287,10 +1292,11 @@ router.post('/:id/places/auto', auth, async (req, res) => {
     const endD = new Date(endDateIso + 'T00:00:00Z');
     const days = Math.max(1, Math.round((endD - startD) / (24*3600*1000)) + 1);
 
-    // Load existing trip_places for the full trip date range with location meta
+    // load all existing trip_places for the trip date range (we keep them, will only update times for chosen day)
     const existingRes = await client.query(
-      `SELECT tp.id as tp_id, tp.fk_locations as fk_location, tp.date::text as date_text, tp.start_hour, tp.end_hour, tp.notes,
-              l.id as loc_id, l.titulo, l.latitud, l.longitud, l.relevancia, l.fk_interest, l.country, l.city, l.category
+      `SELECT tp.id AS tp_id, tp.fk_locations AS fk_location, tp.date::text AS date_text,
+              tp.start_hour, tp.end_hour, tp.notes,
+              l.id AS loc_id, l.titulo, l.latitud, l.longitud, l.relevancia, l.category, l.country, l.city
        FROM trip_places tp
        JOIN locations l ON l.id = tp.fk_locations
        WHERE tp.fk_trips = $1 AND tp.date::text >= $2 AND tp.date::text <= $3
@@ -1299,57 +1305,66 @@ router.post('/:id/places/auto', auth, async (req, res) => {
     );
     const existingPlaces = existingRes.rows || [];
 
-    // Fetch the new location info
+    // fetch new location
     const newLocId = Number(place.fk_location);
-    const locRes = await client.query('SELECT id, titulo, latitud, longitud, relevancia, fk_interest, country, city, category FROM locations WHERE id = $1 LIMIT 1', [newLocId]);
+    const locRes = await client.query('SELECT id, titulo, latitud, longitud, relevancia, category, country, city FROM locations WHERE id = $1 LIMIT 1', [newLocId]);
     if (!locRes.rows.length) {
       return res.status(404).json({ message: 'Location (fk_location) no encontrada' });
     }
     const newLocRow = locRes.rows[0];
 
-    // Build mapping: dayIndex (0..days-1) -> array of location ids (existing)
-    const dayMap = Array.from({length: days}, () => []);
+    // map days: dayIndex -> array of existing place objects (keep tp_id for updates)
     const dateToIndex = {};
-    for (let i = 0; i < days; i++) {
-      const d = addDaysToIso(startDateIso, i);
-      dateToIndex[d] = i;
-    }
+    for (let i = 0; i < days; i++) dateToIndex[addDaysToIso(startDateIso, i)] = i;
+    const dayMap = Array.from({length: days}, () => []);
     for (const ex of existingPlaces) {
       const d = ex.date_text;
-      if (dateToIndex[d] === undefined) continue;
-      dayMap[dateToIndex[d]].push(Number(ex.loc_id));
+      const idx = dateToIndex[d];
+      if (idx === undefined) continue;
+      dayMap[idx].push({
+        tp_id: ex.tp_id,
+        loc_id: Number(ex.loc_id),
+        titulo: ex.titulo,
+        lat: ex.latitud != null ? Number(ex.latitud) : null,
+        lng: ex.longitud != null ? Number(ex.longitud) : null,
+        relevancia: ex.relevancia || 0,
+        category: ex.category || null
+      });
     }
 
-    const globalLocIdSet = new Set();
-    for (const arr of dayMap) for (const id of arr) globalLocIdSet.add(Number(id));
-    globalLocIdSet.add(Number(newLocRow.id));
-    const globalLocIds = Array.from(globalLocIdSet);
+    // For matrix computation gather unique location ids involved across all days plus new loc
+    const allLocIdSet = new Set();
+    for (const dayArr of dayMap) for (const p of dayArr) allLocIdSet.add(Number(p.loc_id));
+    allLocIdSet.add(Number(newLocRow.id));
+    const allLocIds = Array.from(allLocIdSet);
 
-    const placeholder = globalLocIds.map((_,i) => `$${i+1}`).join(',');
-    const locRowsRes = await client.query(`SELECT id, titulo, latitud, longitud, relevancia, category, country, city FROM locations WHERE id IN (${placeholder})`, globalLocIds);
-    const locRows = locRowsRes.rows || [];
-
+    // fetch location rows for matrix
+    const placeholders = allLocIds.map((_,i) => `$${i+1}`).join(',');
+    const allLocRowsRes = await client.query(
+      `SELECT id, titulo, latitud, longitud, relevancia, category FROM locations WHERE id IN (${placeholders})`,
+      allLocIds
+    );
+    const allLocRows = allLocRowsRes.rows || [];
     const locById = new Map();
-    for (const r of locRows) {
+    for (const r of allLocRows) {
       locById.set(Number(r.id), {
         id: Number(r.id),
         titulo: r.titulo,
         lat: r.latitud != null ? Number(r.latitud) : null,
         lng: r.longitud != null ? Number(r.longitud) : null,
         relevancia: r.relevancia || 0,
-        category: r.category || null,
-        country: r.country || null,
-        city: r.city || null
+        category: r.category || null
       });
     }
 
-    const locList = Array.from(locById.values());
+    // build locList and id->index mapping for matrix
+    const locList = allLocIds.map(id => locById.get(Number(id)));
     const idToIndex = new Map();
     for (let i = 0; i < locList.length; i++) idToIndex.set(String(locList[i].id), i);
-
     const n = locList.length;
-    let matrix = Array.from({length:n}, () => Array.from({length:n}, () => Number.MAX_SAFE_INTEGER/10));
 
+    // build travel matrix (minutes) between locList entries
+    let matrix = Array.from({length:n}, () => Array.from({length:n}, () => Number.MAX_SAFE_INTEGER/10));
     if (typeof routing !== 'undefined' && typeof routing.getMatrix === 'function') {
       try {
         const coords = locList.map(L => ({ id: L.id, lat: L.lat, lng: L.lng }));
@@ -1371,6 +1386,7 @@ router.post('/:id/places/auto', auth, async (req, res) => {
           }
         }
       } catch (err) {
+        // fallback to estimate
         for (let i = 0; i < n; i++) {
           for (let j = 0; j < n; j++) {
             if (i === j) { matrix[i][j] = 0; continue; }
@@ -1391,6 +1407,7 @@ router.post('/:id/places/auto', auth, async (req, res) => {
       }
     }
 
+    // helper to compute total duration of an order (array of indices into locList)
     const totalDuration = (order) => {
       if (!order || order.length <= 1) return 0;
       let sum = 0;
@@ -1402,8 +1419,8 @@ router.post('/:id/places/auto', auth, async (req, res) => {
       return sum;
     };
 
+    // compute best order for a set of locList indices
     const computeBestOrderForIndices = (indices) => {
-      if (!indices || indices.length === 0) return { order: [], cost: 0 };
       const uniq = Array.from(new Set(indices));
       if (uniq.length <= 1) return { order: uniq.slice(), cost: 0 };
 
@@ -1427,126 +1444,142 @@ router.post('/:id/places/auto', auth, async (req, res) => {
         return { order: best || uniq.slice(0,1), cost: bestCost === Infinity ? 0 : bestCost };
       }
 
+      // greedy insertion
       const pool = uniq.slice();
       pool.sort((a,b) => (locList[b].relevancia || 0) - (locList[a].relevancia || 0));
       const order = [pool.shift()];
       while (pool.length) {
         const item = pool.shift();
-        let bestPos = 0; let bestInc = Infinity; let bestTrial = null;
+        let bestPos = 0; let bestCost = Infinity;
         for (let pos = 0; pos <= order.length; pos++) {
           const trial = order.slice(0,pos).concat([item], order.slice(pos));
           const c = totalDuration(trial);
-          if (c < bestInc) { bestInc = c; bestPos = pos; bestTrial = trial.slice(); }
+          if (c < bestCost) { bestCost = c; bestPos = pos; }
         }
         order.splice(bestPos, 0, item);
       }
-      return { order: order.slice(0), cost: totalDuration(order) };
+      return { order: order.slice(), cost: totalDuration(order) };
     };
 
-    const baselinePerDayOrders = [];
-    let baselineTotal = 0;
-    for (let di = 0; di < days; di++) {
-      const ids = (dayMap[di] || []).map(id => idToIndex.get(String(id))).filter(x => x !== undefined);
-      const r = computeBestOrderForIndices(ids);
-      baselinePerDayOrders.push(r);
-      baselineTotal += r.cost;
-    }
-
+    // Evaluate insertion into each day: for each day, compute best order for that day's existing locs + new loc,
+    // but DO NOT move places between days (we only permute inside the day).
     let bestDay = 0;
-    let bestTotal = Infinity;
-    let bestPerDayOrders = null;
-
-    for (let candDay = 0; candDay < days; candDay++) {
-      const perDayOrders = [];
-      let sum = 0;
-      for (let di = 0; di < days; di++) {
-        const ids = (dayMap[di] || []).slice();
-        if (di === candDay) {
-          if (!ids.find(x => Number(x) === Number(newLocRow.id))) ids.push(Number(newLocRow.id));
-        }
-        const idxs = ids.map(id => idToIndex.get(String(id))).filter(x => x !== undefined);
-        const r = computeBestOrderForIndices(idxs);
-        perDayOrders.push(r);
-        sum += r.cost;
-      }
-      if (sum < bestTotal) {
-        bestTotal = sum;
-        bestDay = candDay;
-        bestPerDayOrders = perDayOrders;
-      }
-    }
-
-    const itineraryDays = [];
-    const mealSlots = { lunch: 13*60, merienda: 17*60, dinner: 20*60 };
+    let bestDayCost = Infinity;
+    let bestDayOrder = null;
 
     for (let di = 0; di < days; di++) {
-      const date = addDaysToIso(startDateIso, di);
-      const orderInfo = bestPerDayOrders && bestPerDayOrders[di] ? bestPerDayOrders[di] : { order: [], cost: 0 };
-      const orderIndices = orderInfo.order || [];
+      const dayExisting = dayMap[di] || [];
+      // create indices (locList indices) for this day's places
+      const dayIndices = dayExisting.map(p => idToIndex.get(String(p.loc_id))).filter(x => x !== undefined);
+      // add new loc index if not already present in this day
+      const newIdx = idToIndex.get(String(newLocRow.id));
+      if (newIdx === undefined) continue; // should not happen
+      const withNew = dayIndices.slice();
+      if (!withNew.includes(newIdx)) withNew.push(newIdx);
 
-      let currentMin = 9 * 60;
-      const scheduled = [];
-
-      for (let k = 0; k < orderIndices.length; k++) {
-        const li = orderIndices[k];
-        const placeObj = locList[li];
-        if (!placeObj) continue;
-
-        if (scheduled.length > 0) {
-          const lastLi = orderIndices[k-1];
-          const travelMin = Number.isFinite(matrix[lastLi] && matrix[lastLi][li]) ? matrix[lastLi][li] : Math.round(estimateTravelMinutes({lat: locList[lastLi].lat, lng: locList[lastLi].lng}, {lat: placeObj.lat, lng: placeObj.lng}));
-          currentMin += Math.round(travelMin) + 10;
-        }
-
-        const isG = isGastronomia(placeObj);
-        let preferredMin = null;
-        if (isG) {
-          if (Math.abs(currentMin - mealSlots.lunch) < 90) preferredMin = mealSlots.lunch;
-          else if (Math.abs(currentMin - mealSlots.merienda) < 90) preferredMin = mealSlots.merienda;
-          else if (Math.abs(currentMin - mealSlots.dinner) < 120) preferredMin = mealSlots.dinner;
-        }
-        if (preferredMin != null && preferredMin > currentMin + 20) {
-          currentMin = preferredMin - (isG ? 15 : 30);
-        }
-
-        const duration = isG ? 60 : 90;
-        const startStr = minutesToTimeStr(currentMin);
-        const endStr = minutesToTimeStr(currentMin + duration);
-
-        scheduled.push({
-          id: placeObj.id,
-          titulo: placeObj.titulo,
-          lat: Number(placeObj.lat || 0),
-          lng: Number(placeObj.lng || 0),
-          category: placeObj.category,
-          relevance: placeObj.relevancia,
-          start_hour: startStr,
-          end_hour: endStr
-        });
-
-        currentMin += duration + 15;
+      const r = computeBestOrderForIndices(withNew);
+      // cost measure is r.cost; pick minimal cost (tie-breaker earliest day)
+      if (r.cost < bestDayCost) {
+        bestDayCost = r.cost;
+        bestDay = di;
+        bestDayOrder = r.order;
       }
-
-      itineraryDays.push({ date, places: scheduled });
     }
 
+    // If for some reason none evaluated, default to first day and append
+    if (!bestDayOrder || bestDayOrder.length === 0) {
+      bestDay = 0;
+      // get existing indices for day 0 and append new
+      const dayExisting = dayMap[0] || [];
+      const dayIndices = dayExisting.map(p => idToIndex.get(String(p.loc_id))).filter(x => x !== undefined);
+      const newIdx = idToIndex.get(String(newLocRow.id));
+      const orderIndices = dayIndices.slice();
+      if (newIdx !== undefined && !orderIndices.includes(newIdx)) orderIndices.push(newIdx);
+      bestDayOrder = orderIndices;
+    }
+
+    // Build schedule for chosen day using bestDayOrder
+    const mealSlots = { lunch: 13*60, merienda: 17*60, dinner: 20*60 };
+    let currentMin = 9 * 60;
+    const scheduled = [];
+    for (let k = 0; k < bestDayOrder.length; k++) {
+      const li = bestDayOrder[k];
+      const placeObj = locList[li];
+      if (!placeObj) continue;
+      if (scheduled.length > 0) {
+        const lastLi = bestDayOrder[k-1];
+        const travelMin = Number.isFinite(matrix[lastLi] && matrix[lastLi][li]) ? matrix[lastLi][li] : Math.round(estimateTravelMinutes({lat: locList[lastLi].lat, lng: locList[lastLi].lng}, {lat: placeObj.lat, lng: placeObj.lng}));
+        currentMin += Math.round(travelMin) + 10;
+      }
+
+      const isG = isGastronomia(placeObj);
+      let preferredMin = null;
+      if (isG) {
+        if (Math.abs(currentMin - mealSlots.lunch) < 90) preferredMin = mealSlots.lunch;
+        else if (Math.abs(currentMin - mealSlots.merienda) < 90) preferredMin = mealSlots.merienda;
+        else if (Math.abs(currentMin - mealSlots.dinner) < 120) preferredMin = mealSlots.dinner;
+      }
+      if (preferredMin != null && preferredMin > currentMin + 20) {
+        currentMin = preferredMin - (isG ? 15 : 30);
+      }
+
+      const duration = isG ? 60 : 90;
+      const startStr = minutesToTimeStr(currentMin);
+      const endStr = minutesToTimeStr(currentMin + duration);
+
+      scheduled.push({
+        loc_id: placeObj.id,
+        titulo: placeObj.titulo,
+        start_hour: startStr,
+        end_hour: endStr,
+      });
+
+      currentMin += duration + 15;
+    }
+
+    // Persist only updates for the chosen day: update existing rows' times and insert the new one.
     await client.query('BEGIN');
 
-    await client.query('DELETE FROM trip_places WHERE fk_trips = $1 AND date::text >= $2 AND date::text <= $3', [tripId, startDateIso, endDateIso]);
+    const chosenDate = addDaysToIso(startDateIso, bestDay);
 
-    const insertSQL = 'INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, fk_locations, fk_trips, date, start_hour, end_hour, notes, created_at';
-    const createdRows = [];
+    // Build mapping loc_id -> tp_id for existing places on chosen day (so we can update)
+    const existingOnChosen = (existingPlaces || []).filter(ep => ep.date_text === chosenDate);
+    const locIdToTpId = new Map();
+    for (const e of existingOnChosen) locIdToTpId.set(Number(e.loc_id), e.tp_id);
 
-    for (const day of itineraryDays) {
-      for (const p of day.places) {
-        const r = await client.query(insertSQL, [p.id, tripId, day.date, p.start_hour || null, p.end_hour || null, null]);
-        createdRows.push(r.rows[0]);
+    const updatedRows = [];
+    let insertedRow = null;
+
+    // For each scheduled entry:
+    for (const s of scheduled) {
+      const locId = Number(s.loc_id);
+      const start = s.start_hour;
+      const end = s.end_hour;
+      if (locIdToTpId.has(locId)) {
+        // update existing trip_places row times
+        const tpId = locIdToTpId.get(locId);
+        const upd = await client.query('UPDATE trip_places SET start_hour = $1, end_hour = $2 WHERE id = $3 RETURNING id, fk_locations, fk_trips, date, start_hour, end_hour, notes, created_at', [start, end, tpId]);
+        if (upd.rows.length) updatedRows.push(upd.rows[0]);
+      } else {
+        // this is the new inserted place (or an existing place that previously wasn't present as a row - but that should not happen)
+        const ins = await client.query('INSERT INTO trip_places (fk_locations, fk_trips, date, start_hour, end_hour, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, fk_locations, fk_trips, date, start_hour, end_hour, notes, created_at', [locId, tripId, chosenDate, start, end, place.notes || null]);
+        if (ins.rows.length) {
+          // If multiple 'new' entries (should only be one: our newLoc), we detect which corresponds to the newLocRow.id
+          const r = ins.rows[0];
+          insertedRow = r;
+        }
       }
     }
 
     await client.query('COMMIT');
 
-    return res.status(201).json({ places: createdRows, itinerary: { trip_id: tripId, days: itineraryDays, inserted_day_index: bestDay } });
+    return res.status(201).json({
+      message: 'Place inserted and day schedule updated',
+      inserted_place: insertedRow,
+      updated_places: updatedRows,
+      chosen_date: chosenDate,
+      itinerary_day: { date: chosenDate, places: scheduled }
+    });
   } catch (err) {
     await client.query('ROLLBACK').catch(()=>{});
     console.error('POST /trips/:id/places/auto error:', err);
@@ -1555,5 +1588,6 @@ router.post('/:id/places/auto', auth, async (req, res) => {
     client.release();
   }
 });
+
 
 module.exports = router;
