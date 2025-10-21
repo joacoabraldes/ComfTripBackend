@@ -239,6 +239,8 @@ function countryMatches(candidateCountry, destCountry) {
 // ----------------------
 
 // Lower-level HF JSON caller (robust parsing + logging)
+// RETURNS: { parsed: <object>, raw: <string>, parsedFromTxt: <bool> }
+// Throws only when HF is not configured.
 async function callHfJson(prompt, timeoutMs = 5000) {
   const HF_ROUTER_URL = process.env.HF_ROUTER_URL;
   const HF_API_TOKEN = process.env.HF_API_TOKEN;
@@ -275,49 +277,63 @@ async function callHfJson(prompt, timeoutMs = 5000) {
       let data = '';
       res.on('data', (d) => (data += d));
       res.on('end', () => {
+        // Log status code for visibility
+        console.info(`HF response statusCode=${res.statusCode}`);
+        // Keep raw data for response and logs (trim if huge)
+        const rawPreview = String(data).slice(0, 5000);
         try {
-          const parsed = JSON.parse(data);
+          // try parse the top-level JSON returned by HF router
+          let parsedTop = null;
+          try { parsedTop = JSON.parse(data); } catch (e) { parsedTop = null; }
+
           let txt = null;
-          if (parsed.responses && parsed.responses.length && typeof parsed.responses[0].generated_text === 'string') {
-            txt = parsed.responses[0].generated_text;
-          } else if (parsed.output && typeof parsed.output[0] === 'string') {
-            txt = parsed.output[0];
-          } else if (parsed.generated_text && typeof parsed.generated_text === 'string') {
-            txt = parsed.generated_text;
-          } else if (typeof parsed === 'string') {
-            txt = parsed;
+          if (parsedTop && parsedTop.responses && parsedTop.responses.length && typeof parsedTop.responses[0].generated_text === 'string') {
+            txt = parsedTop.responses[0].generated_text;
+          } else if (parsedTop && parsedTop.output && typeof parsedTop.output[0] === 'string') {
+            txt = parsedTop.output[0];
+          } else if (parsedTop && parsedTop.generated_text && typeof parsedTop.generated_text === 'string') {
+            txt = parsedTop.generated_text;
+          } else if (typeof parsedTop === 'string') {
+            txt = parsedTop;
           } else {
             const maybe = data.match(/{[\s\S]*}/);
             if (maybe) txt = maybe[0];
           }
 
           if (!txt) {
-            try {
-              const j = JSON.parse(data);
-              return resolve(j);
-            } catch (e) {
-              console.error('HF returned unexpected shape and no JSON payload. Raw response start:', String(data).slice(0,200));
-              return reject(new Error('HF returned unexpected shape'));
+            // no extracted text, but maybe parsedTop is already a useful json
+            if (parsedTop && typeof parsedTop === 'object') {
+              console.info('HF: parsed top-level JSON (no nested generated_text). Returning parsedTop.');
+              return resolve({ parsed: parsedTop, raw: data, parsedFromTxt: false });
             }
+            console.error('HF returned unexpected shape and no usable JSON/text. Raw start:', rawPreview);
+            return reject(new Error('HF returned unexpected shape'));
           }
 
+          // Try parse txt as JSON
           try {
             const j2 = JSON.parse(txt);
-            return resolve(j2);
+            console.info('HF: parsed JSON from generated_text successfully.');
+            return resolve({ parsed: j2, raw: txt, parsedFromTxt: true });
           } catch (err) {
             const maybe = txt.match(/{[\s\S]*}/);
             if (maybe) {
-              try { return resolve(JSON.parse(maybe[0])); } catch (e) { console.error('HF inner JSON parse failed'); return reject(new Error('HF json parse failed')); }
+              try {
+                const j3 = JSON.parse(maybe[0]);
+                console.info('HF: parsed JSON from substring of generated_text.');
+                return resolve({ parsed: j3, raw: txt, parsedFromTxt: true });
+              } catch (e) {
+                console.error('HF inner JSON parse failed; returning raw generated_text in parsed=false state. Preview:', String(txt).slice(0,500));
+                // return something usable to caller indicating parse failed
+                return resolve({ parsed: null, raw: txt, parsedFromTxt: false });
+              }
             }
-            console.error('HF output not JSON. Output preview:', String(txt).slice(0,200));
-            return reject(new Error('HF output not JSON'));
+            console.error('HF output not JSON. Output preview:', String(txt).slice(0,500));
+            return resolve({ parsed: null, raw: txt, parsedFromTxt: false });
           }
         } catch (err) {
-          const maybe = data.match(/{[\s\S]*}/);
-          if (maybe) {
-            try { return resolve(JSON.parse(maybe[0])); } catch (e) { console.error('HF parse fallback failed'); return reject(new Error('HF parse fallback failed')); }
-          }
-          console.error('HF call error parsing response:', err.message);
+          const rawPreview2 = String(data).slice(0,500);
+          console.error('HF call error parsing response:', err && err.message, 'rawPreview:', rawPreview2);
           return reject(err);
         }
       });
@@ -366,17 +382,27 @@ function heuristicAiSuggestions(destCountry, destCity, pace) {
 async function getAiSuggestions(destCountry, destCity, pace) {
   const prompt = `Generate short location keywords for destination country="${destCountry}" city="${destCity}" pace="${pace}". Return only JSON as described.`;
   try {
-    const j = await callHfJson(prompt, 4000);
+    console.info('getAiSuggestions: calling HF router...');
+    const hfRes = await callHfJson(prompt, 4000);
+    // hfRes: { parsed, raw, parsedFromTxt }
+    console.info('getAiSuggestions: HF raw preview:', String(hfRes.raw).slice(0,500));
+    let j = hfRes.parsed;
+    if (!j) {
+      console.warn('getAiSuggestions: HF did not return parsed JSON; falling back to heuristic.');
+      const heur = heuristicAiSuggestions(destCountry, destCity, pace);
+      return { ...heur, source: 'heuristic', hf_raw: hfRes.raw, hf_parse_ok: false };
+    }
     const prefer_titles = Array.isArray(j.prefer_titles) ? j.prefer_titles.map(x => String(x).trim()).filter(Boolean).slice(0,6) : [];
     const prefer_interests = Array.isArray(j.prefer_interests) ? j.prefer_interests.map(x => String(x).trim()).filter(Boolean).slice(0,6) : [];
     if (prefer_titles.length || prefer_interests.length) {
-      return { prefer_titles, prefer_interests, source: 'hf' };
+      console.info('getAiSuggestions: HF parse ok, returning HF suggestions.');
+      return { prefer_titles, prefer_interests, source: 'hf', hf_raw: hfRes.raw, hf_parse_ok: true };
     }
-    // if HF responded but no useful payload, fallback heuristic
-    return { ...heuristicAiSuggestions(destCountry, destCity, pace), source: 'heuristic' };
+    console.warn('getAiSuggestions: HF parsed but no useful fields, falling back to heuristic.');
+    return { ...heuristicAiSuggestions(destCountry, destCity, pace), source: 'heuristic', hf_raw: hfRes.raw, hf_parse_ok: false };
   } catch (err) {
     console.warn('getAiSuggestions: HF failed, using heuristic. Error:', err && err.message);
-    return { ...heuristicAiSuggestions(destCountry, destCity, pace), source: 'heuristic' };
+    return { ...heuristicAiSuggestions(destCountry, destCity, pace), source: 'heuristic', hf_raw: null, hf_parse_ok: false, hf_error: err && err.message };
   }
 }
 
@@ -402,8 +428,13 @@ Responde únicamente con el JSON.`;
 
   try {
     console.info('parseUserNotesWithAi: calling HF to extract constraints (notes present)');
-    const j = await callHfJson(prompt, 4500);
-    // Ensure shape
+    const hfRes = await callHfJson(prompt, 4500);
+    console.info('parseUserNotesWithAi: HF raw preview:', String(hfRes.raw).slice(0,600));
+    const j = hfRes.parsed;
+    if (!j) {
+      console.warn('parseUserNotesWithAi: HF did not return parsed JSON; will fallback to regex heuristic.');
+      return { use_ai: false, pace_override: null, must_visit: [], day_paces: {}, place_on_day: [], prefer_titles: [], prefer_interests: [], hf_raw: hfRes.raw, hf_parse_ok: false };
+    }
     const out = {
       use_ai: j.use_ai === true,
       pace_override: j.pace_override || null,
@@ -411,7 +442,9 @@ Responde únicamente con el JSON.`;
       day_paces: (j.day_paces && typeof j.day_paces === 'object') ? j.day_paces : {},
       place_on_day: Array.isArray(j.place_on_day) ? j.place_on_day.filter(x => x && (x.place || x.day)) : [],
       prefer_titles: Array.isArray(j.prefer_titles) ? j.prefer_titles.map(String).slice(0,6) : [],
-      prefer_interests: Array.isArray(j.prefer_interests) ? j.prefer_interests.map(String).slice(0,6) : []
+      prefer_interests: Array.isArray(j.prefer_interests) ? j.prefer_interests.map(String).slice(0,6) : [],
+      hf_raw: hfRes.raw,
+      hf_parse_ok: true
     };
     console.info('parseUserNotesWithAi: extracted constraints:', { use_ai: out.use_ai, must_visit_count: out.must_visit.length, place_on_day_count: out.place_on_day.length });
     return out;
@@ -419,7 +452,7 @@ Responde únicamente con el JSON.`;
     console.warn('parseUserNotesWithAi: HF extraction failed, falling back to light regex parsing. Error:', err && err.message);
     // Light heuristic parsing: detect "1er dia relajado" and "visitar X dia N" patterns
     const text = String(notes).toLowerCase();
-    const res = { use_ai: false, pace_override: null, must_visit: [], day_paces: {}, place_on_day: [], prefer_titles: [], prefer_interests: [] };
+    const res = { use_ai: false, pace_override: null, must_visit: [], day_paces: {}, place_on_day: [], prefer_titles: [], prefer_interests: [], hf_raw: null, hf_parse_ok: false };
     if (text.match(/1(er|ro)? dia.*relaj/)) res.day_paces['1'] = 'relajado';
     if (text.match(/primer dia.*relaj/)) res.day_paces['1'] = 'relajado';
     if (text.match(/ultimo dia.*intens/)) res.day_paces['last'] = 'intenso';
@@ -473,9 +506,10 @@ async function handleItinerary(req, res) {
     if (String(notes).trim()) {
       try {
         notesConstraints = await parseUserNotesWithAi(notes);
+        console.info('handleItinerary: notesConstraints loaded, hf_parse_ok=', !!notesConstraints.hf_parse_ok);
       } catch (e) {
         console.warn('handleItinerary: parseUserNotesWithAi failed, continuing with defaults. Error:', e && e.message);
-        notesConstraints = { use_ai: false };
+        notesConstraints = { use_ai: false, hf_parse_ok: false };
       }
     }
 
@@ -492,17 +526,17 @@ async function handleItinerary(req, res) {
         if (notesConstraints.prefer_interests && notesConstraints.prefer_interests.length) ai.prefer_interests = Array.from(new Set([...(ai.prefer_interests||[]), ...notesConstraints.prefer_interests])).slice(0,6);
       } catch (err) {
         console.warn('AI suggestions failed, falling back to heuristic suggestions. Error:', err && err.message);
-        ai = { ...heuristicAiSuggestions(null, null, pace), source: 'heuristic' };
+        ai = { ...heuristicAiSuggestions(null, null, pace), source: 'heuristic', hf_raw: null, hf_parse_ok: false, hf_error: err && err.message };
       }
     } else if (String(notes).trim() && !notesConstraints.use_ai) {
       // notes present but user didn't request AI — use heuristic but include extracted must_visit/day constraints
-      ai = { ...heuristicAiSuggestions(null, null, pace), source: 'heuristic' };
+      ai = { ...heuristicAiSuggestions(null, null, pace), source: 'heuristic', hf_raw: notesConstraints.hf_raw || null, hf_parse_ok: !!notesConstraints.hf_parse_ok };
     } else {
       // no notes: use normal AI suggestions based on destination and pace (but fallback to heuristic inside function)
       ai = await getAiSuggestions(null, null, pace);
     }
 
-    console.info('AI suggestions source:', ai && ai.source);
+    console.info('AI suggestions source:', ai && ai.source, 'hf_parse_ok=', !!ai.hf_parse_ok);
 
     // apply pace overrides from notesConstraints
     if (notesConstraints && notesConstraints.pace_override) {
@@ -894,7 +928,16 @@ async function handleItinerary(req, res) {
     }
 
     // Add AI metadata to itinerary so tests / clients can assert AI was used
-    const itinerary = { trip_id: tripId, pace, days: itineraryDays, generated_at: new Date().toISOString(), ai: { source: ai.source || 'heuristic', suggestions: { prefer_titles: ai.prefer_titles || [], prefer_interests: ai.prefer_interests || [] }, notes_constraints: notesConstraints } };
+    const itinerary = { trip_id: tripId, pace, days: itineraryDays, generated_at: new Date().toISOString(),
+      ai: {
+        source: ai.source || 'heuristic',
+        suggestions: { prefer_titles: ai.prefer_titles || [], prefer_interests: ai.prefer_interests || [] },
+        hf_raw: ai.hf_raw || null,
+        hf_parse_ok: !!ai.hf_parse_ok,
+        hf_error: ai.hf_error || null,
+        notes_constraints: notesConstraints
+      }
+    };
 
     // Save generation record and optionally persist places
     await client.query('BEGIN');
@@ -931,6 +974,7 @@ async function handleItinerary(req, res) {
 
     await client.query('COMMIT');
 
+    // return itinerary including hf_raw & parse flags so client / logs can inspect
     return res.status(201).json({ generation_id: genId, itinerary, saved_places: save ? savedPlaces : undefined });
   } catch (err) {
     await client.query('ROLLBACK').catch(()=>{});
@@ -940,6 +984,151 @@ async function handleItinerary(req, res) {
     client.release();
   }
 }
+
+/**
+ * GET /trips/:id/itinerary
+ * Returns the last generated itinerary for the trip (owner only).
+ */
+async function getLastItinerary(req, res) {
+  try {
+    const tripId = Number(req.params.id);
+    const userId = req.user.id;
+    if (!Number.isFinite(tripId) || tripId <= 0) return res.status(400).json({ message: 'Invalid trip id' });
+
+    const tripRes = await pool.query('SELECT user_id FROM trips WHERE id = $1 LIMIT 1', [tripId]);
+    if (!tripRes.rows.length) return res.status(404).json({ message: 'Trip no encontrado' });
+    if (tripRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
+
+    const r = await pool.query('SELECT id, trip_id, user_id, status, generated_json, created_at, finished_at FROM itinerary_generations WHERE trip_id = $1 ORDER BY created_at DESC LIMIT 1', [tripId]);
+    if (!r.rows.length) return res.status(404).json({ message: 'No hay generaciones' });
+    return res.json(r.rows[0]);
+  } catch (err) {
+    console.error('GET /trips/:id/itinerary error:', err);
+    res.status(500).json({ message: 'Error' });
+  }
+}
+
+// Wire itinerary routes
+router.post('/:id/itinerary', auth, handleItinerary);
+router.get('/:id/itinerary', auth, getLastItinerary);
+
+// ----------------------
+// The rest of the original file's endpoints (share, list trips, create trip, get trip, update, delete, places, auto-insert)
+// are included below without changes to their logic (except minor formatting).
+// ----------------------
+
+// SHARE
+router.post('/:id/share', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const tripId = Number(req.params.id);
+    const userId = req.user.id;
+    if (!Number.isFinite(tripId) || tripId <= 0) return res.status(400).json({ message: 'Invalid trip id' });
+
+    const { mode = 'viewer', public: isPublic = false, shared_with_user_id, expires_in_days } = req.body || {};
+
+    const ownerRes = await pool.query('SELECT user_id FROM trips WHERE id = $1', [tripId]);
+    if (!ownerRes.rows.length) return res.status(404).json({ message: 'Trip no encontrado' });
+    if (ownerRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
+
+    if (!['viewer','editor'].includes(mode)) return res.status(400).json({ message: 'Invalid mode' });
+
+    let sharedWith = null;
+    if (shared_with_user_id) {
+      const other = await pool.query('SELECT id FROM users WHERE id = $1 LIMIT 1', [Number(shared_with_user_id)]);
+      if (!other.rows.length) return res.status(404).json({ message: 'Usuario compartido no encontrado' });
+      sharedWith = Number(shared_with_user_id);
+      if (sharedWith === userId) {
+        return res.status(400).json({ message: 'No puedes compartir un viaje contigo mismo (usa público si quieres)' });
+      }
+    }
+
+    let expiresAt = null;
+    if (expires_in_days && Number.isFinite(Number(expires_in_days)) && Number(expires_in_days) > 0) {
+      const days = Number(expires_in_days);
+      expiresAt = new Date(Date.now() + days * 24 * 3600 * 1000);
+    }
+
+    await client.query('BEGIN');
+    const insertSQL = `INSERT INTO trip_shares (trip_id, shared_by, shared_with, mode, public, expires_at)
+                       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, trip_id, shared_by, shared_with, mode, public, share_uuid, expires_at, created_at`;
+    const values = [tripId, userId, sharedWith, mode, !!isPublic, expiresAt];
+    const r = await client.query(insertSQL, values);
+    await client.query('COMMIT');
+
+    const shareRow = r.rows[0];
+    const base = `${req.protocol}://${req.get('host')}`;
+    const url = `${base}/api/share/trip/${shareRow.share_uuid}`;
+
+    return res.status(201).json({ url, share: shareRow });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(()=>{});
+    console.error('POST /trips/:id/share error:', err);
+    return res.status(500).json({ message: 'Error creating share' });
+  } finally {
+    client.release();
+  }
+});
+
+/* GET / (list trips) */
+router.get('/', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const sql = `
+      SELECT
+        t.id, t.user_id, t.destination, t.start_date, t.end_date, t.budget, t.notes, t.created_at,
+        COALESCE(tp.places, '[]') AS places,
+        ts.id AS share_id,
+        ts.shared_by AS share_shared_by,
+        ts.shared_with AS share_shared_with,
+        ts.mode AS share_mode,
+        ts.public AS share_public,
+        ts.share_uuid AS share_uuid,
+        ts.expires_at AS share_expires_at
+      FROM trips t
+      LEFT JOIN (
+        ${PLACES_AGG_SUBQUERY}
+      ) tp ON tp.fk_trips = t.id
+      LEFT JOIN LATERAL (
+        SELECT * FROM trip_shares
+        WHERE trip_id = t.id
+          AND (shared_with = $1 OR public = true)
+          AND (expires_at IS NULL OR expires_at > now())
+        ORDER BY (shared_with = $1) DESC, created_at DESC
+        LIMIT 1
+      ) ts ON true
+      WHERE t.user_id = $1 OR ts.id IS NOT NULL
+      ORDER BY t.start_date DESC
+    `;
+
+    const result = await pool.query(sql, [userId]);
+    const trips = result.rows.map((r) => {
+      const trip = normalizeTripRow(r);
+      trip.places = r.places || [];
+      if (r.share_id) {
+        trip.share = {
+          id: r.share_id,
+          shared_by: r.share_shared_by,
+          shared_with: r.share_shared_with,
+          mode: r.share_mode,
+          public: r.share_public,
+          share_uuid: r.share_uuid,
+          expires_at: r.share_expires_at
+        };
+      } else {
+        trip.share = null;
+      }
+      return trip;
+    });
+
+    res.json(trips);
+  } catch (err) {
+    console.error('GET /trips error:', err);
+    res.status(500).json({ message: 'Error' });
+  }
+});
+
 
 /**
  * GET /trips/:id/itinerary
