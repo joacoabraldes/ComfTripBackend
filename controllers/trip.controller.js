@@ -172,7 +172,7 @@ function estimateTravelMinutes(a, b, mode = 'fast') {
   return (km / speedKmh) * 60; // minutes
 }
 
-// Format time (HH:MM:SS) given start minutes from midnight
+// Format time (HH:MM:SS) given start minutes from midnightt
 function minutesToTimeStr(mins) {
   const h = Math.floor(mins / 60);
   const m = Math.round(mins % 60);
