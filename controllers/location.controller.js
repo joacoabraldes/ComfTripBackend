@@ -12,7 +12,7 @@ const router = express.Router();
 function normalizeRow(r) {
   return {
     id: r.id,
-    title: r.titulo || null,
+    title: r.titulo || null, 
     interest: r.fk_interest || null,
     description: r.descripcion || null,
     latitude: r.latitud !== null && r.latitud !== undefined ? Number(r.latitud) : null,
