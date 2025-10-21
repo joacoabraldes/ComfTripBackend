@@ -238,32 +238,25 @@ function countryMatches(candidateCountry, destCountry) {
 // AI integration helpers (HF router + heuristic fallback)
 // ----------------------
 
-// Try to call HuggingFace router/chat endpoint. If unavailable or fails, we fallback to a heuristic generator.
-async function callHfRouter(prompt, timeoutMs = 5000) {
+// Lower-level HF JSON caller (robust parsing + logging)
+async function callHfJson(prompt, timeoutMs = 5000) {
   const HF_ROUTER_URL = process.env.HF_ROUTER_URL;
   const HF_API_TOKEN = process.env.HF_API_TOKEN;
   const HF_MODEL = process.env.HF_MODEL;
 
-  if (!HF_ROUTER_URL || !HF_API_TOKEN || !HF_MODEL) throw new Error('HF not configured');
+  if (!HF_ROUTER_URL || !HF_API_TOKEN || !HF_MODEL) {
+    console.warn('HF not configured (missing ROUTER_URL/API_TOKEN/MODEL). Skipping HF call.');
+    throw new Error('HF not configured');
+  }
 
   const body = JSON.stringify({
     model: HF_MODEL,
     input: [
-      {
-        role: "user",
-        content: `You are a helpful assistant that returns ONLY valid JSON (no explanations).
-Return a JSON object with keys:
-{
-  "prefer_titles": ["short phrases to prioritize in location titles (max 6)"],
-  "prefer_interests": ["interest slugs or keywords (max 6)"]
-}
-Given this user prompt: ${prompt}
-Make values short, lowercase when possible.`
-      }
+      { role: 'user', content: prompt }
     ]
   });
 
-  const url = new URL(process.env.HF_ROUTER_URL);
+  const url = new URL(HF_ROUTER_URL);
 
   const options = {
     method: 'POST',
@@ -272,7 +265,7 @@ Make values short, lowercase when possible.`
     port: url.port || (url.protocol === 'https:' ? 443 : 80),
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${process.env.HF_API_TOKEN}`
+      'Authorization': `Bearer ${HF_API_TOKEN}`
     },
     timeout: timeoutMs
   };
@@ -303,6 +296,7 @@ Make values short, lowercase when possible.`
               const j = JSON.parse(data);
               return resolve(j);
             } catch (e) {
+              console.error('HF returned unexpected shape and no JSON payload. Raw response start:', String(data).slice(0,200));
               return reject(new Error('HF returned unexpected shape'));
             }
           }
@@ -313,22 +307,27 @@ Make values short, lowercase when possible.`
           } catch (err) {
             const maybe = txt.match(/{[\s\S]*}/);
             if (maybe) {
-              try { return resolve(JSON.parse(maybe[0])); } catch (e) { return reject(new Error('HF json parse failed')); }
+              try { return resolve(JSON.parse(maybe[0])); } catch (e) { console.error('HF inner JSON parse failed'); return reject(new Error('HF json parse failed')); }
             }
+            console.error('HF output not JSON. Output preview:', String(txt).slice(0,200));
             return reject(new Error('HF output not JSON'));
           }
         } catch (err) {
           const maybe = data.match(/{[\s\S]*}/);
           if (maybe) {
-            try { return resolve(JSON.parse(maybe[0])); } catch (e) { return reject(new Error('HF parse fallback failed')); }
+            try { return resolve(JSON.parse(maybe[0])); } catch (e) { console.error('HF parse fallback failed'); return reject(new Error('HF parse fallback failed')); }
           }
+          console.error('HF call error parsing response:', err.message);
           return reject(err);
         }
       });
     });
 
-    req.on('error', (err) => reject(err));
-    req.on('timeout', () => { req.destroy(); reject(new Error('HF request timeout')); });
+    req.on('error', (err) => {
+      console.error('HF request error:', err && err.message);
+      reject(err);
+    });
+    req.on('timeout', () => { req.destroy(); console.error('HF request timeout'); reject(new Error('HF request timeout')); });
     req.write(body);
     req.end();
   });
@@ -367,7 +366,7 @@ function heuristicAiSuggestions(destCountry, destCity, pace) {
 async function getAiSuggestions(destCountry, destCity, pace) {
   const prompt = `Generate short location keywords for destination country="${destCountry}" city="${destCity}" pace="${pace}". Return only JSON as described.`;
   try {
-    const j = await callHfRouter(prompt, 4000);
+    const j = await callHfJson(prompt, 4000);
     const prefer_titles = Array.isArray(j.prefer_titles) ? j.prefer_titles.map(x => String(x).trim()).filter(Boolean).slice(0,6) : [];
     const prefer_interests = Array.isArray(j.prefer_interests) ? j.prefer_interests.map(x => String(x).trim()).filter(Boolean).slice(0,6) : [];
     if (prefer_titles.length || prefer_interests.length) {
@@ -376,8 +375,72 @@ async function getAiSuggestions(destCountry, destCity, pace) {
     // if HF responded but no useful payload, fallback heuristic
     return { ...heuristicAiSuggestions(destCountry, destCity, pace), source: 'heuristic' };
   } catch (err) {
-    // HF not configured or failed -> heuristic fallback
+    console.warn('getAiSuggestions: HF failed, using heuristic. Error:', err && err.message);
     return { ...heuristicAiSuggestions(destCountry, destCity, pace), source: 'heuristic' };
+  }
+}
+
+// Parse free-text user notes into structured constraints using HF (when notes present)
+// Returns a structure with fields: use_ai (bool), pace_override (string|null), must_visit (array strings), day_paces (object day->pace), place_on_day (array {place, day}), prefer_titles, prefer_interests
+async function parseUserNotesWithAi(notes) {
+  if (!notes || !String(notes).trim()) return { use_ai: false };
+  const prompt = `Eres un asistente que extrae instrucciones de viaje desde texto libre en español. Devuelve SOLO JSON válido con estas claves (puedes dejar valores vacíos o null):
+{
+  "use_ai": true|false,
+  "pace_override": "relajado|medio|intenso|null",
+  "must_visit": ["nombre lugar 1", "nombre lugar 2"],
+  "day_paces": {"1":"relajado","2":"intenso"},
+  "place_on_day": [{"place":"Museo X","day":2}],
+  "prefer_titles": ["short","phrases"],
+  "prefer_interests": ["museums","historic"]
+}
+Analiza este texto del usuario y extrae instrucciones concretas como "quiero que el 1er dia sea mas relajado", "visitar Museo Nacional el dia 2", "primero dia relajado", "quiero que el último día sea intenso", etc. El texto a analizar es:
+"""
+${notes}
+"""
+Responde únicamente con el JSON.`;
+
+  try {
+    console.info('parseUserNotesWithAi: calling HF to extract constraints (notes present)');
+    const j = await callHfJson(prompt, 4500);
+    // Ensure shape
+    const out = {
+      use_ai: j.use_ai === true,
+      pace_override: j.pace_override || null,
+      must_visit: Array.isArray(j.must_visit) ? j.must_visit.map(String).filter(Boolean) : [],
+      day_paces: (j.day_paces && typeof j.day_paces === 'object') ? j.day_paces : {},
+      place_on_day: Array.isArray(j.place_on_day) ? j.place_on_day.filter(x => x && (x.place || x.day)) : [],
+      prefer_titles: Array.isArray(j.prefer_titles) ? j.prefer_titles.map(String).slice(0,6) : [],
+      prefer_interests: Array.isArray(j.prefer_interests) ? j.prefer_interests.map(String).slice(0,6) : []
+    };
+    console.info('parseUserNotesWithAi: extracted constraints:', { use_ai: out.use_ai, must_visit_count: out.must_visit.length, place_on_day_count: out.place_on_day.length });
+    return out;
+  } catch (err) {
+    console.warn('parseUserNotesWithAi: HF extraction failed, falling back to light regex parsing. Error:', err && err.message);
+    // Light heuristic parsing: detect "1er dia relajado" and "visitar X dia N" patterns
+    const text = String(notes).toLowerCase();
+    const res = { use_ai: false, pace_override: null, must_visit: [], day_paces: {}, place_on_day: [], prefer_titles: [], prefer_interests: [] };
+    if (text.match(/1(er|ro)? dia.*relaj/)) res.day_paces['1'] = 'relajado';
+    if (text.match(/primer dia.*relaj/)) res.day_paces['1'] = 'relajado';
+    if (text.match(/ultimo dia.*intens/)) res.day_paces['last'] = 'intenso';
+    // pattern: "visitar X el dia 2" or "el dia 2 visitar X" - crude
+    const visitPattern = /visitar\s+([\w\s\-\'\.,]+?)\s*(?:el\s+dia|día)?\s*(\d+)/g;
+    let m;
+    while ((m = visitPattern.exec(text)) !== null) {
+      const place = (m[1] || '').trim();
+      const day = Number(m[2]);
+      if (place) res.place_on_day.push({ place, day });
+      else res.must_visit.push(place);
+    }
+    // fallback: detect "visitar Museo Nacional" general mention
+    const simpleVisit = /visitar\s+([\w\s\-\'\.,]+)/g;
+    while ((m = simpleVisit.exec(text)) !== null) {
+      const place = (m[1] || '').trim();
+      if (place && !res.must_visit.includes(place)) res.must_visit.push(place);
+    }
+
+    console.info('parseUserNotesWithAi: regex fallback produced', res);
+    return res;
   }
 }
 
@@ -394,15 +457,59 @@ async function handleItinerary(req, res) {
 
     const body = req.body || {};
     const paceRaw = body.pace || 'relajado';
-    const pace = normalizePace(paceRaw);
+    let pace = normalizePace(paceRaw);
     const save = !!body.save;
     const mandatoryPlaceNames = Array.isArray(body.places) ? body.places.map(String).filter(Boolean) : [];
 
     // fetch trip and ownership
-    const tripRes = await client.query('SELECT id, user_id, destination, start_date, end_date FROM trips WHERE id = $1 LIMIT 1', [tripId]);
+    const tripRes = await client.query('SELECT id, user_id, destination, start_date, end_date, notes FROM trips WHERE id = $1 LIMIT 1', [tripId]);
     if (!tripRes.rows.length) return res.status(404).json({ message: 'Trip no encontrado' });
     const trip = tripRes.rows[0];
     if (trip.user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
+
+    // If user notes exist, parse them (either via HF or light heuristic)
+    const notes = trip.notes || '';
+    let notesConstraints = { use_ai: false };
+    if (String(notes).trim()) {
+      try {
+        notesConstraints = await parseUserNotesWithAi(notes);
+      } catch (e) {
+        console.warn('handleItinerary: parseUserNotesWithAi failed, continuing with defaults. Error:', e && e.message);
+        notesConstraints = { use_ai: false };
+      }
+    }
+
+    // If notes explicitly request AI usage, we'll call the HF to get prefer lists; otherwise, if notes empty, prefer heuristic
+    let ai = null;
+    if (String(notes).trim() && notesConstraints.use_ai) {
+      console.info('User provided notes and requested AI — calling getAiSuggestions using notes hints');
+      // merge notes prefer_* with general suggestions
+      try {
+        const aiBase = await getAiSuggestions(null, null, pace);
+        ai = { ...aiBase };
+        // allow notes to inject prefer_titles/interests if present
+        if (notesConstraints.prefer_titles && notesConstraints.prefer_titles.length) ai.prefer_titles = Array.from(new Set([...(ai.prefer_titles||[]), ...notesConstraints.prefer_titles])).slice(0,6);
+        if (notesConstraints.prefer_interests && notesConstraints.prefer_interests.length) ai.prefer_interests = Array.from(new Set([...(ai.prefer_interests||[]), ...notesConstraints.prefer_interests])).slice(0,6);
+      } catch (err) {
+        console.warn('AI suggestions failed, falling back to heuristic suggestions. Error:', err && err.message);
+        ai = { ...heuristicAiSuggestions(null, null, pace), source: 'heuristic' };
+      }
+    } else if (String(notes).trim() && !notesConstraints.use_ai) {
+      // notes present but user didn't request AI — use heuristic but include extracted must_visit/day constraints
+      ai = { ...heuristicAiSuggestions(null, null, pace), source: 'heuristic' };
+    } else {
+      // no notes: use normal AI suggestions based on destination and pace (but fallback to heuristic inside function)
+      ai = await getAiSuggestions(null, null, pace);
+    }
+
+    console.info('AI suggestions source:', ai && ai.source);
+
+    // apply pace overrides from notesConstraints
+    if (notesConstraints && notesConstraints.pace_override) {
+      const pnorm = normalizePace(notesConstraints.pace_override);
+      console.info(`Notes override: global pace changed from ${pace} -> ${pnorm}`);
+      pace = pnorm;
+    }
 
     // determine inclusive date range
     const startDate = trip.start_date ? trip.start_date.toISOString().slice(0,10) : (new Date()).toISOString().slice(0,10);
@@ -411,8 +518,27 @@ async function handleItinerary(req, res) {
     const endD = new Date(endDate + 'T00:00:00Z');
     const days = Math.max(1, Math.round((endD - startD) / (24*3600*1000)) + 1);
 
-    const perDay = PACE_MAP[pace] || PACE_MAP['relajado'];
-    const totalNeeded = perDay * days;
+    // Build per-day slots default array (we may override per-day later)
+    const defaultPerDay = PACE_MAP[pace] || PACE_MAP['relajado'];
+    const perDayArray = Array.from({ length: days }, () => defaultPerDay);
+    if (notesConstraints && notesConstraints.day_paces) {
+      for (const k of Object.keys(notesConstraints.day_paces)) {
+        if (k === 'last') {
+          const val = normalizePace(notesConstraints.day_paces[k]);
+          perDayArray[days-1] = PACE_MAP[val] || perDayArray[days-1];
+        } else {
+          const dayIdx = Number(k) - 1;
+          if (Number.isFinite(dayIdx) && dayIdx >= 0 && dayIdx < days) {
+            const val = normalizePace(notesConstraints.day_paces[k]);
+            perDayArray[dayIdx] = PACE_MAP[val] || perDayArray[dayIdx];
+            console.info(`Notes: overriding day ${dayIdx+1} pace -> ${val}`);
+          }
+        }
+      }
+    }
+
+    // totalNeeded is now the sum of perDayArray
+    const totalNeeded = perDayArray.reduce((s,v)=>s+v,0);
 
     // Fetch user interests
     const uiRes = await client.query(
@@ -429,10 +555,16 @@ async function handleItinerary(req, res) {
     const destCity = destCityRaw ? destCityRaw.toString() : null;
     const destCountry = destCountryRaw ? destCountryRaw.toString() : null;
 
+    // Merge mandatory place names from body + notesConstraints
+    const combinedMandatoryNames = [...mandatoryPlaceNames];
+    if (notesConstraints && Array.isArray(notesConstraints.must_visit)) {
+      for (const m of notesConstraints.must_visit) if (m && !combinedMandatoryNames.includes(m)) combinedMandatoryNames.push(m);
+    }
+
     // Validate mandatory places: only accept as satisfied if they exist inside destination country (if country provided)
-    if (destCountry && mandatoryPlaceNames.length) {
+    if (destCountry && combinedMandatoryNames.length) {
       const missing = [];
-      for (const name of mandatoryPlaceNames) {
+      for (const name of combinedMandatoryNames) {
         const r = await client.query('SELECT id, country FROM locations WHERE titulo ILIKE $1 LIMIT 1', [`%${name}%`]);
         if (!r.rows.length) { missing.push(name); continue; }
         const foundCountry = r.rows[0].country;
@@ -443,11 +575,7 @@ async function handleItinerary(req, res) {
       }
     }
 
-    // --- Get AI suggestions (explicit source returned) ---
-    const ai = await getAiSuggestions(destCountry, destCity, pace);
-    console.info('AI source:', ai && ai.source ? ai.source : 'unknown');
-
-    // Build candidate query: **STRICT** behavior when destCountry present: only fetch locations in that country
+    // --- Build candidate query: **STRICT** behavior when destCountry present: only fetch locations in that country ---
     let candidateSQL = `SELECT id, titulo, latitud, longitud, relevancia, fk_interest, country, city, category FROM locations`;
     const queryValues = [];
     let idx = 1;
@@ -522,7 +650,7 @@ async function handleItinerary(req, res) {
     }
 
     // Ensure mandatory (if any) are included in the candidate pool (they were validated earlier when country provided)
-    for (const name of mandatoryPlaceNames) {
+    for (const name of combinedMandatoryNames) {
       const exists = candidates.find(c => c.titulo && c.titulo.toString().toLowerCase().includes(name.toLowerCase()));
       if (!exists) {
         // If there is still a chance (no country specified), try to fetch specific mandatory and add it
@@ -592,10 +720,30 @@ async function handleItinerary(req, res) {
 
     // Assign mandatory locations to nearest cluster/day (if any)
     const mandatoryById = new Map();
-    for (const name of mandatoryPlaceNames) {
+    for (const name of combinedMandatoryNames) {
       const found = candidates.find(c => c.titulo && c.titulo.toString().toLowerCase().includes(name.toLowerCase()));
       if (found) mandatoryById.set(String(found.id), found);
     }
+
+    // If notes had specific "place_on_day" constraints, try to place them directly
+    if (notesConstraints && Array.isArray(notesConstraints.place_on_day) && notesConstraints.place_on_day.length) {
+      for (const pod of notesConstraints.place_on_day) {
+        const placeName = (pod.place || '').toString().trim();
+        const dayNum = Number(pod.day);
+        if (!placeName || !Number.isFinite(dayNum)) continue;
+        const found = candidates.find(c => c.titulo && c.titulo.toString().toLowerCase().includes(placeName.toLowerCase()));
+        if (found) {
+          const di = Math.max(0, Math.min(days-1, dayNum-1));
+          perDayCandidates[di].push(found);
+          mandatoryById.set(String(found.id), found);
+          console.info(`Notes: placing mandatory "${found.titulo}" on day ${di+1}`);
+        } else {
+          console.warn(`Notes requested place "${placeName}" on day ${dayNum} but it was not found in candidates.`);
+        }
+      }
+    }
+
+    // Assign other mandatory places by proximity/clusters
     for (const [mid, mloc] of mandatoryById.entries()) {
       if (!mloc || mloc.latitud == null || mloc.longitud == null) { perDayCandidates[0].push(mloc); continue; }
       let bestCluster = 0; let bestD = Infinity;
@@ -612,6 +760,7 @@ async function handleItinerary(req, res) {
 
     // Fill each day from its cluster, preferring relevancia and local matches
     for (let di = 0; di < days; di++) {
+      // If clusterOrder doesn't have enough entries, fallback to 0
       const clusterIdx = clusterOrder[di] ?? clusterOrder[0] ?? 0;
       const pool = (clusterCandidates[clusterIdx] || []).slice();
 
@@ -625,7 +774,7 @@ async function handleItinerary(req, res) {
       for (const c of pool) {
         if (perDayCandidates[di].find(x => x && String(x.id) === String(c.id))) continue;
         perDayCandidates[di].push(c);
-        if (perDayCandidates[di].length >= perDay * 3) break;
+        if (perDayCandidates[di].length >= (perDayArray[di] * 3)) break;
       }
     }
 
@@ -662,11 +811,11 @@ async function handleItinerary(req, res) {
         if (!m) continue;
         dayPlaces.push(m);
         usedIds.add(String(m.id));
-        if (dayPlaces.length >= perDay) break;
+        if (dayPlaces.length >= perDayArray[di]) break;
       }
 
       for (const nm of nonMandatory) {
-        if (dayPlaces.length >= perDay) break;
+        if (dayPlaces.length >= perDayArray[di]) break;
         if (!nm) continue;
         if (usedIds.has(String(nm.id))) continue;
         dayPlaces.push(nm);
@@ -676,7 +825,7 @@ async function handleItinerary(req, res) {
       const ensureMealPlace = (mealPlace) => {
         if (!mealPlace) return null;
         if (dayPlaces.find(p => String(p.id) === String(mealPlace.id))) return null;
-        if (dayPlaces.length < perDay) {
+        if (dayPlaces.length < perDayArray[di]) {
           dayPlaces.splice(Math.floor(dayPlaces.length/2), 0, mealPlace);
         } else {
           let replaced = false;
@@ -698,7 +847,7 @@ async function handleItinerary(req, res) {
       ensureMealPlace(meriendaPlace);
       ensureMealPlace(dinnerPlace);
 
-      const finalPlaces = dayPlaces.slice(0, perDay);
+      const finalPlaces = dayPlaces.slice(0, perDayArray[di]);
 
       let currentMin = 9 * 60;
       const scheduled = [];
@@ -737,24 +886,22 @@ async function handleItinerary(req, res) {
     if (destCountry) {
       for (const day of itineraryDays) {
         day.places = day.places.filter(pl => {
-          // find location row in candidates to check country, otherwise keep only if location in candidates or has country matches
           const found = candidates.find(c => String(c.id) === String(pl.id));
           if (found) return countryMatches(found.country, destCountry);
-          // if not found in candidates we are conservative and remove it
           return false;
         });
       }
     }
 
     // Add AI metadata to itinerary so tests / clients can assert AI was used
-    const itinerary = { trip_id: tripId, pace, days: itineraryDays, generated_at: new Date().toISOString(), ai: { source: ai.source || 'heuristic', suggestions: { prefer_titles: ai.prefer_titles || [], prefer_interests: ai.prefer_interests || [] } } };
+    const itinerary = { trip_id: tripId, pace, days: itineraryDays, generated_at: new Date().toISOString(), ai: { source: ai.source || 'heuristic', suggestions: { prefer_titles: ai.prefer_titles || [], prefer_interests: ai.prefer_interests || [] }, notes_constraints: notesConstraints } };
 
     // Save generation record and optionally persist places
     await client.query('BEGIN');
     const genRes = await client.query(
       `INSERT INTO itinerary_generations (trip_id, user_id, model, status, progress, generated_json, created_at, finished_at)
        VALUES ($1,$2,$3,$4,$5,$6, now(), now()) RETURNING id`,
-      [tripId, userId, 'heuristic-strict-country-v2-ai', 'finished', 100, JSON.stringify(itinerary)]
+      [tripId, userId, 'heuristic-strict-country-v3-ai-notes', 'finished', 100, JSON.stringify(itinerary)]
     );
     const genId = genRes.rows[0].id;
 
@@ -1082,7 +1229,7 @@ router.put('/:id', auth, async (req, res) => {
     const userId = req.user.id;
     const { destination, start_date, end_date, budget, notes, places } = req.body;
 
-    const ownerRes = await pool.query('SELECT user_id FROM trips WHERE id = $1', [id]);
+    const ownerRes = await client.query('SELECT user_id FROM trips WHERE id = $1', [id]);
     if (!ownerRes.rows.length) return res.status(404).json({ message: 'No encontrado' });
     if (ownerRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
 
@@ -1170,7 +1317,7 @@ router.post('/:id/places', auth, async (req, res) => {
       return res.status(400).json({ message: 'Debe enviar un arreglo "places" con al menos un elemento' });
     }
 
-    const ownerRes = await pool.query('SELECT user_id FROM trips WHERE id = $1', [tripId]);
+    const ownerRes = await client.query('SELECT user_id FROM trips WHERE id = $1', [tripId]);
     if (!ownerRes.rows.length) return res.status(404).json({ message: 'No encontrado' });
     if (ownerRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
 
@@ -1206,6 +1353,7 @@ router.post('/:id/places', auth, async (req, res) => {
     client.release();
   }
 });
+
 
 /* DELETE /trips/:id/places/:placeId */
 router.delete('/:id/places/:placeId', auth, async (req, res) => {
