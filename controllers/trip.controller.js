@@ -1676,47 +1676,160 @@ router.post('/:id/places/auto', auth, async (req, res) => {
     };
 
     // compute best order for a set of locList indices
-    const computeBestOrderForIndices = (indices) => {
-      const uniq = Array.from(new Set(indices));
-      if (uniq.length <= 1) return { order: uniq.slice(), cost: 0 };
+    // ------------------ REEMPLAZAR computeBestOrderForIndices ------------------
+// helpers: shuffle y twoOpt
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
 
-      // if small, brute-force perms
-      if (uniq.length <= 8) {
-        const perms = [];
-        const back = (curr, rem) => {
-          if (rem.length === 0) { perms.push(curr.slice()); return; }
-          for (let i = 0; i < rem.length; i++) {
-            curr.push(rem[i]);
-            const next = rem.slice(0,i).concat(rem.slice(i+1));
-            back(curr, next);
-            curr.pop();
-          }
-        };
-        back([], uniq.slice());
-        let best = null; let bestCost = Infinity;
-        for (const p of perms) {
-          const c = totalDuration(p);
-          if (c < bestCost) { bestCost = c; best = p.slice(); }
-        }
-        return { order: best || uniq.slice(0,1), cost: bestCost === Infinity ? 0 : bestCost };
-      }
+function twoOpt(order, matrix) {
+  // order: array of node indices (ints)
+  // matrix: travel time matrix
+  if (!order || order.length < 3) return order.slice();
+  let improved = true;
+  let best = order.slice();
+  const n = best.length;
+  const calcCost = (ord) => {
+    let s = 0;
+    for (let i = 0; i < ord.length - 1; i++) {
+      const a = ord[i], b = ord[i+1];
+      const v = matrix[a] && matrix[a][b];
+      s += Number.isFinite(v) ? v : Number.MAX_SAFE_INTEGER/10;
+    }
+    return s;
+  };
+  let bestCost = calcCost(best);
 
-      // greedy insertion
-      const pool = uniq.slice();
-      pool.sort((a,b) => (locList[b].relevancia || 0) - (locList[a].relevancia || 0));
-      const order = [pool.shift()];
-      while (pool.length) {
-        const item = pool.shift();
-        let bestPos = 0; let bestCost = Infinity;
-        for (let pos = 0; pos <= order.length; pos++) {
-          const trial = order.slice(0,pos).concat([item], order.slice(pos));
-          const c = totalDuration(trial);
-          if (c < bestCost) { bestCost = c; bestPos = pos; }
+  while (improved) {
+    improved = false;
+    // i from 0..n-3, k from i+1..n-2 (we don't close the loop - path not cycle)
+    for (let i = 0; i < n - 2; i++) {
+      for (let k = i + 1; k < n - 0; k++) {
+        const newOrder = best.slice(0, i).concat(best.slice(i, k + 1).reverse(), best.slice(k + 1));
+        const c = calcCost(newOrder);
+        if (c + 1e-6 < bestCost) {
+          best = newOrder;
+          bestCost = c;
+          improved = true;
+          break; // restart outer loops when improvement found
         }
-        order.splice(bestPos, 0, item);
       }
-      return { order: order.slice(), cost: totalDuration(order) };
+      if (improved) break;
+    }
+  }
+  return best;
+}
+
+const computeBestOrderForIndices = (indices) => {
+  const uniq = Array.from(new Set(indices));
+  if (uniq.length <= 1) return { order: uniq.slice(), cost: 0 };
+
+  // small -> brute-force exact
+  if (uniq.length <= 8) {
+    // brute-force permutations
+    const perms = [];
+    const back = (curr, rem) => {
+      if (rem.length === 0) { perms.push(curr.slice()); return; }
+      for (let i = 0; i < rem.length; i++) {
+        curr.push(rem[i]);
+        const next = rem.slice(0,i).concat(rem.slice(i+1));
+        back(curr, next);
+        curr.pop();
+      }
     };
+    back([], uniq.slice());
+    let best = null; let bestCost = Infinity;
+    for (const p of perms) {
+      // cost uses matrix variable from outer scope
+      let c = 0;
+      for (let i = 0; i < p.length - 1; i++) {
+        const a = p[i], b = p[i+1];
+        const v = matrix[a] && matrix[a][b];
+        c += Number.isFinite(v) ? v : Number.MAX_SAFE_INTEGER/10;
+      }
+      if (c < bestCost) { bestCost = c; best = p.slice(); }
+    }
+    console.info('computeBestOrderForIndices (brute) result', { nodes: uniq.length, order: best, cost: bestCost });
+    return { order: best || uniq.slice(), cost: bestCost === Infinity ? 0 : bestCost };
+  }
+
+  // Otherwise: nearest-neighbor + 2-opt with multiple restarts
+  let bestOrder = null;
+  let bestCost = Infinity;
+
+  const candidates = uniq.slice();
+  // prepare start points: prefer all unique nodes but limit restarts for performance
+  const startPoints = candidates.slice(0, Math.min(candidates.length, 12)); // up to 12 starts
+  for (const start of startPoints) {
+    // build NN tour starting at `start`
+    const pool = candidates.filter(x => x !== start);
+    const tour = [start];
+    while (pool.length) {
+      let last = tour[tour.length - 1];
+      let bestIdx = 0;
+      let bestD = Infinity;
+      for (let i = 0; i < pool.length; i++) {
+        const p = pool[i];
+        const d = matrix[last] && matrix[last][p];
+        if (Number.isFinite(d) && d < bestD) { bestD = d; bestIdx = i; }
+        else if (!Number.isFinite(d) && bestD === Infinity) { bestIdx = i; } // fallback
+      }
+      tour.push(pool.splice(bestIdx, 1)[0]);
+    }
+
+    // improve using 2-opt
+    const improvedTour = twoOpt(tour, matrix);
+    // compute cost
+    let c = 0;
+    for (let i = 0; i < improvedTour.length - 1; i++) {
+      const a = improvedTour[i], b = improvedTour[i+1];
+      const v = matrix[a] && matrix[a][b];
+      c += Number.isFinite(v) ? v : Number.MAX_SAFE_INTEGER/10;
+    }
+    if (c < bestCost) {
+      bestCost = c;
+      bestOrder = improvedTour.slice();
+    }
+  }
+
+  // add a few random restarts to avoid local minima
+  const randomRestarts = Math.min(8, Math.max(3, Math.floor(candidates.length / 2)));
+  for (let r = 0; r < randomRestarts; r++) {
+    const shuffled = shuffle(candidates);
+    const tour = shuffled.slice();
+    const improvedTour = twoOpt(tour, matrix);
+    let c = 0;
+    for (let i = 0; i < improvedTour.length - 1; i++) {
+      const a = improvedTour[i], b = improvedTour[i+1];
+      const v = matrix[a] && matrix[a][b];
+      c += Number.isFinite(v) ? v : Number.MAX_SAFE_INTEGER/10;
+    }
+    if (c < bestCost) {
+      bestCost = c;
+      bestOrder = improvedTour.slice();
+    }
+  }
+
+  // fallback safety
+  if (!bestOrder) {
+    bestOrder = uniq.slice();
+    bestCost = 0;
+    for (let i = 0; i < bestOrder.length - 1; i++) {
+      const a = bestOrder[i], b = bestOrder[i+1];
+      const v = matrix[a] && matrix[a][b];
+      bestCost += Number.isFinite(v) ? v : Number.MAX_SAFE_INTEGER/10;
+    }
+  }
+
+  console.info('computeBestOrderForIndices (nn+2opt) result', { nodes: uniq.length, order: bestOrder, cost: bestCost });
+  return { order: bestOrder, cost: bestCost };
+};
+
 
     // Evaluate insertion into each day: for each day, compute best order for that day's existing locs + new loc,
     // but DO NOT move places between days (we only permute inside the day).
