@@ -1528,6 +1528,8 @@ router.post('/:id/places/auto', auth, async (req, res) => {
     const userId = req.user.id;
     const body = req.body || {};
     const place = body.place || {};
+    console.log('POST /trips/:id/places/auto body:', body);
+    console.log('tripId:', tripId, 'userId:', userId);
 
     if (!Number.isFinite(tripId) || tripId <= 0) return res.status(400).json({ message: 'Invalid trip id' });
     if (!place || !place.fk_location) return res.status(400).json({ message: 'Debe enviar un objeto place con fk_location' });
