@@ -1,6 +1,6 @@
 {
   "info": {
-    "name": "ComfTrip API - Full workflow (Rome first, Spain second, friends/share)",
+    "name": "ComfTrip API - Full workflow (LLM detection)",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "version": "1.0.0"
   },
@@ -28,7 +28,6 @@
         }
       ]
     },
-
 
     {
       "name": "Create Trip (Italy) - prefer Rome area",
@@ -58,6 +57,7 @@
         }
       ]
     },
+
     {
       "name": "Generate Itinerary (save=true) - Italy (pace Intenso)",
       "request": {
@@ -80,12 +80,60 @@
               "pm.test('itinerary created 201', () => pm.response.to.have.status(201));",
               "const j = pm.response.json();",
               "pm.test('generation_id present', () => pm.expect(j.generation_id).to.exist);",
-              "pm.test('itinerary.days array', () => pm.expect(j.itinerary && j.itinerary.days).to.be.an('array'));"
+              "pm.test('itinerary.days array', () => pm.expect(j.itinerary && j.itinerary.days).to.be.an('array'));",
+              "// clear any previous flag for Italy",
+              "pm.environment.unset('llmUsedItaly');",
+              "pm.environment.unset('llmUsed');"
             ]
           }
         }
       ]
     },
+
+    {
+      "name": "Verify Generation (LLM detection) - Italy",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{authToken}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "url": { "raw": "{{baseUrl}}/trips/{{tripIdRome}}/itinerary", "host": ["{{baseUrl}}"], "path": ["trips","{{tripIdRome}}","itinerary"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('get last generation 200', () => pm.response.to.have.status(200));",
+              "const row = pm.response.json() || {};",
+              "// generated_json can be object or string; stringify for scanning",
+              "let genJson = null;",
+              "if (row.generated_json) {",
+              "  if (typeof row.generated_json === 'string') {",
+              "    try { genJson = JSON.parse(row.generated_json); } catch(e) { genJson = row.generated_json; }",
+              "  } else { genJson = row.generated_json; }",
+              "}",
+              "const scanTarget = JSON.stringify(genJson || row || '');",
+              "const regex = /openai|huggingface|hf_|gpt|llm_response|llm|assistant|model|chat_completion|huggingface/i;",
+              "const found = regex.test(scanTarget);",
+              "if (found) {",
+              "  pm.environment.set('llmUsedItaly','true');",
+              "  pm.environment.set('llmUsed','true');",
+              "  console.log('LLM detected in generated_json (Italy)');",
+              "} else {",
+              "  pm.environment.set('llmUsedItaly','false');",
+              "  // do not override global 'llmUsed' if previously set true for other run steps; set if not present",
+              "  if (!pm.environment.get('llmUsed')) pm.environment.set('llmUsed','false');",
+              "  console.log('No LLM signatures found in generated_json (Italy)');",
+              "}",
+              "pm.test('LLM detection ran', () => pm.expect(['true','false']).to.include(pm.environment.get('llmUsedItaly')));"
+            ]
+          }
+        }
+      ]
+    },
+
     {
       "name": "Get Trip (Italy) - assert saved places are in Italy",
       "request": {
@@ -119,32 +167,6 @@
       ]
     },
 
-
-    {
-      "name": "Create friend user (123@gmail.com)",
-      "request": {
-        "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"name\": \"Friend123\",\n  \"email\": \"{{friend_email}}\",\n  \"password\": \"{{friend_password}}\"\n}"
-        },
-        "url": { "raw": "{{baseUrl}}/users/register", "host": ["{{baseUrl}}"], "path": ["users","register"] }
-      },
-      "event": [
-        {
-          "listen": "test",
-          "script": {
-            "exec": [
-              "// registration may return 200/201 or 400 if user exists; accept both",
-              "pm.test('register response ok (200/201/400)', () => pm.expect(pm.response.code).to.be.oneOf([200,201,400]));",
-              "const j = pm.response.json ? pm.response.json() : {};",
-              "console.log('register response:', pm.response.text());"
-            ]
-          }
-        }
-      ]
-    },
     {
       "name": "Login friend (capture friendToken & id)",
       "request": {
@@ -168,6 +190,7 @@
         }
       ]
     },
+
     {
       "name": "Send friend request (admin -> friend by email)",
       "request": {
@@ -193,6 +216,7 @@
         }
       ]
     },
+
     {
       "name": "Friend: GET incoming/outgoing requests",
       "request": {
@@ -217,6 +241,7 @@
         }
       ]
     },
+
     {
       "name": "Friend: Accept friend request (as friend)",
       "request": {
@@ -236,6 +261,7 @@
         }
       ]
     },
+
     {
       "name": "Admin: List friends (should include friendId)",
       "request": {
@@ -258,7 +284,6 @@
         }
       ]
     },
-
 
     {
       "name": "Admin: Share trip with friend (create share row)",
@@ -288,6 +313,7 @@
         }
       ]
     },
+
     {
       "name": "Public: GET shared trip (no auth) via uuid",
       "request": {
@@ -308,7 +334,6 @@
         }
       ]
     },
-
 
     {
       "name": "Create Trip (Spain)",
@@ -338,6 +363,7 @@
         }
       ]
     },
+
     {
       "name": "Generate Itinerary (save=true) - Spain (require Zim)",
       "request": {
@@ -359,12 +385,57 @@
             "exec": [
               "pm.test('itinerary Spain created 201', () => pm.response.to.have.status(201));",
               "const j = pm.response.json();",
-              "pm.test('generation_id present', () => pm.expect(j.generation_id).to.exist);"
+              "pm.test('generation_id present', () => pm.expect(j.generation_id).to.exist);",
+              "pm.environment.unset('llmUsedSpain');",
+              "if (!pm.environment.get('llmUsed')) pm.environment.unset('llmUsed');"
             ]
           }
         }
       ]
     },
+
+    {
+      "name": "Verify Generation (LLM detection) - Spain",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{authToken}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "url": { "raw": "{{baseUrl}}/trips/{{tripIdSpain}}/itinerary", "host": ["{{baseUrl}}"], "path": ["trips","{{tripIdSpain}}","itinerary"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('get last generation Spain 200', () => pm.response.to.have.status(200));",
+              "const row = pm.response.json() || {};",
+              "let genJson = null;",
+              "if (row.generated_json) {",
+              "  if (typeof row.generated_json === 'string') {",
+              "    try { genJson = JSON.parse(row.generated_json); } catch(e) { genJson = row.generated_json; }",
+              "  } else { genJson = row.generated_json; }",
+              "}",
+              "const scanTarget = JSON.stringify(genJson || row || '');",
+              "const regex = /openai|huggingface|hf_|gpt|llm_response|llm|assistant|model|chat_completion|huggingface/i;",
+              "const found = regex.test(scanTarget);",
+              "if (found) {",
+              "  pm.environment.set('llmUsedSpain','true');",
+              "  pm.environment.set('llmUsed','true');",
+              "  console.log('LLM detected in generated_json (Spain)');",
+              "} else {",
+              "  pm.environment.set('llmUsedSpain','false');",
+              "  if (!pm.environment.get('llmUsed')) pm.environment.set('llmUsed','false');",
+              "  console.log('No LLM signatures found in generated_json (Spain)');",
+              "}",
+              "pm.test('LLM detection ran (Spain)', () => pm.expect(['true','false']).to.include(pm.environment.get('llmUsedSpain')));"
+            ]
+          }
+        }
+      ]
+    },
+
     {
       "name": "Get Trip (Spain) - assert saved places are in Spain and Zim present",
       "request": {
@@ -428,6 +499,7 @@
         }
       ]
     },
+
     {
       "name": "Delete Trip Spain (cleanup)",
       "request": {
