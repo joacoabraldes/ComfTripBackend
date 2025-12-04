@@ -11,7 +11,7 @@ const interestRoutes = require('./controllers/interest.controller');
 const communityController = require('./controllers/community.controller');
 const shareController = require('./controllers/share.controller');
 const flightController = require('./controllers/flight.controller');
-const socialRouter = require('../controllers/social.controller');
+const socialRouter = require('./controllers/social.controller');
 
 const app = express();
 app.use(cors({
