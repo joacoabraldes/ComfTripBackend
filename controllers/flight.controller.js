@@ -45,7 +45,7 @@ router.post('/', auth, async (req, res) => {
 
 /**
  * PUT /flights/:flight_id
- * Body: { trip_id: number (optional) }
+ * Body: { trip_id: number (optional, can be null to disassociate) }
  * Updates the trip association for a flight. Only the owner (flights.user_id) can update.
  */
 router.put('/:flight_id', auth, async (req, res) => {
@@ -55,22 +55,53 @@ router.put('/:flight_id', auth, async (req, res) => {
     const flightId = String(req.params.flight_id || '').trim();
     const { trip_id } = req.body || {};
 
-    if (!flightId) return res.status(400).json({ message: 'flight_id inválido' });
+    if (!flightId) {
+      return res.status(400).json({ message: 'flight_id inválido' });
+    }
 
-    // fetch existing
-    const cur = await client.query('SELECT flight_id, user_id, trip_id FROM flights WHERE flight_id = $1 LIMIT 1', [flightId]);
-    if (!cur.rows.length) return res.status(404).json({ message: 'Vuelo no encontrado' });
+    // fetch existing flight
+    const cur = await client.query(
+      'SELECT flight_id, user_id, trip_id FROM flights WHERE flight_id = $1 LIMIT 1',
+      [flightId]
+    );
+    if (!cur.rows.length) {
+      return res.status(404).json({ message: 'Vuelo no encontrado' });
+    }
+
     const row = cur.rows[0];
-    if (row.user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
 
-    // perform update (only trip_id can be changed here)
-    const newTripId = (typeof trip_id !== 'undefined' && Number.isFinite(Number(trip_id))) ? Number(trip_id) : null;
+    // IMPORTANT: compare user IDs with same type
+    if (Number(row.user_id) !== Number(userId)) {
+      return res.status(403).json({ message: 'No autorizado' });
+    }
 
-    const upd = await client.query('UPDATE flights SET trip_id = $1 WHERE flight_id = $2 RETURNING flight_id, user_id, trip_id, created_at', [newTripId, flightId]);
+    // Decide newTripId:
+    // - If trip_id is NOT present in the body, keep current row.trip_id.
+    // - If trip_id is present:
+    //    * null / '' => set to NULL (disassociate)
+    //    * numeric / numeric string => that number
+    //    * anything else => 400
+    let newTripId = row.trip_id;
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'trip_id')) {
+      if (trip_id === null || trip_id === '') {
+        newTripId = null;
+      } else if (Number.isFinite(Number(trip_id))) {
+        newTripId = Number(trip_id);
+      } else {
+        return res.status(400).json({ message: 'trip_id inválido' });
+      }
+    }
+
+    const upd = await client.query(
+      'UPDATE flights SET trip_id = $1 WHERE flight_id = $2 RETURNING flight_id, user_id, trip_id, created_at',
+      [newTripId, flightId]
+    );
+
     return res.json({ flight: upd.rows[0] });
   } catch (err) {
     console.error('PUT /flights/:flight_id error:', err);
-    res.status(500).json({ message: 'Error actualizando vuelo' });
+    return res.status(500).json({ message: 'Error actualizando vuelo' });
   } finally {
     client.release();
   }
