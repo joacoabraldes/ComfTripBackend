@@ -6,23 +6,28 @@ const router = express.Router();
 const bcrypt = require('bcrypt');
 
 router.post('/register', async (req, res) => {
-  const { name, email, password, nationality, birthdate } = req.body;
-  if (!name || !email || !password) return res.status(400).json({ error: 'Faltan campos obligatorios' });
+  const { name, username, email, password, nationality, birthdate, phone } = req.body;
+
+  if (!name || !username || !email || !password) {
+    return res.status(400).json({ error: 'Faltan campos obligatorios' });
+  }
 
   try {
     const password_hash = await bcrypt.hash(password, 10);
     await pool.query(
-      'INSERT INTO users (name, email, password_hash, nationality, birthdate) VALUES ($1, $2, $3, $4, $5)',
-      [name, email, password_hash, nationality || null, birthdate || null]
+      'INSERT INTO users (name, username, email, phone, password_hash, nationality, birthdate) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [name, username, email, phone || null, password_hash, nationality || null, birthdate || null]
     );
     res.json({ message: 'Usuario registrado correctamente' });
   } catch (err) {
-    if (err.code === '23505') { // unique_violation
-      res.status(400).json({ error: 'El email ya está registrado' });
-    } else {
-      console.error(err);
-      res.status(500).json({ error: 'Error en el servidor' });
+    if (err.code === '23505') {
+      // unique_violation: puede ser email o username
+      return res
+        .status(400)
+        .json({ error: 'El email o el nombre de usuario ya está registrado' });
     }
+    console.error(err);
+    res.status(500).json({ error: 'Error en el servidor' });
   }
 });
 
