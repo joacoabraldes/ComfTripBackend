@@ -11,6 +11,7 @@ const interestRoutes = require('./controllers/interest.controller');
 const communityController = require('./controllers/community.controller');
 const shareController = require('./controllers/share.controller');
 const flightController = require('./controllers/flight.controller');
+const socialRouter = require('../controllers/social.controller');
 
 const app = express();
 app.use(cors({
@@ -28,6 +29,7 @@ app.use('/api/interests', interestRoutes);
 app.use('/api/friends', communityController);
 app.use('/api/share', shareController);
 app.use('/api/flights', flightController);
+app.use('/api/social', socialRouter);
 
 const PORT = process.env.PORT || 5432;
 app.listen(PORT, () => console.log(`Backend escuchando en http://localhost:${PORT}`));
