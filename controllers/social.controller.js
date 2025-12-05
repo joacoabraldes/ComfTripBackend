@@ -310,96 +310,115 @@ router.get('/posts/:id', auth, async (req, res) => {
  *  - JSON: { content }
  *  - multipart/form-data: fields content, image (archivo)
  */
-/**
- * POST /social/posts
- * Crea un post nuevo
- * Soporta:
- *  - Solo texto
- *  - Solo imagen
- *  - Texto + imagen
- *  - JSON (sin imagen) o multipart/form-data (con imagen)
- */
-router.post(
-  '/posts',
-  auth,
-  upload.single('image'), // campo "image" para la foto
-  async (req, res) => {
-    const userId = getUserIdFromReq(req);
-    if (!userId) {
-      return res.status(401).json({ message: 'No autenticado' });
-    }
+// src/services/socialService.js
+const API_BASE =
+  (process.env.REACT_APP_API_URL || '/api').replace(/\/$/, ''); // sin barra final
 
-    try {
-      const { trip_id, location_id } = req.body;
-      const rawContent = typeof req.body.content === 'string' ? req.body.content : '';
-      const content = rawContent.trim();
-
-      const hasText = content.length > 0;
-      const hasImage = !!req.file;
-
-      // ahora lo único prohibido es "nada de nada"
-      if (!hasText && !hasImage) {
-        return res
-          .status(400)
-          .json({ message: 'Debés enviar al menos texto o una imagen' });
-      }
-
-      // Armamos array de URLs de imágenes (si hay)
-      let imageUrls = [];
-      if (hasImage) {
-        imageUrls.push(`/uploads/social/${req.file.filename}`);
-      }
-      const imagesJson = imageUrls.length ? JSON.stringify(imageUrls) : null;
-
-      const result = await pool.query(
-        `
-        INSERT INTO social_posts (user_id, trip_id, location_id, content, images)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, user_id, trip_id, location_id, content, images, created_at
-        `,
-        [
-          userId,
-          trip_id || null,
-          location_id || null,
-          hasText ? content : null,
-          imagesJson,
-        ]
-      );
-
-      const post = result.rows[0];
-
-      // Traemos username y name del autor
-      const userRes = await pool.query(
-        'SELECT username, name FROM users WHERE id = $1 LIMIT 1',
-        [userId]
-      );
-      const userRow = userRes.rows[0] || {};
-
-      return res.status(201).json({
-        message: 'Post creado',
-        post: {
-          id: post.id,
-          user_id: post.user_id,
-          trip_id: post.trip_id,
-          location_id: post.location_id,
-          content: post.content || '',
-          images: post.images ? JSON.parse(post.images) : null,
-          created_at: post.created_at,
-          like_count: 0,
-          comment_count: 0,
-          liked_by_me: false,
-          author_username: userRow.username || null,
-          author_name: userRow.name || null,
-        },
-      });
-    } catch (err) {
-      console.error('POST /social/posts error:', err?.message || err);
-      return res
-        .status(500)
-        .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
-    }
+function getAuthHeaders() {
+  try {
+    const token = localStorage.getItem('token');
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  } catch {
+    return {};
   }
-);
+}
+
+async function handleJsonResponse(res, defaultError) {
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(text || defaultError);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(text || defaultError);
+  }
+}
+
+// -------- FEED --------
+export async function fetchSocialFeed() {
+  const res = await fetch(`${API_BASE}/social/feed`, {
+    headers: {
+      ...getAuthHeaders(),
+    },
+  });
+  return handleJsonResponse(res, 'Error cargando el feed');
+}
+
+// -------- CREAR POST --------
+export async function createSocialPost({ content, files }) {
+  const hasFiles = files && files.length > 0;
+  const trimmed = (content || '').trim();
+
+  // Si NO hay imagen, mandamos JSON normal
+  if (!hasFiles) {
+    const res = await fetch(`${API_BASE}/social/posts`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...getAuthHeaders(),
+      },
+      body: JSON.stringify({ content: trimmed }),
+    });
+    return handleJsonResponse(res, 'Error al crear el post');
+  }
+
+  // Si hay imagen, usamos FormData (texto opcional)
+  const formData = new FormData();
+  if (trimmed.length > 0) {
+    formData.append('content', trimmed);
+  } else {
+    formData.append('content', ''); // el backend lo maneja
+  }
+
+  // Por ahora usamos solo la primera imagen
+  formData.append('image', files[0]);
+
+  const res = await fetch(`${API_BASE}/social/posts`, {
+    method: 'POST',
+    headers: {
+      ...getAuthHeaders(),
+      // IMPORTANTE: NO poner Content-Type, lo setea el navegador
+    },
+    body: formData,
+  });
+
+  return handleJsonResponse(res, 'Error al crear el post');
+}
+
+// -------- LIKE / UNLIKE --------
+export async function togglePostLike(postId) {
+  const res = await fetch(`${API_BASE}/social/posts/${postId}/like`, {
+    method: 'POST',
+    headers: {
+      ...getAuthHeaders(),
+    },
+  });
+  return handleJsonResponse(res, 'Error cambiando like');
+}
+
+// -------- COMENTARIOS --------
+export async function fetchPostComments(postId) {
+  const res = await fetch(`${API_BASE}/social/posts/${postId}/comments`, {
+    headers: {
+      ...getAuthHeaders(),
+    },
+  });
+  return handleJsonResponse(res, 'Error cargando comentarios');
+}
+
+export async function addPostComment(postId, content) {
+  const res = await fetch(`${API_BASE}/social/posts/${postId}/comments`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...getAuthHeaders(),
+    },
+    body: JSON.stringify({ content }),
+  });
+  return handleJsonResponse(res, 'Error agregando comentario');
+}
+
 
 
 /**
