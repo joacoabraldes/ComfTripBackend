@@ -18,7 +18,13 @@ function getUserIdFromReq(req) {
 /**
  * Configuración de subida de imágenes (JPG/PNG) para posts
  */
-const uploadDir = path.join(__dirname, '..', 'uploads', 'social');
+// raíz donde se van a guardar los uploads (configurable)
+const UPLOAD_ROOT =
+  process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
+
+// carpeta específica para fotos del social feed
+const uploadDir = path.join(UPLOAD_ROOT, 'social');
+
 fs.mkdirSync(uploadDir, { recursive: true });
 
 const storage = multer.diskStorage({
