@@ -12,8 +12,7 @@ const router = express.Router();
 
 /**
  * Directorio base de uploads
- * Usamos OS tmpdir para que funcione en entornos serverless (/tmp)
- * y localmente también.
+ * Usamos OS tmpdir para que funcione en serverless (/tmp) y localmente.
  */
 const UPLOAD_ROOT =
   process.env.UPLOAD_DIR || path.join(os.tmpdir(), 'comftrip_uploads');
@@ -74,7 +73,7 @@ function normalizePostRow(r) {
     trip_id: r.trip_id,
     location_id: r.location_id,
     content: r.content || '',
-    images: r.images || null, // array/jsonb o null
+    images: r.images ?? null, // puede ser array (jsonb) o string
     created_at: r.created_at,
     like_count:
       r.like_count !== null && r.like_count !== undefined
@@ -161,9 +160,10 @@ router.get('/feed', auth, async (req, res) => {
     return res.json(posts);
   } catch (err) {
     console.error('GET /social/feed error:', err?.message || err);
-    return res
-      .status(500)
-      .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+    return res.status(500).json({
+      message: 'Error en el servidor',
+      detail: err?.message || String(err),
+    });
   }
 });
 
@@ -231,9 +231,10 @@ router.get('/posts', auth, async (req, res) => {
     return res.json(posts);
   } catch (err) {
     console.error('GET /social/posts error:', err?.message || err);
-    return res
-      .status(500)
-      .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+    return res.status(500).json({
+      message: 'Error en el servidor',
+      detail: err?.message || String(err),
+    });
   }
 });
 
@@ -296,15 +297,19 @@ router.get('/posts/:id', auth, async (req, res) => {
     return res.json(normalizePostRow(result.rows[0]));
   } catch (err) {
     console.error('GET /social/posts/:id error:', err?.message || err);
-    return res
-      .status(500)
-      .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+    return res.status(500).json({
+      message: 'Error en el servidor',
+      detail: err?.message || String(err),
+    });
   }
 });
 
 /**
  * POST /social/posts
- * Crea un post nuevo (texto opcional + imagen opcional)
+ * Crea un post nuevo
+ * Soporta:
+ *  - JSON: { content }
+ *  - multipart/form-data: fields content, image (archivo)
  * Se permite:
  *  - solo texto
  *  - solo imagen
@@ -321,28 +326,28 @@ router.post(
     }
 
     try {
-      const { content = '', trip_id, location_id } = req.body;
+      const { content: rawContent, trip_id, location_id } = req.body;
 
-      const textOk = typeof content === 'string' && content.trim().length > 0;
+      const content =
+        typeof rawContent === 'string' ? rawContent.trim() : '';
+
       const hasImage = !!req.file;
+      const hasText = content.length > 0;
 
-      if (!textOk && !hasImage) {
-        return res
-          .status(400)
-          .json({ message: 'Debes enviar texto o al menos una imagen' });
+      if (!hasImage && !hasText) {
+        return res.status(400).json({
+          message: 'El post debe tener texto, imagen o ambos',
+        });
       }
 
+      // Armamos array de URLs de imágenes (si hay)
       let imageUrls = [];
-
       if (hasImage) {
-        const baseUrl =
-          process.env.PUBLIC_BACKEND_URL ||
-          `${req.protocol}://${req.get('host')}`;
-
-        imageUrls.push(`${baseUrl}/uploads/social/${req.file.filename}`);
+        imageUrls.push(`/uploads/social/${req.file.filename}`);
       }
 
-      const imagesJson = imageUrls.length ? JSON.stringify(imageUrls) : null;
+      // Para columna json/jsonb podemos mandar directamente el array
+      const imagesValue = imageUrls.length ? imageUrls : null;
 
       const result = await pool.query(
         `
@@ -354,8 +359,8 @@ router.post(
           userId,
           trip_id || null,
           location_id || null,
-          textOk ? content : '',
-          imagesJson,
+          content,
+          imagesValue,
         ]
       );
 
@@ -374,8 +379,8 @@ router.post(
           user_id: post.user_id,
           trip_id: post.trip_id,
           location_id: post.location_id,
-          content: post.content || '',
-          images: post.images ? JSON.parse(post.images) : null,
+          content: post.content,
+          images: post.images ?? null,
           created_at: post.created_at,
           like_count: 0,
           comment_count: 0,
@@ -386,9 +391,10 @@ router.post(
       });
     } catch (err) {
       console.error('POST /social/posts error:', err?.message || err);
-      return res
-        .status(500)
-        .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+      return res.status(500).json({
+        message: 'Error en el servidor',
+        detail: err?.message || String(err),
+      });
     }
   }
 );
@@ -424,9 +430,10 @@ router.delete('/posts/:id', auth, async (req, res) => {
     return res.json({ message: 'Post eliminado' });
   } catch (err) {
     console.error('DELETE /social/posts/:id error:', err?.message || err);
-    return res
-      .status(500)
-      .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+    return res.status(500).json({
+      message: 'Error en el servidor',
+      detail: err?.message || String(err),
+    });
   }
 });
 
@@ -471,9 +478,10 @@ router.post('/posts/:id/like', auth, async (req, res) => {
     }
   } catch (err) {
     console.error('POST /social/posts/:id/like error:', err?.message || err);
-    return res
-      .status(500)
-      .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+    return res.status(500).json({
+      message: 'Error en el servidor',
+      detail: err?.message || String(err),
+    });
   }
 });
 
@@ -515,16 +523,16 @@ router.get('/posts/:id/comments', auth, async (req, res) => {
     return res.json(comments);
   } catch (err) {
     console.error('GET /social/posts/:id/comments error:', err?.message || err);
-    return res
-      .status(500)
-      .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+    return res.status(500).json({
+      message: 'Error en el servidor',
+      detail: err?.message || String(err),
+    });
   }
 });
 
 /**
  * POST /social/posts/:id/comments
  * Crea un comentario
- * Body: { content }
  */
 router.post('/posts/:id/comments', auth, async (req, res) => {
   const userId = getUserIdFromReq(req);
@@ -571,9 +579,10 @@ router.post('/posts/:id/comments', auth, async (req, res) => {
     });
   } catch (err) {
     console.error('POST /social/posts/:id/comments error:', err?.message || err);
-    return res
-      .status(500)
-      .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+    return res.status(500).json({
+      message: 'Error en el servidor',
+      detail: err?.message || String(err),
+    });
   }
 });
 
