@@ -310,6 +310,15 @@ router.get('/posts/:id', auth, async (req, res) => {
  *  - JSON: { content }
  *  - multipart/form-data: fields content, image (archivo)
  */
+/**
+ * POST /social/posts
+ * Crea un post nuevo
+ * Soporta:
+ *  - Solo texto
+ *  - Solo imagen
+ *  - Texto + imagen
+ *  - JSON (sin imagen) o multipart/form-data (con imagen)
+ */
 router.post(
   '/posts',
   auth,
@@ -321,24 +330,25 @@ router.post(
     }
 
     try {
-      // content puede venir en body independientemente de JSON o multipart
-      const { content, trip_id, location_id } = req.body;
+      const { trip_id, location_id } = req.body;
+      const rawContent = typeof req.body.content === 'string' ? req.body.content : '';
+      const content = rawContent.trim();
 
-      if (!content || typeof content !== 'string') {
-        return res.status(400).json({ message: 'content es obligatorio' });
+      const hasText = content.length > 0;
+      const hasImage = !!req.file;
+
+      // ahora lo único prohibido es "nada de nada"
+      if (!hasText && !hasImage) {
+        return res
+          .status(400)
+          .json({ message: 'Debés enviar al menos texto o una imagen' });
       }
 
       // Armamos array de URLs de imágenes (si hay)
       let imageUrls = [];
-
-      if (req.file) {
-        // Ruta pública para servir estática: /uploads/social/<filename>
+      if (hasImage) {
         imageUrls.push(`/uploads/social/${req.file.filename}`);
       }
-
-      // Si además vinieran imágenes en el body (URLs existentes), se podrían mergear aquí:
-      // if (req.body.images) { ... }
-
       const imagesJson = imageUrls.length ? JSON.stringify(imageUrls) : null;
 
       const result = await pool.query(
@@ -351,14 +361,14 @@ router.post(
           userId,
           trip_id || null,
           location_id || null,
-          content,
+          hasText ? content : null,
           imagesJson,
         ]
       );
 
       const post = result.rows[0];
 
-      // Traemos username y name del autor para que la feed lo muestre sin "Usuario"
+      // Traemos username y name del autor
       const userRes = await pool.query(
         'SELECT username, name FROM users WHERE id = $1 LIMIT 1',
         [userId]
@@ -372,7 +382,7 @@ router.post(
           user_id: post.user_id,
           trip_id: post.trip_id,
           location_id: post.location_id,
-          content: post.content,
+          content: post.content || '',
           images: post.images ? JSON.parse(post.images) : null,
           created_at: post.created_at,
           like_count: 0,
@@ -390,6 +400,7 @@ router.post(
     }
   }
 );
+
 
 /**
  * DELETE /social/posts/:id
