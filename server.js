@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const os = require('os');
+const emailService = require('./services/email.service');
 
 const authRoutes = require('./controllers/auth.controller');
 const userRoutes = require('./controllers/user.controller');
@@ -45,6 +46,12 @@ app.use('/api/flights', flightController);
 app.use('/api/social', socialRouter);
 
 const PORT = process.env.PORT || 5432;
+
+// Verify email configuration on startup
+(async () => {
+  await emailService.verifyEmailConfig();
+})();
+
 app.listen(PORT, () =>
   console.log(`Backend escuchando en http://localhost:${PORT}`)
 );
