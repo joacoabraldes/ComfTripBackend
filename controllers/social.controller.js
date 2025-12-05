@@ -2,6 +2,9 @@
 const express = require('express');
 const pool = require('../db');
 const auth = require('../middleware/auth');
+const path = require('path');
+const fs = require('fs');
+const multer = require('multer');
 
 const router = express.Router();
 
@@ -11,6 +14,31 @@ const router = express.Router();
 function getUserIdFromReq(req) {
   return req.user?.id || req.user?.userId;
 }
+
+/**
+ * Configuración de subida de imágenes (JPG/PNG) para posts
+ */
+const uploadDir = path.join(__dirname, '..', 'uploads', 'social');
+fs.mkdirSync(uploadDir, { recursive: true });
+
+const storage = multer.diskStorage({
+  destination: uploadDir,
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname || '');
+    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+  fileFilter: (req, file, cb) => {
+    if (!/^image\/(jpe?g|png|webp|gif)$/i.test(file.mimetype)) {
+      return cb(new Error('Solo se permiten imágenes (jpg, png, webp, gif)'));
+    }
+    cb(null, true);
+  },
+});
 
 /**
  * Normaliza un post
@@ -26,13 +54,59 @@ function normalizePostRow(r) {
     content: r.content || '',
     images: r.images || null,
     created_at: r.created_at,
-    like_count: r.like_count !== null && r.like_count !== undefined ? Number(r.like_count) : 0,
+    like_count:
+      r.like_count !== null && r.like_count !== undefined
+        ? Number(r.like_count)
+        : 0,
     comment_count:
       r.comment_count !== null && r.comment_count !== undefined
         ? Number(r.comment_count)
         : 0,
     liked_by_me: r.liked_by_me === true || r.liked_by_me === 't',
   };
+}
+
+/**
+ * Helper: inserta un post y devuelve el objeto normalizado con username + name
+ */
+async function insertSocialPost({ userId, content, imagesArray, trip_id, location_id }) {
+  const imagesJson =
+    imagesArray && imagesArray.length ? JSON.stringify(imagesArray) : null;
+
+  const insertRes = await pool.query(
+    `
+    INSERT INTO social_posts (user_id, trip_id, location_id, content, images)
+    VALUES ($1, $2, $3, $4, $5)
+    RETURNING id
+    `,
+    [userId, trip_id || null, location_id || null, content, imagesJson]
+  );
+
+  const postId = insertRes.rows[0].id;
+
+  const detail = await pool.query(
+    `
+    SELECT
+      sp.id,
+      sp.user_id,
+      u.name AS author_name,
+      u.username AS author_username,
+      sp.trip_id,
+      sp.location_id,
+      sp.content,
+      sp.images,
+      sp.created_at,
+      0::int AS like_count,
+      0::int AS comment_count,
+      false AS liked_by_me
+    FROM social_posts sp
+    JOIN users u ON u.id = sp.user_id
+    WHERE sp.id = $1
+    `,
+    [postId]
+  );
+
+  return normalizePostRow(detail.rows[0]);
 }
 
 /**
@@ -161,7 +235,7 @@ router.get('/posts', auth, async (req, res) => {
         sp.created_at,
         COALESCE(lc.like_count, 0) AS like_count,
         COALESCE(cc.comment_count, 0) AS comment_count,
-        false AS liked_by_me -- si querés, podés pasarlo con auth como en feed
+        false AS liked_by_me
       FROM social_posts sp
       JOIN users u ON u.id = sp.user_id
       LEFT JOIN like_counts lc ON lc.post_id = sp.id
@@ -252,8 +326,8 @@ router.get('/posts/:id', auth, async (req, res) => {
 
 /**
  * POST /social/posts
- * Crea un post nuevo
- * Body: { content, images?, trip_id?, location_id? }
+ * Crea un post nuevo (solo texto o con URLs de imágenes ya conocidas)
+ * Body JSON: { content, images?, trip_id?, location_id? }
  */
 router.post('/posts', auth, async (req, res) => {
   const userId = getUserIdFromReq(req);
@@ -268,42 +342,24 @@ router.post('/posts', auth, async (req, res) => {
       return res.status(400).json({ message: 'content es obligatorio' });
     }
 
-    let imagesJson = null;
-    if (images !== undefined && images !== null) {
-      imagesJson = typeof images === 'string' ? images : JSON.stringify(images);
+    let imagesArray = [];
+    if (Array.isArray(images)) {
+      imagesArray = images;
+    } else if (typeof images === 'string' && images.trim() !== '') {
+      imagesArray = [images.trim()];
     }
 
-    const result = await pool.query(
-      `
-      INSERT INTO social_posts (user_id, trip_id, location_id, content, images)
-      VALUES ($1, $2, $3, $4, $5)
-      RETURNING id, user_id, trip_id, location_id, content, images, created_at
-      `,
-      [
-        userId,
-        trip_id || null,
-        location_id || null,
-        content,
-        imagesJson,
-      ]
-    );
-
-    const post = result.rows[0];
+    const created = await insertSocialPost({
+      userId,
+      content: content.trim(),
+      imagesArray,
+      trip_id,
+      location_id,
+    });
 
     return res.status(201).json({
       message: 'Post creado',
-      post: {
-        id: post.id,
-        user_id: post.user_id,
-        trip_id: post.trip_id,
-        location_id: post.location_id,
-        content: post.content,
-        images: post.images,
-        created_at: post.created_at,
-        like_count: 0,
-        comment_count: 0,
-        liked_by_me: false,
-      },
+      post: created,
     });
   } catch (err) {
     console.error('POST /social/posts error:', err?.message || err);
@@ -312,6 +368,56 @@ router.post('/posts', auth, async (req, res) => {
       .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
   }
 });
+
+/**
+ * POST /social/posts/upload
+ * Crea un post nuevo con subida de imágenes (multipart/form-data)
+ * Campos:
+ *  - content (string, obligatorio)
+ *  - images (uno o varios archivos)
+ *  - trip_id?, location_id? (opcionales)
+ */
+router.post(
+  '/posts/upload',
+  auth,
+  upload.array('images', 4),
+  async (req, res) => {
+    const userId = getUserIdFromReq(req);
+    if (!userId) {
+      return res.status(401).json({ message: 'No autenticado' });
+    }
+
+    try {
+      const { content, trip_id, location_id } = req.body;
+
+      if (!content || typeof content !== 'string') {
+        return res.status(400).json({ message: 'content es obligatorio' });
+      }
+
+      const files = req.files || [];
+      const imagesArray = files.map((f) => `/uploads/social/${f.filename}`);
+
+      const created = await insertSocialPost({
+        userId,
+        content: content.trim(),
+        imagesArray,
+        trip_id,
+        location_id,
+      });
+
+      return res.status(201).json({
+        message: 'Post creado',
+        post: created,
+      });
+    } catch (err) {
+      console.error('POST /social/posts/upload error:', err?.message || err);
+      return res.status(500).json({
+        message: 'Error en el servidor',
+        detail: err?.message || String(err),
+      });
+    }
+  }
+);
 
 /**
  * DELETE /social/posts/:id
