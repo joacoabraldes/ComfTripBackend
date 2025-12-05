@@ -2,11 +2,58 @@
 const express = require('express');
 const pool = require('../db');
 const auth = require('../middleware/auth');
+
+const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const multer = require('multer');
+const os = require('os');
 
 const router = express.Router();
+
+/**
+ * Directorio base de uploads
+ * Usamos OS tmpdir para que funcione en Vercel / serverless (/tmp)
+ * y localmente también.
+ */
+const UPLOAD_ROOT =
+  process.env.UPLOAD_DIR || path.join(os.tmpdir(), 'comftrip_uploads');
+
+// Carpeta específica para fotos del social feed
+const uploadDir = path.join(UPLOAD_ROOT, 'social');
+
+// Nos aseguramos de que exista
+fs.mkdirSync(uploadDir, { recursive: true });
+
+/**
+ * Configuración de multer para subir imágenes
+ */
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname || '');
+    const base = path.basename(file.originalname || 'image', ext);
+    const safeBase = base.replace(/[^a-zA-Z0-9_-]/g, '');
+    const ts = Date.now();
+    cb(null, `${safeBase || 'photo'}_${ts}${ext || '.jpg'}`);
+  },
+});
+
+function imageFileFilter(req, file, cb) {
+  if (!file.mimetype || !file.mimetype.startsWith('image/')) {
+    return cb(new Error('Solo se permiten archivos de imagen'), false);
+  }
+  cb(null, true);
+}
+
+const upload = multer({
+  storage,
+  fileFilter: imageFileFilter,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB
+  },
+});
 
 /**
  * Helper para obtener el userId del token
@@ -14,37 +61,6 @@ const router = express.Router();
 function getUserIdFromReq(req) {
   return req.user?.id || req.user?.userId;
 }
-
-/**
- * Configuración de subida de imágenes (JPG/PNG) para posts
- */
-// raíz donde se van a guardar los uploads (configurable)
-const UPLOAD_ROOT =
-  process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
-
-// carpeta específica para fotos del social feed
-const uploadDir = path.join(UPLOAD_ROOT, 'social');
-
-fs.mkdirSync(uploadDir, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: uploadDir,
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname || '');
-    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
-  },
-});
-
-const upload = multer({
-  storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
-  fileFilter: (req, file, cb) => {
-    if (!/^image\/(jpe?g|png|webp|gif)$/i.test(file.mimetype)) {
-      return cb(new Error('Solo se permiten imágenes (jpg, png, webp, gif)'));
-    }
-    cb(null, true);
-  },
-});
 
 /**
  * Normaliza un post
@@ -58,7 +74,7 @@ function normalizePostRow(r) {
     trip_id: r.trip_id,
     location_id: r.location_id,
     content: r.content || '',
-    images: r.images || null,
+    images: r.images || null, // array o null (jsonb en PG)
     created_at: r.created_at,
     like_count:
       r.like_count !== null && r.like_count !== undefined
@@ -70,49 +86,6 @@ function normalizePostRow(r) {
         : 0,
     liked_by_me: r.liked_by_me === true || r.liked_by_me === 't',
   };
-}
-
-/**
- * Helper: inserta un post y devuelve el objeto normalizado con username + name
- */
-async function insertSocialPost({ userId, content, imagesArray, trip_id, location_id }) {
-  const imagesJson =
-    imagesArray && imagesArray.length ? JSON.stringify(imagesArray) : null;
-
-  const insertRes = await pool.query(
-    `
-    INSERT INTO social_posts (user_id, trip_id, location_id, content, images)
-    VALUES ($1, $2, $3, $4, $5)
-    RETURNING id
-    `,
-    [userId, trip_id || null, location_id || null, content, imagesJson]
-  );
-
-  const postId = insertRes.rows[0].id;
-
-  const detail = await pool.query(
-    `
-    SELECT
-      sp.id,
-      sp.user_id,
-      u.name AS author_name,
-      u.username AS author_username,
-      sp.trip_id,
-      sp.location_id,
-      sp.content,
-      sp.images,
-      sp.created_at,
-      0::int AS like_count,
-      0::int AS comment_count,
-      false AS liked_by_me
-    FROM social_posts sp
-    JOIN users u ON u.id = sp.user_id
-    WHERE sp.id = $1
-    `,
-    [postId]
-  );
-
-  return normalizePostRow(detail.rows[0]);
 }
 
 /**
@@ -332,61 +305,15 @@ router.get('/posts/:id', auth, async (req, res) => {
 
 /**
  * POST /social/posts
- * Crea un post nuevo (solo texto o con URLs de imágenes ya conocidas)
- * Body JSON: { content, images?, trip_id?, location_id? }
- */
-router.post('/posts', auth, async (req, res) => {
-  const userId = getUserIdFromReq(req);
-  if (!userId) {
-    return res.status(401).json({ message: 'No autenticado' });
-  }
-
-  try {
-    const { content, images, trip_id, location_id } = req.body;
-
-    if (!content || typeof content !== 'string') {
-      return res.status(400).json({ message: 'content es obligatorio' });
-    }
-
-    let imagesArray = [];
-    if (Array.isArray(images)) {
-      imagesArray = images;
-    } else if (typeof images === 'string' && images.trim() !== '') {
-      imagesArray = [images.trim()];
-    }
-
-    const created = await insertSocialPost({
-      userId,
-      content: content.trim(),
-      imagesArray,
-      trip_id,
-      location_id,
-    });
-
-    return res.status(201).json({
-      message: 'Post creado',
-      post: created,
-    });
-  } catch (err) {
-    console.error('POST /social/posts error:', err?.message || err);
-    return res
-      .status(500)
-      .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
-  }
-});
-
-/**
- * POST /social/posts/upload
- * Crea un post nuevo con subida de imágenes (multipart/form-data)
- * Campos:
- *  - content (string, obligatorio)
- *  - images (uno o varios archivos)
- *  - trip_id?, location_id? (opcionales)
+ * Crea un post nuevo
+ * Soporta:
+ *  - JSON: { content }
+ *  - multipart/form-data: fields content, image (archivo)
  */
 router.post(
-  '/posts/upload',
+  '/posts',
   auth,
-  upload.array('images', 4),
+  upload.single('image'), // campo "image" para la foto
   async (req, res) => {
     const userId = getUserIdFromReq(req);
     if (!userId) {
@@ -394,33 +321,72 @@ router.post(
     }
 
     try {
+      // content puede venir en body independientemente de JSON o multipart
       const { content, trip_id, location_id } = req.body;
 
       if (!content || typeof content !== 'string') {
         return res.status(400).json({ message: 'content es obligatorio' });
       }
 
-      const files = req.files || [];
-      const imagesArray = files.map((f) => `/uploads/social/${f.filename}`);
+      // Armamos array de URLs de imágenes (si hay)
+      let imageUrls = [];
 
-      const created = await insertSocialPost({
-        userId,
-        content: content.trim(),
-        imagesArray,
-        trip_id,
-        location_id,
-      });
+      if (req.file) {
+        // Ruta pública para servir estática: /uploads/social/<filename>
+        imageUrls.push(`/uploads/social/${req.file.filename}`);
+      }
+
+      // Si además vinieran imágenes en el body (URLs existentes), se podrían mergear aquí:
+      // if (req.body.images) { ... }
+
+      const imagesJson = imageUrls.length ? JSON.stringify(imageUrls) : null;
+
+      const result = await pool.query(
+        `
+        INSERT INTO social_posts (user_id, trip_id, location_id, content, images)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, user_id, trip_id, location_id, content, images, created_at
+        `,
+        [
+          userId,
+          trip_id || null,
+          location_id || null,
+          content,
+          imagesJson,
+        ]
+      );
+
+      const post = result.rows[0];
+
+      // Traemos username y name del autor para que la feed lo muestre sin "Usuario"
+      const userRes = await pool.query(
+        'SELECT username, name FROM users WHERE id = $1 LIMIT 1',
+        [userId]
+      );
+      const userRow = userRes.rows[0] || {};
 
       return res.status(201).json({
         message: 'Post creado',
-        post: created,
+        post: {
+          id: post.id,
+          user_id: post.user_id,
+          trip_id: post.trip_id,
+          location_id: post.location_id,
+          content: post.content,
+          images: post.images ? JSON.parse(post.images) : null,
+          created_at: post.created_at,
+          like_count: 0,
+          comment_count: 0,
+          liked_by_me: false,
+          author_username: userRow.username || null,
+          author_name: userRow.name || null,
+        },
       });
     } catch (err) {
-      console.error('POST /social/posts/upload error:', err?.message || err);
-      return res.status(500).json({
-        message: 'Error en el servidor',
-        detail: err?.message || String(err),
-      });
+      console.error('POST /social/posts error:', err?.message || err);
+      return res
+        .status(500)
+        .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
     }
   }
 );
