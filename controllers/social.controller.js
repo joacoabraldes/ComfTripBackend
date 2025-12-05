@@ -12,7 +12,7 @@ const router = express.Router();
 
 /**
  * Directorio base de uploads
- * Usamos OS tmpdir para que funcione en Vercel / serverless (/tmp)
+ * Usamos OS tmpdir para que funcione en entornos serverless (/tmp)
  * y localmente también.
  */
 const UPLOAD_ROOT =
@@ -74,7 +74,7 @@ function normalizePostRow(r) {
     trip_id: r.trip_id,
     location_id: r.location_id,
     content: r.content || '',
-    images: r.images || null, // array o null (jsonb en PG)
+    images: r.images || null, // array/jsonb o null
     created_at: r.created_at,
     like_count:
       r.like_count !== null && r.like_count !== undefined
@@ -90,8 +90,7 @@ function normalizePostRow(r) {
 
 /**
  * GET /social/feed
- * Feed del usuario autenticado + sus amigos (friend_requests con status 'accepted')
- * Query params: limit, offset
+ * Feed del usuario autenticado + sus amigos
  */
 router.get('/feed', auth, async (req, res) => {
   const userId = getUserIdFromReq(req);
@@ -305,121 +304,94 @@ router.get('/posts/:id', auth, async (req, res) => {
 
 /**
  * POST /social/posts
- * Crea un post nuevo
- * Soporta:
- *  - JSON: { content }
- *  - multipart/form-data: fields content, image (archivo)
+ * Crea un post nuevo (texto opcional + imagen opcional)
+ * Se permite:
+ *  - solo texto
+ *  - solo imagen
+ *  - texto + imagen
  */
-// src/services/socialService.js
-const API_BASE =
-  (process.env.REACT_APP_API_URL || '/api').replace(/\/$/, ''); // sin barra final
+router.post(
+  '/posts',
+  auth,
+  upload.single('image'),
+  async (req, res) => {
+    const userId = getUserIdFromReq(req);
+    if (!userId) {
+      return res.status(401).json({ message: 'No autenticado' });
+    }
 
-function getAuthHeaders() {
-  try {
-    const token = localStorage.getItem('token');
-    return token ? { Authorization: `Bearer ${token}` } : {};
-  } catch {
-    return {};
+    try {
+      const { content = '', trip_id, location_id } = req.body;
+
+      const textOk = typeof content === 'string' && content.trim().length > 0;
+      const hasImage = !!req.file;
+
+      if (!textOk && !hasImage) {
+        return res
+          .status(400)
+          .json({ message: 'Debes enviar texto o al menos una imagen' });
+      }
+
+      let imageUrls = [];
+
+      if (hasImage) {
+        const baseUrl =
+          process.env.PUBLIC_BACKEND_URL ||
+          `${req.protocol}://${req.get('host')}`;
+
+        imageUrls.push(`${baseUrl}/uploads/social/${req.file.filename}`);
+      }
+
+      const imagesJson = imageUrls.length ? JSON.stringify(imageUrls) : null;
+
+      const result = await pool.query(
+        `
+        INSERT INTO social_posts (user_id, trip_id, location_id, content, images)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, user_id, trip_id, location_id, content, images, created_at
+        `,
+        [
+          userId,
+          trip_id || null,
+          location_id || null,
+          textOk ? content : '',
+          imagesJson,
+        ]
+      );
+
+      const post = result.rows[0];
+
+      const userRes = await pool.query(
+        'SELECT username, name FROM users WHERE id = $1 LIMIT 1',
+        [userId]
+      );
+      const userRow = userRes.rows[0] || {};
+
+      return res.status(201).json({
+        message: 'Post creado',
+        post: {
+          id: post.id,
+          user_id: post.user_id,
+          trip_id: post.trip_id,
+          location_id: post.location_id,
+          content: post.content || '',
+          images: post.images ? JSON.parse(post.images) : null,
+          created_at: post.created_at,
+          like_count: 0,
+          comment_count: 0,
+          liked_by_me: false,
+          author_username: userRow.username || null,
+          author_name: userRow.name || null,
+        },
+      });
+    } catch (err) {
+      console.error('POST /social/posts error:', err?.message || err);
+      return res
+        .status(500)
+        .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+    }
   }
-}
-
-async function handleJsonResponse(res, defaultError) {
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(text || defaultError);
-  }
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error(text || defaultError);
-  }
-}
-
-// -------- FEED --------
-export async function fetchSocialFeed() {
-  const res = await fetch(`${API_BASE}/social/feed`, {
-    headers: {
-      ...getAuthHeaders(),
-    },
-  });
-  return handleJsonResponse(res, 'Error cargando el feed');
-}
-
-// -------- CREAR POST --------
-export async function createSocialPost({ content, files }) {
-  const hasFiles = files && files.length > 0;
-  const trimmed = (content || '').trim();
-
-  // Si NO hay imagen, mandamos JSON normal
-  if (!hasFiles) {
-    const res = await fetch(`${API_BASE}/social/posts`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...getAuthHeaders(),
-      },
-      body: JSON.stringify({ content: trimmed }),
-    });
-    return handleJsonResponse(res, 'Error al crear el post');
-  }
-
-  // Si hay imagen, usamos FormData (texto opcional)
-  const formData = new FormData();
-  if (trimmed.length > 0) {
-    formData.append('content', trimmed);
-  } else {
-    formData.append('content', ''); // el backend lo maneja
-  }
-
-  // Por ahora usamos solo la primera imagen
-  formData.append('image', files[0]);
-
-  const res = await fetch(`${API_BASE}/social/posts`, {
-    method: 'POST',
-    headers: {
-      ...getAuthHeaders(),
-      // IMPORTANTE: NO poner Content-Type, lo setea el navegador
-    },
-    body: formData,
-  });
-
-  return handleJsonResponse(res, 'Error al crear el post');
-}
-
-// -------- LIKE / UNLIKE --------
-export async function togglePostLike(postId) {
-  const res = await fetch(`${API_BASE}/social/posts/${postId}/like`, {
-    method: 'POST',
-    headers: {
-      ...getAuthHeaders(),
-    },
-  });
-  return handleJsonResponse(res, 'Error cambiando like');
-}
-
-// -------- COMENTARIOS --------
-export async function fetchPostComments(postId) {
-  const res = await fetch(`${API_BASE}/social/posts/${postId}/comments`, {
-    headers: {
-      ...getAuthHeaders(),
-    },
-  });
-  return handleJsonResponse(res, 'Error cargando comentarios');
-}
-
-export async function addPostComment(postId, content) {
-  const res = await fetch(`${API_BASE}/social/posts/${postId}/comments`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...getAuthHeaders(),
-    },
-    body: JSON.stringify({ content }),
-  });
-  return handleJsonResponse(res, 'Error agregando comentario');
-}
-
-
+);
 
 /**
  * DELETE /social/posts/:id
@@ -485,14 +457,12 @@ router.post('/posts/:id/like', auth, async (req, res) => {
     );
 
     if (like.rows.length) {
-      // ya existe -> unlike
       await pool.query(
         `DELETE FROM social_post_likes WHERE post_id = $1 AND user_id = $2`,
         [postId, userId]
       );
       return res.json({ liked: false });
     } else {
-      // no existe -> like
       await pool.query(
         `INSERT INTO social_post_likes (post_id, user_id) VALUES ($1, $2)`,
         [postId, userId]
