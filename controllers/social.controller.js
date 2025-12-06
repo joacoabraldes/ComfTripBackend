@@ -346,13 +346,14 @@ router.post(
         imageUrls.push(`/uploads/social/${req.file.filename}`);
       }
 
-      // Para columna json/jsonb podemos mandar directamente el array
-      const imagesValue = imageUrls.length ? imageUrls : null;
+      // Para la columna jsonb hay que mandar JSON válido (stringificado)
+      // Ej: '["/uploads/social/archivo.jpg"]' o NULL
+      const imagesJson = imageUrls.length ? JSON.stringify(imageUrls) : null;
 
       const result = await pool.query(
         `
         INSERT INTO social_posts (user_id, trip_id, location_id, content, images)
-        VALUES ($1, $2, $3, $4, $5)
+        VALUES ($1, $2, $3, $4, $5::jsonb)
         RETURNING id, user_id, trip_id, location_id, content, images, created_at
         `,
         [
@@ -360,7 +361,7 @@ router.post(
           trip_id || null,
           location_id || null,
           content,
-          imagesValue,
+          imagesJson, // <- string JSON o null
         ]
       );
 
@@ -380,7 +381,7 @@ router.post(
           trip_id: post.trip_id,
           location_id: post.location_id,
           content: post.content,
-          images: post.images ?? null,
+          images: post.images ?? null, // ya viene parseado como array de JS
           created_at: post.created_at,
           like_count: 0,
           comment_count: 0,
@@ -398,6 +399,7 @@ router.post(
     }
   }
 );
+
 
 /**
  * DELETE /social/posts/:id
