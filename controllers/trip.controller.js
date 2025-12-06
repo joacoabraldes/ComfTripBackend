@@ -962,28 +962,6 @@ async function handleItinerary(req, res) {
   }
 }
 
-/**
- * GET /trips/:id/itinerary
- */
-async function getLastItinerary(req, res) {
-  try {
-    const tripId = Number(req.params.id);
-    const userId = req.user.id;
-    if (!Number.isFinite(tripId) || tripId <= 0) return res.status(400).json({ message: 'Invalid trip id' });
-
-    const tripRes = await pool.query('SELECT user_id FROM trips WHERE id = $1 LIMIT 1', [tripId]);
-    if (!tripRes.rows.length) return res.status(404).json({ message: 'Trip no encontrado' });
-    if (tripRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
-
-    const r = await pool.query('SELECT id, trip_id, user_id, status, generated_json, created_at, finished_at FROM itinerary_generations WHERE trip_id = $1 ORDER BY created_at DESC LIMIT 1', [tripId]);
-    if (!r.rows.length) return res.status(404).json({ message: 'No hay generaciones' });
-    return res.json(r.rows[0]);
-  } catch (err) {
-    console.error('GET /trips/:id/itinerary error:', err);
-    res.status(500).json({ message: 'Error' });
-  }
-}
-
 // SHARE
 router.post('/:id/share', auth, async (req, res) => {
   const client = await pool.connect();
@@ -1119,70 +1097,6 @@ async function getLastItinerary(req, res) {
     res.status(500).json({ message: 'Error' });
   }
 }
-
-// ----------------------
-// The rest of the original file's endpoints (share, list trips, create trip, get trip, update, delete, places, auto-insert)
-// are included below without changes to their logic (except minor formatting).
-// ----------------------
-
-/* GET / (list trips) */
-router.get('/', auth, async (req, res) => {
-  try {
-    const userId = req.user.id;
-
-    const sql = `
-      SELECT
-        t.id, t.user_id, t.destination, t.start_date, t.end_date, t.budget, t.notes, t.created_at,
-        COALESCE(tp.places, '[]') AS places,
-        ts.id AS share_id,
-        ts.shared_by AS share_shared_by,
-        ts.shared_with AS share_shared_with,
-        ts.mode AS share_mode,
-        ts.public AS share_public,
-        ts.share_uuid AS share_uuid,
-        ts.expires_at AS share_expires_at
-      FROM trips t
-      LEFT JOIN (
-        ${PLACES_AGG_SUBQUERY}
-      ) tp ON tp.fk_trips = t.id
-      LEFT JOIN LATERAL (
-        SELECT * FROM trip_shares
-        WHERE trip_id = t.id
-          AND (shared_with = $1 OR public = true)
-          AND (expires_at IS NULL OR expires_at > now())
-        ORDER BY (shared_with = $1) DESC, created_at DESC
-        LIMIT 1
-      ) ts ON true
-      WHERE t.user_id = $1 OR ts.id IS NOT NULL
-      ORDER BY t.start_date DESC
-    `;
-
-    const result = await pool.query(sql, [userId]);
-    const trips = result.rows.map((r) => {
-      const trip = normalizeTripRow(r);
-      trip.places = r.places || [];
-      if (r.share_id) {
-        trip.share = {
-          id: r.share_id,
-          shared_by: r.share_shared_by,
-          shared_with: r.share_shared_with,
-          mode: r.share_mode,
-          public: r.share_public,
-          share_uuid: r.share_uuid,
-          expires_at: r.share_expires_at
-        };
-      } else {
-        trip.share = null;
-      }
-      return trip;
-    });
-
-    res.json(trips);
-  } catch (err) {
-    console.error('GET /trips error:', err);
-    res.status(500).json({ message: 'Error' });
-  }
-});
 
 router.post('/', auth, async (req, res) => {
   const client = await pool.connect();
