@@ -8,6 +8,32 @@ const auth = require('../middleware/auth');
 const router = express.Router();
 
 // ----------------------
+// Initialize trip_reviews table if it doesn't exist
+// ----------------------
+(async function initTripReviewsTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS trip_reviews (
+        id SERIAL PRIMARY KEY,
+        trip_id INT NOT NULL,
+        user_id INT NOT NULL,
+        rating INT CHECK (rating >= 1 AND rating <= 5),
+        title VARCHAR(255),
+        comment TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        CONSTRAINT fk_tr_trip FOREIGN KEY(trip_id) REFERENCES trips(id) ON DELETE CASCADE,
+        CONSTRAINT fk_tr_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+        CONSTRAINT unique_trip_review UNIQUE(trip_id, user_id)
+      )
+    `);
+    console.log('trip_reviews table initialized');
+  } catch (err) {
+    console.error('Error initializing trip_reviews table:', err);
+  }
+})();
+
+// ----------------------
 // Utilities kept from original file (normalizeTripRow, PLACES_AGG_SUBQUERY)
 // ----------------------
 function normalizeTripRow(row) {
@@ -1281,6 +1307,189 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
+/* GET /trips/:id/review */
+router.get('/:id/review', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const tripId = Number(req.params.id);
+    const userId = req.user.id;
+
+    if (!Number.isFinite(tripId) || tripId <= 0) {
+      return res.status(400).json({ message: 'trip_id inválido' });
+    }
+
+    // Verify trip exists and user has access
+    const tripRes = await client.query('SELECT user_id FROM trips WHERE id = $1 LIMIT 1', [tripId]);
+    if (!tripRes.rows.length) {
+      return res.status(404).json({ message: 'Viaje no encontrado' });
+    }
+
+    // Get review for this trip and user
+    const reviewRes = await client.query(
+      'SELECT id, trip_id, user_id, rating, title, comment, created_at, updated_at FROM trip_reviews WHERE trip_id = $1 AND user_id = $2 LIMIT 1',
+      [tripId, userId]
+    );
+
+    if (!reviewRes.rows.length) {
+      return res.status(404).json({ message: 'Review no encontrado' });
+    }
+
+    return res.json(reviewRes.rows[0]);
+  } catch (err) {
+    console.error('GET /trips/:id/review error:', err);
+    return res.status(500).json({ message: 'Error obteniendo review' });
+  } finally {
+    client.release();
+  }
+});
+
+/* POST /trips/:id/review */
+router.post('/:id/review', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const tripId = Number(req.params.id);
+    const userId = req.user.id;
+    const { rating, title, comment } = req.body || {};
+
+    if (!Number.isFinite(tripId) || tripId <= 0) {
+      return res.status(400).json({ message: 'trip_id inválido' });
+    }
+
+    if (!rating || rating < 1 || rating > 5) {
+      return res.status(400).json({ message: 'rating debe ser un número entre 1 y 5' });
+    }
+
+    if (!title || String(title).trim().length === 0) {
+      return res.status(400).json({ message: 'title es requerido' });
+    }
+
+    // Verify trip exists and user owns it
+    const tripRes = await client.query('SELECT user_id FROM trips WHERE id = $1 LIMIT 1', [tripId]);
+    if (!tripRes.rows.length) {
+      return res.status(404).json({ message: 'Viaje no encontrado' });
+    }
+    if (tripRes.rows[0].user_id !== userId) {
+      return res.status(403).json({ message: 'No autorizado' });
+    }
+
+    // Check if review already exists
+    const existingRes = await client.query(
+      'SELECT id FROM trip_reviews WHERE trip_id = $1 AND user_id = $2 LIMIT 1',
+      [tripId, userId]
+    );
+
+    if (existingRes.rows.length > 0) {
+      return res.status(409).json({ message: 'Ya existe un review para este viaje' });
+    }
+
+    await client.query('BEGIN');
+
+    const insertRes = await client.query(
+      `INSERT INTO trip_reviews (trip_id, user_id, rating, title, comment, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, now(), now())
+       RETURNING id, trip_id, user_id, rating, title, comment, created_at, updated_at`,
+      [tripId, userId, rating, String(title).trim(), comment ? String(comment).trim() : null]
+    );
+
+    await client.query('COMMIT');
+
+    return res.status(201).json(insertRes.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('POST /trips/:id/review error:', err);
+    return res.status(500).json({ message: 'Error creando review' });
+  } finally {
+    client.release();
+  }
+});
+
+/* PUT /trips/:id/review */
+router.put('/:id/review', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const tripId = Number(req.params.id);
+    const userId = req.user.id;
+    const { rating, title, comment } = req.body || {};
+
+    if (!Number.isFinite(tripId) || tripId <= 0) {
+      return res.status(400).json({ message: 'trip_id inválido' });
+    }
+
+    if (rating !== undefined && (rating < 1 || rating > 5)) {
+      return res.status(400).json({ message: 'rating debe ser un número entre 1 y 5' });
+    }
+
+    if (title !== undefined && String(title).trim().length === 0) {
+      return res.status(400).json({ message: 'title no puede estar vacío' });
+    }
+
+    // Verify trip exists and user owns it
+    const tripRes = await client.query('SELECT user_id FROM trips WHERE id = $1 LIMIT 1', [tripId]);
+    if (!tripRes.rows.length) {
+      return res.status(404).json({ message: 'Viaje no encontrado' });
+    }
+    if (tripRes.rows[0].user_id !== userId) {
+      return res.status(403).json({ message: 'No autorizado' });
+    }
+
+    // Check if review exists
+    const existingRes = await client.query(
+      'SELECT id FROM trip_reviews WHERE trip_id = $1 AND user_id = $2 LIMIT 1',
+      [tripId, userId]
+    );
+
+    if (!existingRes.rows.length) {
+      return res.status(404).json({ message: 'Review no encontrado' });
+    }
+
+    await client.query('BEGIN');
+
+    // Build update query dynamically based on provided fields
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+
+    if (rating !== undefined) {
+      updates.push(`rating = $${paramIndex++}`);
+      values.push(rating);
+    }
+    if (title !== undefined) {
+      updates.push(`title = $${paramIndex++}`);
+      values.push(String(title).trim());
+    }
+    if (comment !== undefined) {
+      updates.push(`comment = $${paramIndex++}`);
+      values.push(comment ? String(comment).trim() : null);
+    }
+
+    if (updates.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'No hay campos para actualizar' });
+    }
+
+    updates.push(`updated_at = now()`);
+    values.push(tripId, userId);
+
+    const updateRes = await client.query(
+      `UPDATE trip_reviews 
+       SET ${updates.join(', ')}
+       WHERE trip_id = $${paramIndex++} AND user_id = $${paramIndex++}
+       RETURNING id, trip_id, user_id, rating, title, comment, created_at, updated_at`,
+      values
+    );
+
+    await client.query('COMMIT');
+
+    return res.json(updateRes.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('PUT /trips/:id/review error:', err);
+    return res.status(500).json({ message: 'Error actualizando review' });
+  } finally {
+    client.release();
+  }
+});
+
 /* GET /trips/:id */
 router.get('/:id', auth, async (req, res) => {
   try {
@@ -1299,7 +1508,13 @@ router.get('/:id', auth, async (req, res) => {
         ts.mode AS share_mode,
         ts.public AS share_public,
         ts.share_uuid AS share_uuid,
-        ts.expires_at AS share_expires_at
+        ts.expires_at AS share_expires_at,
+        tr.id AS review_id,
+        tr.rating AS review_rating,
+        tr.title AS review_title,
+        tr.comment AS review_comment,
+        tr.created_at AS review_created_at,
+        tr.updated_at AS review_updated_at
       FROM trips t
       LEFT JOIN (
         ${PLACES_AGG_SUBQUERY}
@@ -1312,6 +1527,7 @@ router.get('/:id', auth, async (req, res) => {
         ORDER BY (shared_with = $2) DESC, created_at DESC
         LIMIT 1
       ) ts ON true
+      LEFT JOIN trip_reviews tr ON tr.trip_id = t.id AND tr.user_id = $2
       WHERE t.id = $1
       LIMIT 1
     `;
@@ -1347,6 +1563,21 @@ router.get('/:id', auth, async (req, res) => {
       };
     } else {
       trip.share = null;
+    }
+
+    if (row.review_id) {
+      trip.review = {
+        id: row.review_id,
+        trip_id: row.id,
+        user_id: row.user_id,
+        rating: row.review_rating,
+        title: row.review_title,
+        comment: row.review_comment,
+        created_at: row.review_created_at,
+        updated_at: row.review_updated_at
+      };
+    } else {
+      trip.review = null;
     }
 
     res.json(trip);
