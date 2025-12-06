@@ -984,11 +984,6 @@ async function getLastItinerary(req, res) {
   }
 }
 
-// Wire routes
-router.post('/:id/itinerary', auth, handleItinerary);
-router.get('/:id/itinerary', auth, getLastItinerary);
-
-
 // SHARE
 router.post('/:id/share', auth, async (req, res) => {
   const client = await pool.connect();
@@ -1125,67 +1120,10 @@ async function getLastItinerary(req, res) {
   }
 }
 
-// Wire itinerary routes
-router.post('/:id/itinerary', auth, handleItinerary);
-router.get('/:id/itinerary', auth, getLastItinerary);
-
 // ----------------------
 // The rest of the original file's endpoints (share, list trips, create trip, get trip, update, delete, places, auto-insert)
 // are included below without changes to their logic (except minor formatting).
 // ----------------------
-
-// SHARE
-router.post('/:id/share', auth, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const tripId = Number(req.params.id);
-    const userId = req.user.id;
-    if (!Number.isFinite(tripId) || tripId <= 0) return res.status(400).json({ message: 'Invalid trip id' });
-
-    const { mode = 'viewer', public: isPublic = false, shared_with_user_id, expires_in_days } = req.body || {};
-
-    const ownerRes = await pool.query('SELECT user_id FROM trips WHERE id = $1', [tripId]);
-    if (!ownerRes.rows.length) return res.status(404).json({ message: 'Trip no encontrado' });
-    if (ownerRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
-
-    if (!['viewer','editor'].includes(mode)) return res.status(400).json({ message: 'Invalid mode' });
-
-    let sharedWith = null;
-    if (shared_with_user_id) {
-      const other = await pool.query('SELECT id FROM users WHERE id = $1 LIMIT 1', [Number(shared_with_user_id)]);
-      if (!other.rows.length) return res.status(404).json({ message: 'Usuario compartido no encontrado' });
-      sharedWith = Number(shared_with_user_id);
-      if (sharedWith === userId) {
-        return res.status(400).json({ message: 'No puedes compartir un viaje contigo mismo (usa público si quieres)' });
-      }
-    }
-
-    let expiresAt = null;
-    if (expires_in_days && Number.isFinite(Number(expires_in_days)) && Number(expires_in_days) > 0) {
-      const days = Number(expires_in_days);
-      expiresAt = new Date(Date.now() + days * 24 * 3600 * 1000);
-    }
-
-    await client.query('BEGIN');
-    const insertSQL = `INSERT INTO trip_shares (trip_id, shared_by, shared_with, mode, public, expires_at)
-                       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, trip_id, shared_by, shared_with, mode, public, share_uuid, expires_at, created_at`;
-    const values = [tripId, userId, sharedWith, mode, !!isPublic, expiresAt];
-    const r = await client.query(insertSQL, values);
-    await client.query('COMMIT');
-
-    const shareRow = r.rows[0];
-    const base = `${req.protocol}://${req.get('host')}`;
-    const url = `${base}/api/share/trip/${shareRow.share_uuid}`;
-
-    return res.status(201).json({ url, share: shareRow });
-  } catch (err) {
-    await client.query('ROLLBACK').catch(()=>{});
-    console.error('POST /trips/:id/share error:', err);
-    return res.status(500).json({ message: 'Error creating share' });
-  } finally {
-    client.release();
-  }
-});
 
 /* GET / (list trips) */
 router.get('/', auth, async (req, res) => {
@@ -1306,6 +1244,10 @@ router.post('/', auth, async (req, res) => {
     client.release();
   }
 });
+
+// ======================
+// REVIEW ROUTES (must be before /:id route)
+// ======================
 
 /* GET /trips/:id/review */
 router.get('/:id/review', auth, async (req, res) => {
@@ -1489,6 +1431,17 @@ router.put('/:id/review', auth, async (req, res) => {
     client.release();
   }
 });
+
+// ======================
+// ITINERARY ROUTES (must be before /:id route)
+// ======================
+
+router.post('/:id/itinerary', auth, handleItinerary);
+router.get('/:id/itinerary', auth, getLastItinerary);
+
+// ======================
+// TRIP CRUD ROUTES
+// ======================
 
 /* GET /trips/:id */
 router.get('/:id', auth, async (req, res) => {
