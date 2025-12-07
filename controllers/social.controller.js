@@ -8,23 +8,23 @@ const auth = require('../middleware/auth');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const os = require('os'); // <--- NUEVO
+const os = require('os');
 
 const router = express.Router();
 
 /**
  * Directorio base de uploads
- * Debe coincidir con el de server.js:
+ * DEBE COINCIDIR con server.js:
  *   const UPLOAD_ROOT = process.env.UPLOAD_DIR || path.join(os.tmpdir(), 'comftrip_uploads');
  *   app.use('/uploads', express.static(UPLOAD_ROOT));
  */
 const UPLOAD_ROOT =
   process.env.UPLOAD_DIR || path.join(os.tmpdir(), 'comftrip_uploads');
 
-// Carpeta específica para fotos del social feed
+// Carpeta específica para fotos del social feed: /tmp/comftrip_uploads/social
 const uploadDir = path.join(UPLOAD_ROOT, 'social');
 
-// Nos aseguramos de que exista (en /tmp, que sí es escribible)
+// Nos aseguramos de que exista (en /tmp sí se puede escribir en serverless)
 fs.mkdirSync(uploadDir, { recursive: true });
 
 /**
@@ -67,6 +67,7 @@ function getUserIdFromReq(req) {
 
 /**
  * Normaliza un post
+ * images ahora es text[] en la BD, el driver pg lo devuelve como array de strings.
  */
 function normalizePostRow(r) {
   return {
@@ -77,7 +78,7 @@ function normalizePostRow(r) {
     trip_id: r.trip_id,
     location_id: r.location_id,
     content: r.content || '',
-    images: r.images ?? null, // puede ser array (jsonb) o string
+    images: r.images || null, // text[] o null
     created_at: r.created_at,
     like_count:
       r.like_count !== null && r.like_count !== undefined
@@ -173,6 +174,7 @@ router.get('/feed', auth, async (req, res) => {
 
 /**
  * GET /social/posts
+ * Lista de posts (opcionalmente por user_id)
  */
 router.get('/posts', auth, async (req, res) => {
   try {
@@ -243,6 +245,7 @@ router.get('/posts', auth, async (req, res) => {
 
 /**
  * GET /social/posts/:id
+ * Detalle de un post (con contadores)
  */
 router.get('/posts/:id', auth, async (req, res) => {
   const userId = getUserIdFromReq(req);
@@ -308,6 +311,10 @@ router.get('/posts/:id', auth, async (req, res) => {
 
 /**
  * POST /social/posts
+ * Crea un post nuevo
+ * Soporta:
+ *  - JSON: { content }
+ *  - multipart/form-data: fields content, image (archivo)
  */
 router.post('/posts', auth, upload.single('image'), async (req, res) => {
   const userId = getUserIdFromReq(req);
@@ -328,12 +335,13 @@ router.post('/posts', auth, upload.single('image'), async (req, res) => {
       });
     }
 
+    // Armamos array de URLs de imágenes (text[])
     let imageUrls = [];
     if (hasImage) {
       imageUrls.push(`/uploads/social/${req.file.filename}`);
     }
 
-    const imagesValue = imageUrls.length ? imageUrls : null;
+    const imagesValue = imageUrls.length ? imageUrls : null; // text[] o null
 
     const result = await pool.query(
       `
@@ -360,7 +368,7 @@ router.post('/posts', auth, upload.single('image'), async (req, res) => {
         trip_id: post.trip_id,
         location_id: post.location_id,
         content: post.content,
-        images: post.images ?? null,
+        images: post.images || null,
         created_at: post.created_at,
         like_count: 0,
         comment_count: 0,
@@ -380,6 +388,7 @@ router.post('/posts', auth, upload.single('image'), async (req, res) => {
 
 /**
  * DELETE /social/posts/:id
+ * Solo el autor puede borrar
  */
 router.delete('/posts/:id', auth, async (req, res) => {
   const userId = getUserIdFromReq(req);
@@ -417,6 +426,7 @@ router.delete('/posts/:id', auth, async (req, res) => {
 
 /**
  * POST /social/posts/:id/like
+ * Toggle like/unlike para el usuario actual
  */
 router.post('/posts/:id/like', auth, async (req, res) => {
   const userId = getUserIdFromReq(req);
@@ -464,6 +474,7 @@ router.post('/posts/:id/like', auth, async (req, res) => {
 
 /**
  * GET /social/posts/:id/comments
+ * Lista comentarios de un post
  */
 router.get('/posts/:id/comments', auth, async (req, res) => {
   try {
@@ -508,6 +519,7 @@ router.get('/posts/:id/comments', auth, async (req, res) => {
 
 /**
  * POST /social/posts/:id/comments
+ * Crea un comentario
  */
 router.post('/posts/:id/comments', auth, async (req, res) => {
   const userId = getUserIdFromReq(req);
