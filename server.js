@@ -1,9 +1,8 @@
-// server.js
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const os = require('os');
+const os = require('os'); // si querés usar tmp en algún momento
 const emailService = require('./services/email.service');
 
 const authRoutes = require('./controllers/auth.controller');
@@ -27,14 +26,18 @@ app.use(
 
 app.use(express.json());
 
-// --- uploads estáticos (deben coincidir con social.controller.js) ---
+/**
+ * === UPLOADS ESTÁTICOS ===
+ * Usamos SIEMPRE el mismo root en todo el backend.
+ * Carpeta física: <raíz del proyecto>/uploads
+ */
 const UPLOAD_ROOT =
-  process.env.UPLOAD_DIR || path.join(os.tmpdir(), 'comftrip_uploads');
+  process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
 
-// sirve /uploads/** desde UPLOAD_ROOT
+// /uploads/** → sirve archivos desde UPLOAD_ROOT
 app.use('/uploads', express.static(UPLOAD_ROOT));
 
-// prefijo /api para separar de las rutas de React
+// --- Rutas API (todas con prefijo /api) ---
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/trips', tripRoutes);
