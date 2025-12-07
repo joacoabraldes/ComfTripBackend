@@ -1,4 +1,6 @@
 // controllers/social.controller.js
+'use strict';
+
 const express = require('express');
 const pool = require('../db');
 const auth = require('../middleware/auth');
@@ -6,16 +8,15 @@ const auth = require('../middleware/auth');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
 
 const router = express.Router();
 
 /**
  * Directorio base de uploads
- * Usamos OS tmpdir para que funcione en serverless (/tmp) y localmente.
+ * USAR LA MISMA RUTA QUE EN server.js PARA app.use('/uploads', express.static(...))
  */
 const UPLOAD_ROOT =
-  process.env.UPLOAD_DIR || path.join(os.tmpdir(), 'comftrip_uploads');
+  process.env.UPLOAD_DIR || path.join(__dirname, '..', 'uploads');
 
 // Carpeta específica para fotos del social feed
 const uploadDir = path.join(UPLOAD_ROOT, 'social');
@@ -315,91 +316,77 @@ router.get('/posts/:id', auth, async (req, res) => {
  *  - solo imagen
  *  - texto + imagen
  */
-router.post(
-  '/posts',
-  auth,
-  upload.single('image'),
-  async (req, res) => {
-    const userId = getUserIdFromReq(req);
-    if (!userId) {
-      return res.status(401).json({ message: 'No autenticado' });
-    }
-
-    try {
-      const { content: rawContent, trip_id, location_id } = req.body;
-
-      const content =
-        typeof rawContent === 'string' ? rawContent.trim() : '';
-
-      const hasImage = !!req.file;
-      const hasText = content.length > 0;
-
-      if (!hasImage && !hasText) {
-        return res.status(400).json({
-          message: 'El post debe tener texto, imagen o ambos',
-        });
-      }
-
-      // Armamos array de URLs de imágenes (si hay)
-      let imageUrls = [];
-      if (hasImage) {
-        imageUrls.push(`/uploads/social/${req.file.filename}`);
-      }
-
-      // Para la columna jsonb hay que mandar JSON válido (stringificado)
-      // Ej: '["/uploads/social/archivo.jpg"]' o NULL
-      const imagesJson = imageUrls.length ? JSON.stringify(imageUrls) : null;
-
-      const result = await pool.query(
-        `
-        INSERT INTO social_posts (user_id, trip_id, location_id, content, images)
-        VALUES ($1, $2, $3, $4, $5::jsonb)
-        RETURNING id, user_id, trip_id, location_id, content, images, created_at
-        `,
-        [
-          userId,
-          trip_id || null,
-          location_id || null,
-          content,
-          imagesJson, // <- string JSON o null
-        ]
-      );
-
-      const post = result.rows[0];
-
-      const userRes = await pool.query(
-        'SELECT username, name FROM users WHERE id = $1 LIMIT 1',
-        [userId]
-      );
-      const userRow = userRes.rows[0] || {};
-
-      return res.status(201).json({
-        message: 'Post creado',
-        post: {
-          id: post.id,
-          user_id: post.user_id,
-          trip_id: post.trip_id,
-          location_id: post.location_id,
-          content: post.content,
-          images: post.images ?? null, // ya viene parseado como array de JS
-          created_at: post.created_at,
-          like_count: 0,
-          comment_count: 0,
-          liked_by_me: false,
-          author_username: userRow.username || null,
-          author_name: userRow.name || null,
-        },
-      });
-    } catch (err) {
-      console.error('POST /social/posts error:', err?.message || err);
-      return res.status(500).json({
-        message: 'Error en el servidor',
-        detail: err?.message || String(err),
-      });
-    }
+router.post('/posts', auth, upload.single('image'), async (req, res) => {
+  const userId = getUserIdFromReq(req);
+  if (!userId) {
+    return res.status(401).json({ message: 'No autenticado' });
   }
-);
 
+  try {
+    const { content: rawContent, trip_id, location_id } = req.body;
+
+    const content = typeof rawContent === 'string' ? rawContent.trim() : '';
+
+    const hasImage = !!req.file;
+    const hasText = content.length > 0;
+
+    if (!hasImage && !hasText) {
+      return res.status(400).json({
+        message: 'El post debe tener texto, imagen o ambos',
+      });
+    }
+
+    // Armamos array de URLs de imágenes (si hay)
+    let imageUrls = [];
+    if (hasImage) {
+      imageUrls.push(`/uploads/social/${req.file.filename}`);
+    }
+
+    // Para columna json/jsonb podemos mandar directamente el array
+    const imagesValue = imageUrls.length ? imageUrls : null;
+
+    const result = await pool.query(
+      `
+        INSERT INTO social_posts (user_id, trip_id, location_id, content, images)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, user_id, trip_id, location_id, content, images, created_at
+      `,
+      [userId, trip_id || null, location_id || null, content, imagesValue]
+    );
+
+    const post = result.rows[0];
+
+    const userRes = await pool.query(
+      'SELECT username, name FROM users WHERE id = $1 LIMIT 1',
+      [userId]
+    );
+    const userRow = userRes.rows[0] || {};
+
+    return res.status(201).json({
+      message: 'Post creado',
+      post: {
+        id: post.id,
+        user_id: post.user_id,
+        trip_id: post.trip_id,
+        location_id: post.location_id,
+        content: post.content,
+        images: post.images ?? null,
+        created_at: post.created_at,
+        like_count: 0,
+        comment_count: 0,
+        liked_by_me: false,
+        author_username: userRow.username || null,
+        author_name: userRow.name || null,
+      },
+    });
+  } catch (err) {
+    console.error('POST /social/posts error:', err?.message || err);
+    return res.status(500).json({
+      message: 'Error en el servidor',
+      detail: err?.message || String(err),
+    });
+  }
+});
 
 /**
  * DELETE /social/posts/:id
@@ -560,9 +547,9 @@ router.post('/posts/:id/comments', auth, async (req, res) => {
 
     const result = await pool.query(
       `
-      INSERT INTO social_post_comments (post_id, user_id, content)
-      VALUES ($1, $2, $3)
-      RETURNING id, post_id, user_id, content, created_at
+        INSERT INTO social_post_comments (post_id, user_id, content)
+        VALUES ($1, $2, $3)
+        RETURNING id, post_id, user_id, content, created_at
       `,
       [postId, userId, content]
     );
