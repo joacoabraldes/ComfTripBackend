@@ -12,17 +12,30 @@ const router = express.Router();
 function normalizeRow(r) {
   return {
     id: r.id,
-    title: r.titulo || null, 
+    title: r.titulo || null,
     interest: r.fk_interest || null,
     description: r.descripcion || null,
-    latitude: r.latitud !== null && r.latitud !== undefined ? Number(r.latitud) : null,
-    longitude: r.longitud !== null && r.longitud !== undefined ? Number(r.longitud) : null,
+    latitude:
+      r.latitud !== null && r.latitud !== undefined
+        ? Number(r.latitud)
+        : null,
+    longitude:
+      r.longitud !== null && r.longitud !== undefined
+        ? Number(r.longitud)
+        : null,
     images: r.imagenes || null,
-    relevance: r.relevancia !== null && r.relevancia !== undefined ? Number(r.relevancia) : null,
+    relevance:
+      r.relevancia !== null && r.relevancia !== undefined
+        ? Number(r.relevancia)
+        : null,
     country: r.country || null,
     city: r.city || null,
     opening_hours: r.opening_hours || null,
-    website: r.website || null
+    website: r.website || null,
+    // nuevos campos de filtrado
+    duration_tag: r.duration_tag || null,
+    budget_tag: r.budget_tag || null,
+    season_tag: r.season_tag || null,
   };
 }
 
@@ -30,16 +43,23 @@ function normalizeRow(r) {
  * GET /locations
  * List locations (public). Supports optional query params:
  *  - interest (slug or id)
+ *  - country (string, optional)
+ *  - duration (corto|medio|largo|fin_semana)
+ *  - budget (economico|moderado|lujo)
+ *  - season (primavera|verano|otono|invierno)
  *  - limit, offset (pagination)
  */
-// GET /locations
-// Query params:
-//   - interest (slug or id)           // existing behaviour
-//   - country (string, optional)     // new: case-insensitive partial match
-//   - limit, offset (pagination)
 router.get('/', async (req, res) => {
   try {
-    let { interest, country, limit = 50, offset = 0 } = req.query;
+    let {
+      interest,
+      country,
+      duration,
+      budget,
+      season,
+      limit = 50,
+      offset = 0,
+    } = req.query;
 
     // safe ints + max limit guard
     limit = Number.parseInt(limit, 10) || 50;
@@ -54,7 +74,7 @@ router.get('/', async (req, res) => {
     const params = [];
 
     if (interest) {
-      // keep previous behaviour: compare fk_interest to provided interest
+      // previous behaviour: compare fk_interest to provided interest
       params.push(interest);
       where.push(`fk_interest = $${params.length}`);
     }
@@ -65,9 +85,23 @@ router.get('/', async (req, res) => {
       where.push(`country ILIKE $${params.length}`);
     }
 
+    if (duration) {
+      params.push(duration.toLowerCase());
+      where.push(`LOWER(duration_tag) = $${params.length}`);
+    }
+
+    if (budget) {
+      params.push(budget.toLowerCase());
+      where.push(`LOWER(budget_tag) = $${params.length}`);
+    }
+
+    if (season) {
+      params.push(season.toLowerCase());
+      where.push(`LOWER(season_tag) = $${params.length}`);
+    }
+
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
-    // include country (and city, opening_hours, website) in select
     const sql = `
       SELECT
         id,
@@ -81,7 +115,10 @@ router.get('/', async (req, res) => {
         country,
         city,
         opening_hours,
-        website
+        website,
+        duration_tag,
+        budget_tag,
+        season_tag
       FROM locations
       ${whereSql}
       ORDER BY relevancia DESC NULLS LAST, id
@@ -97,12 +134,11 @@ router.get('/', async (req, res) => {
     return res.json(rows);
   } catch (err) {
     console.error('GET /locations error:', err?.message || err);
-    return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+    return res
+      .status(500)
+      .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
   }
 });
-
-
-
 
 /**
  * GET /locations/:id
@@ -111,44 +147,144 @@ router.get('/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     const result = await pool.query(
-      `SELECT id, titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia
-       FROM locations WHERE id = $1`,
+      `SELECT
+         id,
+         titulo,
+         fk_interest,
+         descripcion,
+         latitud,
+         longitud,
+         imagenes,
+         relevancia,
+         country,
+         city,
+         opening_hours,
+         website,
+         duration_tag,
+         budget_tag,
+         season_tag
+       FROM locations
+       WHERE id = $1`,
       [id]
     );
-    if (!result.rows.length) return res.status(404).json({ message: 'No encontrado' });
+    if (!result.rows.length)
+      return res.status(404).json({ message: 'No encontrado' });
     return res.json(normalizeRow(result.rows[0]));
   } catch (err) {
     console.error('GET /locations/:id error:', err?.message || err);
-    return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+    return res
+      .status(500)
+      .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
   }
 });
 
 /**
  * POST /locations
  * Create a location (protected)
- * Body: { titulo, fk_interest, descripcion, latitude, longitude, imagenes, relevancia }
+ * Body: {
+ *   titulo, fk_interest, descripcion,
+ *   latitude, longitude,
+ *   imagenes, relevancia,
+ *   country?, city?, opening_hours?, website?,
+ *   duration_tag?, budget_tag?, season_tag?
+ * }
  */
 router.post('/', auth, async (req, res) => {
   try {
-    const { titulo, fk_interest, descripcion, latitude, longitude, imagenes, relevancia } = req.body;
-    if (!titulo || !fk_interest) return res.status(400).json({ message: 'Faltan campos obligatorios' });
+    const {
+      titulo,
+      fk_interest,
+      descripcion,
+      latitude,
+      longitude,
+      imagenes,
+      relevancia,
+      country,
+      city,
+      opening_hours,
+      website,
+      duration_tag,
+      budget_tag,
+      season_tag,
+    } = req.body;
 
-    const lat = latitude !== undefined ? latitude : req.body.latitud;
-    const lng = longitude !== undefined ? longitude : req.body.longitud;
+    if (!titulo || !fk_interest)
+      return res
+        .status(400)
+        .json({ message: 'Faltan campos obligatorios' });
 
-    const imagenesJson = imagenes ? (typeof imagenes === 'string' ? imagenes : JSON.stringify(imagenes)) : null;
+    const lat =
+      latitude !== undefined ? latitude : req.body.latitud;
+    const lng =
+      longitude !== undefined ? longitude : req.body.longitud;
+
+    const imagenesJson = imagenes
+      ? typeof imagenes === 'string'
+        ? imagenes
+        : JSON.stringify(imagenes)
+      : null;
 
     const result = await pool.query(
-      `INSERT INTO locations (titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia`,
-      [titulo, fk_interest, descripcion || null, lat || null, lng || null, imagenesJson, relevancia || null]
+      `INSERT INTO locations (
+         titulo,
+         fk_interest,
+         descripcion,
+         latitud,
+         longitud,
+         imagenes,
+         relevancia,
+         country,
+         city,
+         opening_hours,
+         website,
+         duration_tag,
+         budget_tag,
+         season_tag
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       RETURNING
+         id,
+         titulo,
+         fk_interest,
+         descripcion,
+         latitud,
+         longitud,
+         imagenes,
+         relevancia,
+         country,
+         city,
+         opening_hours,
+         website,
+         duration_tag,
+         budget_tag,
+         season_tag`,
+      [
+        titulo,
+        fk_interest,
+        descripcion || null,
+        lat || null,
+        lng || null,
+        imagenesJson,
+        relevancia || null,
+        country || null,
+        city || null,
+        opening_hours || null,
+        website || null,
+        duration_tag || null,
+        budget_tag || null,
+        season_tag || null,
+      ]
     );
 
-    return res.status(201).json({ message: 'Localidad creada', location: normalizeRow(result.rows[0]) });
+    return res.status(201).json({
+      message: 'Localidad creada',
+      location: normalizeRow(result.rows[0]),
+    });
   } catch (err) {
     console.error('POST /locations error:', err?.message || err);
-    return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+    return res
+      .status(500)
+      .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
   }
 });
 
@@ -158,36 +294,108 @@ router.post('/', auth, async (req, res) => {
 router.put('/:id', auth, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
-    const existing = await pool.query('SELECT * FROM locations WHERE id = $1', [id]);
-    if (!existing.rows.length) return res.status(404).json({ message: 'No encontrado' });
+    const existingRes = await pool.query(
+      'SELECT * FROM locations WHERE id = $1',
+      [id]
+    );
+    if (!existingRes.rows.length)
+      return res.status(404).json({ message: 'No encontrado' });
+
+    const existing = existingRes.rows[0];
 
     const {
-      titulo = existing.rows[0].titulo,
-      fk_interest = existing.rows[0].fk_interest,
-      descripcion = existing.rows[0].descripcion,
+      titulo = existing.titulo,
+      fk_interest = existing.fk_interest,
+      descripcion = existing.descripcion,
       latitude,
       longitude,
-      imagenes = existing.rows[0].imagenes,
-      relevancia = existing.rows[0].relevancia
+      imagenes = existing.imagenes,
+      relevancia = existing.relevancia,
+      country = existing.country,
+      city = existing.city,
+      opening_hours = existing.opening_hours,
+      website = existing.website,
+      duration_tag = existing.duration_tag,
+      budget_tag = existing.budget_tag,
+      season_tag = existing.season_tag,
     } = req.body;
 
-    const lat = latitude !== undefined ? latitude : (existing.rows[0].latitud ?? existing.rows[0].latitude);
-    const lng = longitude !== undefined ? longitude : (existing.rows[0].longitud ?? existing.rows[0].longitude);
+    const lat =
+      latitude !== undefined
+        ? latitude
+        : existing.latitud ?? existing.latitude;
+    const lng =
+      longitude !== undefined
+        ? longitude
+        : existing.longitud ?? existing.longitude;
 
-    const imagenesJson = imagenes && typeof imagenes !== 'string' ? JSON.stringify(imagenes) : imagenes;
+    const imagenesJson =
+      imagenes && typeof imagenes !== 'string'
+        ? JSON.stringify(imagenes)
+        : imagenes;
 
     const updated = await pool.query(
       `UPDATE locations
-       SET titulo = $1, fk_interest = $2, descripcion = $3, latitud = $4, longitud = $5, imagenes = $6, relevancia = $7
-       WHERE id = $8
-       RETURNING id, titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia`,
-      [titulo, fk_interest, descripcion || null, lat || null, lng || null, imagenesJson || null, relevancia || null, id]
+       SET
+         titulo = $1,
+         fk_interest = $2,
+         descripcion = $3,
+         latitud = $4,
+         longitud = $5,
+         imagenes = $6,
+         relevancia = $7,
+         country = $8,
+         city = $9,
+         opening_hours = $10,
+         website = $11,
+         duration_tag = $12,
+         budget_tag = $13,
+         season_tag = $14
+       WHERE id = $15
+       RETURNING
+         id,
+         titulo,
+         fk_interest,
+         descripcion,
+         latitud,
+         longitud,
+         imagenes,
+         relevancia,
+         country,
+         city,
+         opening_hours,
+         website,
+         duration_tag,
+         budget_tag,
+         season_tag`,
+      [
+        titulo,
+        fk_interest,
+        descripcion || null,
+        lat || null,
+        lng || null,
+        imagenesJson || null,
+        relevancia || null,
+        country || null,
+        city || null,
+        opening_hours || null,
+        website || null,
+        duration_tag || null,
+        budget_tag || null,
+        season_tag || null,
+        id,
+      ]
     );
 
-    return res.json({ message: 'Localidad actualizada', location: normalizeRow(updated.rows[0]) });
+    return res.json({
+      message: 'Localidad actualizada',
+      location: normalizeRow(updated.rows[0]),
+    });
   } catch (err) {
     console.error('PUT /locations/:id error:', err?.message || err);
-    return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+    return res
+      .status(500)
+      .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
   }
 });
 
@@ -197,14 +405,19 @@ router.put('/:id', auth, async (req, res) => {
 router.delete('/:id', auth, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
-    const del = await pool.query('DELETE FROM locations WHERE id = $1 RETURNING id', [id]);
-    if (!del.rows.length) return res.status(404).json({ message: 'No encontrado' });
+    const del = await pool.query(
+      'DELETE FROM locations WHERE id = $1 RETURNING id',
+      [id]
+    );
+    if (!del.rows.length)
+      return res.status(404).json({ message: 'No encontrado' });
     return res.json({ message: 'Localidad eliminada' });
   } catch (err) {
     console.error('DELETE /locations/:id error:', err?.message || err);
-    return res.status(500).json({ message: 'Error en el servidor', detail: err?.message || String(err) });
+    return res
+      .status(500)
+      .json({ message: 'Error en el servidor', detail: err?.message || String(err) });
   }
 });
 
 module.exports = router;
-// aa
