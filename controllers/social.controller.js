@@ -1,3 +1,4 @@
+// controllers/social.controller.js
 'use strict';
 
 const express = require('express');
@@ -7,22 +8,25 @@ const auth = require('../middleware/auth');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 const router = express.Router();
 
 /**
  * Directorio base de uploads
- * DEBE COINCIDIR LÓGICAMENTE con server.js:
- *   server.js -> path.join(__dirname, 'uploads')
- *   acá       -> path.join(__dirname, '..', 'uploads')
+ * DEBE COINCIDIR con server.js:
+ *
+ *   server.js        -> os.tmpdir() + 'comftrip_uploads'
+ *   social.controller -> el mismo valor
  */
 const UPLOAD_ROOT =
-  process.env.UPLOAD_DIR || path.join(__dirname, '..', 'uploads');
+  process.env.UPLOAD_DIR || path.join(os.tmpdir(), 'comftrip_uploads');
 
 // Carpeta específica para fotos del social feed
 const uploadDir = path.join(UPLOAD_ROOT, 'social');
 
-// Nos aseguramos de que exista
+// Nos aseguramos de que existan
+fs.mkdirSync(UPLOAD_ROOT, { recursive: true });
 fs.mkdirSync(uploadDir, { recursive: true });
 
 /**
@@ -306,7 +310,7 @@ router.get('/posts/:id', auth, async (req, res) => {
 /**
  * POST /social/posts
  * Crea un post nuevo (texto + 1 imagen opcional).
- * En la columna jsonb "images" guardamos un ARRAY:
+ * Guardamos en jsonb "images" un ARRAY de strings:
  *   ["/uploads/social/archivo.jpg"]
  */
 router.post('/posts', auth, upload.single('image'), async (req, res) => {

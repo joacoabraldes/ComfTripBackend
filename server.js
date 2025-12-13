@@ -1,8 +1,10 @@
+// server.js
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const os = require('os'); // si querés usar tmp en algún momento
+const os = require('os');
+const fs = require('fs');
 const emailService = require('./services/email.service');
 
 const authRoutes = require('./controllers/auth.controller');
@@ -29,10 +31,14 @@ app.use(express.json());
 /**
  * === UPLOADS ESTÁTICOS ===
  * Usamos SIEMPRE el mismo root en todo el backend.
- * Carpeta física: <raíz del proyecto>/uploads
+ * Por defecto: <directorio temporal>/comftrip_uploads
+ * (en AWS Lambda será algo como /tmp/comftrip_uploads, que sí es escribible)
  */
 const UPLOAD_ROOT =
-  process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
+  process.env.UPLOAD_DIR || path.join(os.tmpdir(), 'comftrip_uploads');
+
+// nos aseguramos de que exista
+fs.mkdirSync(UPLOAD_ROOT, { recursive: true });
 
 // /uploads/** → sirve archivos desde UPLOAD_ROOT
 app.use('/uploads', express.static(UPLOAD_ROOT));
