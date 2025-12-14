@@ -32,36 +32,20 @@ function normalizeRow(r) {
     city: r.city || null,
     opening_hours: r.opening_hours || null,
     website: r.website || null,
-    // nuevos campos de filtrado
-    duration_tag: r.duration_tag || null,
-    budget_tag: r.budget_tag || null,
-    season_tag: r.season_tag || null,
   };
 }
 
 /**
  * GET /locations
- * List locations (public). Supports optional query params:
- *  - interest (slug or id)
- *  - country (string, optional)
- *  - duration (corto|medio|largo|fin_semana)
- *  - budget (economico|moderado|lujo)
- *  - season (primavera|verano|otono|invierno)
- *  - limit, offset (pagination)
+ * Query params:
+ *   - interest (slug or id)
+ *   - country (string, optional)
+ *   - limit, offset
  */
 router.get('/', async (req, res) => {
   try {
-    let {
-      interest,
-      country,
-      duration,
-      budget,
-      season,
-      limit = 50,
-      offset = 0,
-    } = req.query;
+    let { interest, country, limit = 50, offset = 0 } = req.query;
 
-    // safe ints + max limit guard
     limit = Number.parseInt(limit, 10) || 50;
     offset = Number.parseInt(offset, 10) || 0;
     const MAX_LIMIT = 1000;
@@ -69,35 +53,17 @@ router.get('/', async (req, res) => {
     if (limit > MAX_LIMIT) limit = MAX_LIMIT;
     if (offset < 0) offset = 0;
 
-    // build WHERE clauses dynamically and parameterize
     const where = [];
     const params = [];
 
     if (interest) {
-      // previous behaviour: compare fk_interest to provided interest
       params.push(interest);
       where.push(`fk_interest = $${params.length}`);
     }
 
     if (country) {
-      // case-insensitive partial match; use ILIKE with %..%
       params.push(`%${country}%`);
       where.push(`country ILIKE $${params.length}`);
-    }
-
-    if (duration) {
-      params.push(duration.toLowerCase());
-      where.push(`LOWER(duration_tag) = $${params.length}`);
-    }
-
-    if (budget) {
-      params.push(budget.toLowerCase());
-      where.push(`LOWER(budget_tag) = $${params.length}`);
-    }
-
-    if (season) {
-      params.push(season.toLowerCase());
-      where.push(`LOWER(season_tag) = $${params.length}`);
     }
 
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
@@ -115,10 +81,7 @@ router.get('/', async (req, res) => {
         country,
         city,
         opening_hours,
-        website,
-        duration_tag,
-        budget_tag,
-        season_tag
+        website
       FROM locations
       ${whereSql}
       ORDER BY relevancia DESC NULLS LAST, id
@@ -159,10 +122,7 @@ router.get('/:id', async (req, res) => {
          country,
          city,
          opening_hours,
-         website,
-         duration_tag,
-         budget_tag,
-         season_tag
+         website
        FROM locations
        WHERE id = $1`,
       [id]
@@ -180,14 +140,6 @@ router.get('/:id', async (req, res) => {
 
 /**
  * POST /locations
- * Create a location (protected)
- * Body: {
- *   titulo, fk_interest, descripcion,
- *   latitude, longitude,
- *   imagenes, relevancia,
- *   country?, city?, opening_hours?, website?,
- *   duration_tag?, budget_tag?, season_tag?
- * }
  */
 router.post('/', auth, async (req, res) => {
   try {
@@ -203,9 +155,6 @@ router.post('/', auth, async (req, res) => {
       city,
       opening_hours,
       website,
-      duration_tag,
-      budget_tag,
-      season_tag,
     } = req.body;
 
     if (!titulo || !fk_interest)
@@ -236,12 +185,9 @@ router.post('/', auth, async (req, res) => {
          country,
          city,
          opening_hours,
-         website,
-         duration_tag,
-         budget_tag,
-         season_tag
+         website
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        RETURNING
          id,
          titulo,
@@ -254,10 +200,7 @@ router.post('/', auth, async (req, res) => {
          country,
          city,
          opening_hours,
-         website,
-         duration_tag,
-         budget_tag,
-         season_tag`,
+         website`,
       [
         titulo,
         fk_interest,
@@ -270,9 +213,6 @@ router.post('/', auth, async (req, res) => {
         city || null,
         opening_hours || null,
         website || null,
-        duration_tag || null,
-        budget_tag || null,
-        season_tag || null,
       ]
     );
 
@@ -315,9 +255,6 @@ router.put('/:id', auth, async (req, res) => {
       city = existing.city,
       opening_hours = existing.opening_hours,
       website = existing.website,
-      duration_tag = existing.duration_tag,
-      budget_tag = existing.budget_tag,
-      season_tag = existing.season_tag,
     } = req.body;
 
     const lat =
@@ -347,11 +284,8 @@ router.put('/:id', auth, async (req, res) => {
          country = $8,
          city = $9,
          opening_hours = $10,
-         website = $11,
-         duration_tag = $12,
-         budget_tag = $13,
-         season_tag = $14
-       WHERE id = $15
+         website = $11
+       WHERE id = $12
        RETURNING
          id,
          titulo,
@@ -364,10 +298,7 @@ router.put('/:id', auth, async (req, res) => {
          country,
          city,
          opening_hours,
-         website,
-         duration_tag,
-         budget_tag,
-         season_tag`,
+         website`,
       [
         titulo,
         fk_interest,
@@ -380,9 +311,6 @@ router.put('/:id', auth, async (req, res) => {
         city || null,
         opening_hours || null,
         website || null,
-        duration_tag || null,
-        budget_tag || null,
-        season_tag || null,
         id,
       ]
     );
