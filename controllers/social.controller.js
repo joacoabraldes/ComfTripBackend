@@ -56,7 +56,7 @@ const upload = multer({
   storage,
   fileFilter: imageFileFilter,
   limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB
+    fileSize: 5 * 1024 * 1024, // 5MB por archivo
   },
 });
 
@@ -79,7 +79,7 @@ function normalizePostRow(r) {
     trip_id: r.trip_id,
     location_id: r.location_id,
     content: r.content || '',
-    images: r.images ?? null, // jsonb
+    images: r.images ?? null, // text[] o jsonb (según tu DB)
     created_at: r.created_at,
     like_count:
       r.like_count !== null && r.like_count !== undefined
@@ -98,9 +98,7 @@ function normalizePostRow(r) {
  */
 router.get('/feed', auth, async (req, res) => {
   const userId = getUserIdFromReq(req);
-  if (!userId) {
-    return res.status(401).json({ message: 'No autenticado' });
-  }
+  if (!userId) return res.status(401).json({ message: 'No autenticado' });
 
   try {
     let { limit = 20, offset = 0 } = req.query;
@@ -247,9 +245,7 @@ router.get('/posts', auth, async (req, res) => {
  */
 router.get('/posts/:id', auth, async (req, res) => {
   const userId = getUserIdFromReq(req);
-  if (!userId) {
-    return res.status(401).json({ message: 'No autenticado' });
-  }
+  if (!userId) return res.status(401).json({ message: 'No autenticado' });
 
   try {
     const postId = parseInt(req.params.id, 10);
@@ -309,89 +305,110 @@ router.get('/posts/:id', auth, async (req, res) => {
 
 /**
  * POST /social/posts
- * Crea un post nuevo (texto + 1 imagen opcional).
- * Guardamos en jsonb "images" un ARRAY de strings:
- *   ["/uploads/social/archivo.jpg"]
+ * Crea un post nuevo (texto + imágenes opcionales).
+ * Guardamos en "images" un ARRAY de strings:
+ *   ["/uploads/social/archivo.jpg", ...]
+ *
+ * Acepta cualquiera de estos campos en FormData:
+ * - image  (1 archivo)
+ * - images (muchos archivos)
+ * - files  (muchos archivos)  <-- típico si el front manda "files"
  */
-router.post('/posts', auth, upload.single('image'), async (req, res) => {
-  const userId = getUserIdFromReq(req);
-  if (!userId) {
-    return res.status(401).json({ message: 'No autenticado' });
-  }
+router.post(
+  '/posts',
+  auth,
+  upload.fields([
+    { name: 'image', maxCount: 1 },   // compat
+    { name: 'images', maxCount: 10 }, // recomendado
+    { name: 'files', maxCount: 10 },  // compat con tu UI actual
+  ]),
+  async (req, res) => {
+    const userId = getUserIdFromReq(req);
+    if (!userId) return res.status(401).json({ message: 'No autenticado' });
 
-  try {
-    const { content: rawContent, trip_id, location_id } = req.body;
-    const content = typeof rawContent === 'string' ? rawContent.trim() : '';
+    try {
+      const { content: rawContent, trip_id, location_id } = req.body;
+      const content = typeof rawContent === 'string' ? rawContent.trim() : '';
 
-    const hasImage = !!req.file;
-    const hasText = content.length > 0;
+      const hasImage =
+        !!req.file ||
+        (req.files &&
+          Object.values(req.files).some(
+            (arr) => Array.isArray(arr) && arr.length > 0
+          ));
 
-    if (!hasImage && !hasText) {
-      return res.status(400).json({
-        message: 'El post debe tener texto, imagen o ambos',
+      const hasText = content.length > 0;
+
+      if (!hasImage && !hasText) {
+        return res.status(400).json({
+          message: 'El post debe tener texto, imagen o ambos',
+        });
+      }
+
+      // juntar todo lo que haya llegado por cualquier key
+      const collected = [];
+      if (req.file) collected.push(req.file);
+
+      if (req.files) {
+        for (const key of Object.keys(req.files)) {
+          const arr = req.files[key] || [];
+          for (const f of arr) collected.push(f);
+        }
+      }
+
+      const imageUrls = collected.map((f) => `/uploads/social/${f.filename}`);
+      const imagesValue = imageUrls.length ? imageUrls : null;
+
+      const result = await pool.query(
+        `
+          INSERT INTO social_posts (user_id, trip_id, location_id, content, images)
+          VALUES ($1, $2, $3, $4, $5)
+          RETURNING id, user_id, trip_id, location_id, content, images, created_at
+        `,
+        [userId, trip_id || null, location_id || null, content, imagesValue]
+      );
+
+      const post = result.rows[0];
+
+      const userRes = await pool.query(
+        'SELECT username, name FROM users WHERE id = $1 LIMIT 1',
+        [userId]
+      );
+      const userRow = userRes.rows[0] || {};
+
+      return res.status(201).json({
+        message: 'Post creado',
+        post: {
+          id: post.id,
+          user_id: post.user_id,
+          trip_id: post.trip_id,
+          location_id: post.location_id,
+          content: post.content,
+          images: post.images ?? null,
+          created_at: post.created_at,
+          like_count: 0,
+          comment_count: 0,
+          liked_by_me: false,
+          author_username: userRow.username || null,
+          author_name: userRow.name || null,
+        },
+      });
+    } catch (err) {
+      console.error('POST /social/posts error:', err?.message || err);
+      return res.status(500).json({
+        message: 'Error en el servidor',
+        detail: err?.message || String(err),
       });
     }
-
-    // Array de URLs relativas que se guardan en jsonb
-    let imageUrls = [];
-    if (hasImage) {
-      const publicPath = `/uploads/social/${req.file.filename}`;
-      imageUrls.push(publicPath);
-    }
-
-    const imagesValue = imageUrls.length ? imageUrls : null;
-
-    const result = await pool.query(
-      `
-        INSERT INTO social_posts (user_id, trip_id, location_id, content, images)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, user_id, trip_id, location_id, content, images, created_at
-      `,
-      [userId, trip_id || null, location_id || null, content, imagesValue]
-    );
-
-    const post = result.rows[0];
-
-    const userRes = await pool.query(
-      'SELECT username, name FROM users WHERE id = $1 LIMIT 1',
-      [userId]
-    );
-    const userRow = userRes.rows[0] || {};
-
-    return res.status(201).json({
-      message: 'Post creado',
-      post: {
-        id: post.id,
-        user_id: post.user_id,
-        trip_id: post.trip_id,
-        location_id: post.location_id,
-        content: post.content,
-        images: post.images ?? null,
-        created_at: post.created_at,
-        like_count: 0,
-        comment_count: 0,
-        liked_by_me: false,
-        author_username: userRow.username || null,
-        author_name: userRow.name || null,
-      },
-    });
-  } catch (err) {
-    console.error('POST /social/posts error:', err?.message || err);
-    return res.status(500).json({
-      message: 'Error en el servidor',
-      detail: err?.message || String(err),
-    });
   }
-});
+);
 
 /**
  * DELETE /social/posts/:id
  */
 router.delete('/posts/:id', auth, async (req, res) => {
   const userId = getUserIdFromReq(req);
-  if (!userId) {
-    return res.status(401).json({ message: 'No autenticado' });
-  }
+  if (!userId) return res.status(401).json({ message: 'No autenticado' });
 
   try {
     const postId = parseInt(req.params.id, 10);
@@ -426,20 +443,13 @@ router.delete('/posts/:id', auth, async (req, res) => {
  */
 router.post('/posts/:id/like', auth, async (req, res) => {
   const userId = getUserIdFromReq(req);
-  if (!userId) {
-    return res.status(401).json({ message: 'No autenticado' });
-  }
+  if (!userId) return res.status(401).json({ message: 'No autenticado' });
 
   try {
     const postId = parseInt(req.params.id, 10);
 
-    const existing = await pool.query(
-      `SELECT id FROM social_posts WHERE id = $1`,
-      [postId]
-    );
-    if (!existing.rows.length) {
-      return res.status(404).json({ message: 'Post no encontrado' });
-    }
+    const existing = await pool.query(`SELECT id FROM social_posts WHERE id = $1`, [postId]);
+    if (!existing.rows.length) return res.status(404).json({ message: 'Post no encontrado' });
 
     const like = await pool.query(
       `SELECT id FROM social_post_likes WHERE post_id = $1 AND user_id = $2`,
@@ -517,9 +527,7 @@ router.get('/posts/:id/comments', auth, async (req, res) => {
  */
 router.post('/posts/:id/comments', auth, async (req, res) => {
   const userId = getUserIdFromReq(req);
-  if (!userId) {
-    return res.status(401).json({ message: 'No autenticado' });
-  }
+  if (!userId) return res.status(401).json({ message: 'No autenticado' });
 
   try {
     const postId = parseInt(req.params.id, 10);
@@ -529,13 +537,8 @@ router.post('/posts/:id/comments', auth, async (req, res) => {
       return res.status(400).json({ message: 'content es obligatorio' });
     }
 
-    const post = await pool.query(
-      `SELECT id FROM social_posts WHERE id = $1`,
-      [postId]
-    );
-    if (!post.rows.length) {
-      return res.status(404).json({ message: 'Post no encontrado' });
-    }
+    const post = await pool.query(`SELECT id FROM social_posts WHERE id = $1`, [postId]);
+    if (!post.rows.length) return res.status(404).json({ message: 'Post no encontrado' });
 
     const result = await pool.query(
       `
