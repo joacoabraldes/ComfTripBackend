@@ -240,7 +240,7 @@ router.post('/:id/reject', auth, async (req, res) => {
  * DELETE /:userId
  * Remove friendship between logged user and userId OR cancel outgoing request.
  */
-router.delete('/:userId', auth, async (req, res) => {
+/*router.delete('/:userId', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     const otherId = Number(req.params.userId);
@@ -258,6 +258,61 @@ router.delete('/:userId', auth, async (req, res) => {
     console.error('DELETE /:userId error:', err);
     res.status(500).json({ message: 'Error' });
   }
+});*/
+
+/**
+ * DELETE /:userId
+ * Remove friendship between logged user and userId OR cancel outgoing request.
+ * ALSO removes any shared trips between both users.
+ */
+router.delete('/:userId', auth, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const userId = req.user.id;
+        const otherId = Number(req.params.userId);
+
+        await client.query('BEGIN');
+
+        const r = await client.query(
+            `SELECT id
+       FROM friend_requests
+       WHERE (requester_id = $1 AND addressee_id = $2)
+          OR (requester_id = $2 AND addressee_id = $1)
+       LIMIT 1`,
+            [userId, otherId]
+        );
+
+        if (!r.rows.length) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ message: 'Relación no encontrada' });
+        }
+
+        const frId = r.rows[0].id;
+
+        await client.query(
+            'DELETE FROM friend_requests WHERE id = $1',
+            [frId]
+        );
+
+        await client.query(
+            `DELETE FROM trip_shares
+       WHERE (shared_by = $1 AND shared_with = $2)
+          OR (shared_by = $2 AND shared_with = $1)`,
+            [userId, otherId]
+        );
+
+        await client.query('COMMIT');
+
+        res.json({
+            message: 'Relación eliminada y viajes compartidos revocados'
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('DELETE /:userId error:', err);
+        res.status(500).json({ message: 'Error' });
+    } finally {
+        client.release();
+    }
 });
 
 /**
@@ -284,5 +339,54 @@ router.get('/', auth, async (req, res) => {
     res.status(500).json({ message: 'Error' });
   }
 });
+
+router.get('/:friendId', auth, async (req, res) => {
+    const userId = req.user?.id || req.user?.userId;
+    const friendId = Number(req.params.friendId);
+
+    if (!userId) {
+        return res.status(401).json({ message: 'No autenticado' });
+    }
+
+    if (!Number.isFinite(friendId)) {
+        return res.status(400).json({ message: 'ID inválido' });
+    }
+
+    const friendship = await pool.query(
+        `
+    SELECT 1
+    FROM friend_requests
+    WHERE status = 'accepted'
+      AND (
+        (requester_id = $1 AND addressee_id = $2)
+        OR
+        (requester_id = $2 AND addressee_id = $1)
+      )
+    LIMIT 1
+    `,
+        [userId, friendId]
+    );
+
+    if (!friendship.rows.length) {
+        return res.status(403).json({ message: 'No son amigos' });
+    }
+
+    const u = await pool.query(
+        `
+            SELECT id, name, email, phone, nationality, birthdate
+            FROM users
+            WHERE id = $1
+
+        `,
+        [friendId]
+    );
+
+    if (!u.rows.length) {
+        return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+
+    res.json(u.rows[0]);
+});
+
 
 module.exports = router;

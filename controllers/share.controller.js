@@ -101,4 +101,65 @@ router.get('/trip/:uuid', async (req, res) => {
   }
 });
 
+// DELETE /share/trip/:uuid/leave
+// El usuario deja de tener acceso al viaje compartido
+router.delete('/trip/:uuid/leave', async (req, res) => {
+    try {
+        const userId = req.user.id; // requiere auth middleware
+        const { uuid } = req.params;
+
+        const shareRes = await pool.query(
+            `SELECT * FROM trip_shares WHERE share_uuid = $1 LIMIT 1`,
+            [uuid]
+        );
+
+        if (!shareRes.rows.length) {
+            return res.status(404).json({ message: 'Share no encontrado' });
+        }
+
+        const share = shareRes.rows[0];
+
+        if (share.shared_with !== userId) {
+            return res.status(403).json({ message: 'No tenés permiso para esta acción' });
+        }
+
+        await pool.query(
+            `DELETE FROM trip_shares WHERE id = $1`,
+            [share.id]
+        );
+
+        res.json({ message: 'Dejaste de tener acceso al viaje compartido' });
+    } catch (err) {
+        console.error('DELETE /share/trip/:uuid/leave error:', err);
+        res.status(500).json({ message: 'Error' });
+    }
+});
+
+
+router.delete('/trip/:tripId/user/:userId', async (req, res) => {
+    try {
+        const ownerId = req.user.id;
+        const { tripId, userId } = req.params;
+
+        // verificar ownership
+        const tripRes = await pool.query(
+            `SELECT id FROM trips WHERE id = $1 AND user_id = $2`,
+            [tripId, ownerId]
+        );
+        if (!tripRes.rows.length) {
+            return res.status(403).json({ message: 'No sos el dueño del viaje' });
+        }
+
+        await pool.query(
+            `DELETE FROM trip_shares WHERE trip_id = $1 AND shared_with = $2`,
+            [tripId, userId]
+        );
+
+        res.json({ message: 'Se dejó de compartir el viaje con el usuario' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'Error' });
+    }
+});
+
 module.exports = router;
