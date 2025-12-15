@@ -114,6 +114,7 @@ router.get('/by-me/:friendId', auth, async (req, res) => {
         t.destination,
         t.start_date,
         t.end_date,
+        ts.mode,
         ts.created_at
       FROM trip_shares ts
       JOIN trips t ON t.id = ts.trip_id
@@ -150,7 +151,7 @@ router.get('/trip/:tripId/users', auth, async (req, res) => {
         // Obtener usuarios con los que está compartido
         const result = await pool.query(
             `
-      SELECT u.id, u.name, u.email
+      SELECT u.id, u.name, u.email, ts.mode
       FROM trip_shares ts
       JOIN users u ON u.id = ts.shared_with
       WHERE ts.trip_id = $1
@@ -170,9 +171,9 @@ router.get('/trip/:tripId/users', auth, async (req, res) => {
 
 // DELETE /share/trip/:uuid/leave
 // El usuario deja de tener acceso al viaje compartido
-router.delete('/trip/:uuid/leave', async (req, res) => {
+router.delete('/trip/:uuid/leave', auth, async (req, res) => {
     try {
-        const userId = req.user.id; // requiere auth middleware
+        const userId = req.user.id;
         const { uuid } = req.params;
 
         const shareRes = await pool.query(
@@ -187,7 +188,7 @@ router.delete('/trip/:uuid/leave', async (req, res) => {
         const share = shareRes.rows[0];
 
         if (share.shared_with !== userId) {
-            return res.status(403).json({ message: 'No tenés permiso para esta acción' });
+            return res.status(403).json({ message: 'No tenés permiso' });
         }
 
         await pool.query(
@@ -195,38 +196,39 @@ router.delete('/trip/:uuid/leave', async (req, res) => {
             [share.id]
         );
 
-        res.json({ message: 'Dejaste de tener acceso al viaje compartido' });
-    } catch (err) {
-        console.error('DELETE /share/trip/:uuid/leave error:', err);
-        res.status(500).json({ message: 'Error' });
-    }
-});
-
-
-router.delete('/trip/:tripId/user/:userId', async (req, res) => {
-    try {
-        const ownerId = req.user.id;
-        const { tripId, userId } = req.params;
-
-        // verificar ownership
-        const tripRes = await pool.query(
-            `SELECT id FROM trips WHERE id = $1 AND user_id = $2`,
-            [tripId, ownerId]
-        );
-        if (!tripRes.rows.length) {
-            return res.status(403).json({ message: 'No sos el dueño del viaje' });
-        }
-
-        await pool.query(
-            `DELETE FROM trip_shares WHERE trip_id = $1 AND shared_with = $2`,
-            [tripId, userId]
-        );
-
-        res.json({ message: 'Se dejó de compartir el viaje con el usuario' });
+        res.json({ message: 'Acceso eliminado' });
     } catch (err) {
         console.error(err);
         res.status(500).json({ message: 'Error' });
     }
 });
+
+
+router.delete('/trip/:tripId/user/:userId', auth, async (req, res) => {
+    try {
+        const ownerId = req.user.id;
+        const { tripId, userId } = req.params;
+
+        const tripRes = await pool.query(
+            `SELECT id FROM trips WHERE id = $1 AND user_id = $2`,
+            [tripId, ownerId]
+        );
+
+        if (!tripRes.rows.length) {
+            return res.status(403).json({ message: 'No sos el dueño del viaje' });
+        }
+
+        const r = await pool.query(
+            `DELETE FROM trip_shares WHERE trip_id = $1 AND shared_with = $2`,
+            [tripId, userId]
+        );
+
+        res.json({ message: 'Acceso eliminado', deleted: r.rowCount });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'Error' });
+    }
+});
+
 
 module.exports = router;
