@@ -5,7 +5,6 @@ const express = require('express');
 const https = require('https');
 const pool = require('../db');
 const auth = require('../middleware/auth');
-const { getCandidates } = require('../services/poi.service');
 const router = express.Router();
 
 // ----------------------
@@ -644,59 +643,6 @@ async function handleItinerary(req, res) {
     const candRes = await client.query(candidateSQL, queryValues);
     let candidates = candRes.rows || [];
 
-    // If not enough candidates found, use POI service (OpenTripMap + OSM fallback)
-    const minCandidatesNeeded = Math.max(10, totalNeeded);
-    if (candidates.length < minCandidatesNeeded) {
-      console.info(`handleItinerary: Only ${candidates.length} candidates found, need ${minCandidatesNeeded}. Using POI service (OpenTripMap)...`);
-      
-      try {
-        // Get interest slugs from interest IDs
-        const interestSlugsRes = await client.query(
-          'SELECT slug FROM interests WHERE id = ANY($1)',
-          [interestIds.length ? interestIds : [-999999]]
-        );
-        const interestSlugs = interestSlugsRes.rows.map(r => r.slug).filter(Boolean);
-
-        // Use POI service to fetch candidates (includes OpenTripMap + OSM fallback)
-        const poiCandidates = await getCandidates({
-          db: client,
-          interestSlugs: interestSlugs,
-          country: destCountry,
-          destination: trip.destination,
-          limit: Math.max(totalNeeded * 3, 100),
-          mustVisits: combinedMandatoryNames,
-          notes: notesToParse
-        });
-
-        console.info(`handleItinerary: POI service returned ${poiCandidates.length} candidates`);
-
-        // Convert POI candidates to our format and merge with existing
-        const seenIds = new Set(candidates.map(c => String(c.id)));
-        for (const poi of poiCandidates) {
-          if (!seenIds.has(String(poi.id))) {
-            // Convert POI candidate format to our internal format
-            candidates.push({
-              id: poi.id,
-              titulo: poi.titulo,
-              latitud: poi.lat,
-              longitud: poi.lng,
-              relevancia: poi.relevancia || 5,
-              fk_interest: poi.fk_interest || null,
-              country: poi.country || destCountry || null,
-              city: poi.city || destCity || null,
-              category: poi.category || null
-            });
-            seenIds.add(String(poi.id));
-          }
-        }
-
-        console.info(`handleItinerary: After POI service merge, total candidates: ${candidates.length}`);
-      } catch (poiErr) {
-        console.warn('handleItinerary: POI service failed, continuing with DB candidates only:', poiErr?.message || poiErr);
-        // Continue with whatever candidates we have from DB
-      }
-    }
-
     if (destCountry && (!candidates || candidates.length === 0)) {
       console.warn('handleItinerary: zero candidates found for destCountry', destCountry);
       return res.status(400).json({ message: `No se encontraron ubicaciones en el país destino: ${destCountry}. Generador interrumpido.` });
@@ -709,6 +655,18 @@ async function handleItinerary(req, res) {
         console.warn('handleItinerary: after country filter no candidates remain for', destCountry);
         return res.status(400).json({ message: `No se encontraron ubicaciones en el país destino (después del filtrado): ${destCountry}. Generador interrumpido.` });
       }
+    }
+
+    if (!destCountry && (!candidates.length || candidates.length < Math.max(10, totalNeeded))) {
+      const broadRes = await client.query(`SELECT id, titulo, latitud, longitud, relevancia, fk_interest, country, city, category FROM locations ORDER BY relevancia DESC NULLS LAST LIMIT $1`, [Math.max(totalNeeded * 6, 300)]);
+      const broad = broadRes.rows || [];
+      const combined = [];
+      const seenIds = new Set();
+      for (const c of candidates) { seenIds.add(String(c.id)); combined.push(c); }
+      for (const b of broad) {
+        if (!seenIds.has(String(b.id))) { combined.push(b); seenIds.add(String(b.id)); }
+      }
+      candidates = combined;
     }
 
     // ensure mandatory included in candidate pool
