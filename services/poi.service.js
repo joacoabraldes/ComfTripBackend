@@ -1,5 +1,5 @@
 // services/poi.service.js
-// Improved POI fetcher that prefers DB city entries; falls back to geocode+OSM only when DB has none.
+// Improved POI fetcher that prefers DB city entries; falls back to OpenTripMap, then OSM when DB has none.
 
 "use strict";
 
@@ -28,6 +28,8 @@ if (!fetchImpl) throw new Error("No fetch implementation found. Install node >=1
 const NOMINATIM_URL = process.env.NOMINATIM_URL || "https://nominatim.openstreetmap.org/search";
 const OVERPASS_URL = process.env.OVERPASS_URL || "https://overpass-api.de/api/interpreter";
 const NOMINATIM_EMAIL = process.env.NOMINATIM_EMAIL || "";
+const OPENTRIPMAP_API_KEY = process.env.OPENTRIPMAP_API_KEY || "5ae2e3f221c38a28845f05b6fc9e3160c40397c5b7a3ae2bdb772d93";
+const OPENTRIPMAP_BASE_URL = process.env.OPENTRIPMAP_BASE_URL || "https://api.opentripmap.com/0.1/en";
 
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
   if (AbortControllerImpl) {
@@ -181,16 +183,17 @@ function dedupeMerge(existing, incoming, distanceThresholdMeters = 50) {
     if (foundIdx === -1) merged.push(inc);
     else {
       const ex = merged[foundIdx];
-      merged[foundIdx] = {
-        ...ex,
-        titulo: ex.titulo || inc.titulo,
-        lat: ex.lat || inc.lat,
-        lng: ex.lng || inc.lng,
-        imagenes: ex.imagenes || inc.imagenes || null,
-        relevancia: Math.max(ex.relevancia || 0, inc.relevancia || 0),
-        osm: { ...(ex.osm || {}), ...(inc.osm || {}) },
-        source: ex.source === 'db' ? 'db+osm' : inc.source
-      };
+        merged[foundIdx] = {
+          ...ex,
+          titulo: ex.titulo || inc.titulo,
+          lat: ex.lat || inc.lat,
+          lng: ex.lng || inc.lng,
+          imagenes: ex.imagenes || inc.imagenes || null,
+          relevancia: Math.max(ex.relevancia || 0, inc.relevancia || 0),
+          osm: { ...(ex.osm || {}), ...(inc.osm || {}) },
+          opentripmap: { ...(ex.opentripmap || {}), ...(inc.opentripmap || {}) },
+          source: ex.source === 'db' ? (inc.source === 'opentripmap' ? 'db+opentripmap' : inc.source === 'osm' ? 'db+osm' : 'db') : inc.source
+        };
     }
   }
   return merged;
@@ -239,6 +242,408 @@ async function geocodeDestination(query) {
   } catch (err) {
     console.warn('geocodeDestination failed:', err?.message || err);
     return null;
+  }
+}
+
+/* ---------- OpenTripMap API functions ---------- */
+/**
+ * Search POIs within a radius using OpenTripMap API
+ * @param {number} lat - Latitude
+ * @param {number} lon - Longitude
+ * @param {number} radius - Radius in meters (default: 10000 = 10km)
+ * @param {number} limit - Maximum number of results (default: 50)
+ * @returns {Promise<Array>} Array of POI objects with xid, name, kinds, point
+ */
+async function searchOpenTripMapRadius(lat, lon, radius = 10000, limit = 50) {
+  if (!OPENTRIPMAP_API_KEY || OPENTRIPMAP_API_KEY === "5ae2e3f221c38a28845f05b6fc9e3160c40397c5b7a3ae2bdb772d93") {
+    console.warn('OpenTripMap API key not configured');
+    return [];
+  }
+
+  try {
+    const url = `${OPENTRIPMAP_BASE_URL}/places/radius?lat=${lat}&lon=${lon}&radius=${radius}&limit=${limit}&apikey=${OPENTRIPMAP_API_KEY}`;
+    const resp = await fetchWithTimeout(url, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'ComfTripBackend/1.0'
+      }
+    }, 15000);
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new Error(`OpenTripMap radius search ${resp.status}: ${text.slice(0, 200)}`);
+    }
+
+    const data = await resp.json();
+    if (!Array.isArray(data)) return [];
+    
+    return data.map(item => ({
+      xid: item.xid,
+      name: item.name || null,
+      kinds: item.kinds ? item.kinds.split(',') : [],
+      lat: item.point?.lat ? Number(item.point.lat) : null,
+      lon: item.point?.lon ? Number(item.point.lon) : null,
+      rate: item.rate || null,
+      osm: item.osm || null,
+      wikidata: item.wikidata || null
+    })).filter(item => item.xid && item.name && item.lat !== null && item.lon !== null);
+  } catch (err) {
+    console.warn('searchOpenTripMapRadius failed:', err?.message || err);
+    return [];
+  }
+}
+
+/**
+ * Get detailed information about a POI using its xid
+ * @param {string} xid - OpenTripMap xid identifier
+ * @returns {Promise<Object|null>} Detailed POI information
+ */
+async function getOpenTripMapDetails(xid) {
+  if (!OPENTRIPMAP_API_KEY || OPENTRIPMAP_API_KEY === "5ae2e3f221c38a28845f05b6fc9e3160c40397c5b7a3ae2bdb772d93") {
+    return null;
+  }
+
+  if (!xid) return null;
+
+  try {
+    const url = `${OPENTRIPMAP_BASE_URL}/places/xid/${encodeURIComponent(xid)}?apikey=${OPENTRIPMAP_API_KEY}`;
+    const resp = await fetchWithTimeout(url, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'ComfTripBackend/1.0'
+      }
+    }, 10000);
+
+    if (!resp.ok) {
+      if (resp.status === 404) return null; // POI not found
+      const text = await resp.text().catch(() => '');
+      throw new Error(`OpenTripMap details ${resp.status}: ${text.slice(0, 200)}`);
+    }
+
+    const data = await resp.json();
+    return data;
+  } catch (err) {
+    console.warn(`getOpenTripMapDetails failed for xid ${xid}:`, err?.message || err);
+    return null;
+  }
+}
+
+/**
+ * Map OpenTripMap kinds to our interest categories
+ */
+const OPENTRIPMAP_KINDS_TO_INTEREST = {
+  'restaurants': 'gastronomia',
+  'cafes': 'gastronomia',
+  'bars': 'gastronomia',
+  'fast_food': 'gastronomia',
+  'pubs': 'gastronomia',
+  'museums': 'cultura',
+  'galleries': 'cultura',
+  'theatres': 'cultura',
+  'monuments': 'cultura',
+  'memorials': 'cultura',
+  'parks': 'naturaleza',
+  'gardens': 'naturaleza',
+  'viewpoints': 'naturaleza',
+  'beaches': 'naturaleza',
+  'stadiums': 'deportes',
+  'sports': 'deportes',
+  'shops': 'compras',
+  'markets': 'compras',
+  'nightclubs': 'nocturna',
+  'clubs': 'nocturna'
+};
+
+/**
+ * Normalize OpenTripMap POI details to our database format
+ * @param {Object} details - OpenTripMap details object
+ * @param {Object} basicInfo - Basic info from radius search (xid, name, lat, lon, kinds)
+ * @returns {Object|null} Normalized POI data for database insertion
+ */
+function normalizeOpenTripMapForInsert(details, basicInfo) {
+  if (!basicInfo || !basicInfo.name || basicInfo.lat === null || basicInfo.lon === null) {
+    return null;
+  }
+
+  // Extract image from details
+  let images = null;
+  if (details) {
+    const imageUrls = [];
+    if (details.preview && details.preview.source) {
+      imageUrls.push(details.preview.source);
+    }
+    if (details.image && typeof details.image === 'string') {
+      imageUrls.push(details.image);
+    }
+    if (details.images && Array.isArray(details.images)) {
+      details.images.forEach(img => {
+        if (img && img.source) imageUrls.push(img.source);
+        else if (typeof img === 'string') imageUrls.push(img);
+      });
+    }
+    if (imageUrls.length > 0) {
+      images = imageUrls.slice(0, 6);
+    }
+  }
+
+  // Extract description
+  let description = null;
+  if (details) {
+    if (details.wikipedia_extracts && details.wikipedia_extracts.text) {
+      description = details.wikipedia_extracts.text.slice(0, 2000);
+    } else if (details.info && details.info.descr) {
+      description = details.info.descr.slice(0, 2000);
+    } else if (details.wikidata && typeof details.wikidata === 'string') {
+      description = `Wikidata: ${details.wikidata}`;
+    }
+  }
+
+  // Determine category from kinds
+  let category = null;
+  if (basicInfo.kinds && basicInfo.kinds.length > 0) {
+    const primaryKind = basicInfo.kinds[0].split('_')[0]; // Get first part of kind
+    category = primaryKind;
+  }
+
+  // Calculate relevance based on rate, wikidata, wikipedia
+  let relevancia = 5;
+  if (basicInfo.rate) {
+    relevancia = Math.max(relevancia, Number(basicInfo.rate) || 5);
+  }
+  if (details && (details.wikidata || details.wikipedia)) {
+    relevancia = Math.max(relevancia, 7);
+  }
+
+  // Extract website
+  let website = null;
+  if (details && details.url) {
+    website = details.url;
+  } else if (details && details.wikipedia) {
+    website = `https://${details.wikipedia}`;
+  }
+
+  return {
+    titulo: basicInfo.name.trim(),
+    latitud: basicInfo.lat,
+    longitud: basicInfo.lon,
+    relevancia,
+    descripcion: description || JSON.stringify({ source: 'opentripmap', xid: basicInfo.xid, kinds: basicInfo.kinds }).slice(0, 2000),
+    opening_hours: null, // OpenTripMap doesn't provide this
+    website,
+    imagenes: images,
+    category,
+    opentripmap: {
+      xid: basicInfo.xid,
+      kinds: basicInfo.kinds,
+      rate: basicInfo.rate,
+      wikidata: details?.wikidata || basicInfo.wikidata || null,
+      wikipedia: details?.wikipedia || null
+    }
+  };
+}
+
+/**
+ * Fetch OpenTripMap POIs and get their details, then normalize for DB insertion
+ * @param {number} lat - Latitude
+ * @param {number} lon - Longitude
+ * @param {number} radius - Search radius in meters
+ * @param {number} limit - Maximum number of POIs to fetch
+ * @returns {Promise<Array>} Array of normalized POI objects ready for DB insertion
+ */
+async function fetchOpenTripMapPOIs(lat, lon, radius = 10000, limit = 50) {
+  try {
+    // Step 1: Search POIs by radius
+    const radiusResults = await searchOpenTripMapRadius(lat, lon, radius, limit);
+    if (!radiusResults || radiusResults.length === 0) {
+      return [];
+    }
+
+    console.info(`OpenTripMap: Found ${radiusResults.length} POIs, fetching details...`);
+
+    // Step 2: Fetch details for each POI (with rate limiting)
+    const detailsPromises = [];
+    const BATCH_SIZE = 5; // Process 5 at a time to avoid rate limits
+    const normalizedPOIs = [];
+
+    for (let i = 0; i < radiusResults.length; i += BATCH_SIZE) {
+      const batch = radiusResults.slice(i, i + BATCH_SIZE);
+      const batchPromises = batch.map(async (poi) => {
+        const details = await getOpenTripMapDetails(poi.xid);
+        const normalized = normalizeOpenTripMapForInsert(details, poi);
+        if (normalized) {
+          normalized._raw = { basic: poi, details };
+          normalizedPOIs.push(normalized);
+        }
+        // Small delay to avoid rate limits
+        await new Promise(resolve => setTimeout(resolve, 200));
+      });
+
+      await Promise.all(batchPromises);
+    }
+
+    console.info(`OpenTripMap: Successfully normalized ${normalizedPOIs.length} POIs`);
+    return normalizedPOIs;
+  } catch (err) {
+    console.warn('fetchOpenTripMapPOIs failed:', err?.message || err);
+    return [];
+  }
+}
+
+/**
+ * Persist OpenTripMap candidates to DB (reuses existing bulk upsert logic)
+ */
+async function persistOpenTripMapCandidatesToDb(otmCandidates = [], db, country = null, city = null) {
+  if (!Array.isArray(otmCandidates) || otmCandidates.length === 0) return [];
+  
+  // Reuse the same persist logic as OSM, but with OpenTripMap normalized data
+  const norm = otmCandidates.map(c => {
+    // Remove _raw before insertion
+    const { _raw, opentripmap, ...clean } = c;
+    return clean;
+  }).filter(c => c && c.titulo && c.latitud !== null && c.longitud !== null);
+
+  if (!norm.length) return [];
+
+  let client = db;
+  let mustRelease = false;
+  try {
+    if (typeof db.connect === 'function') {
+      client = await db.connect();
+      mustRelease = true;
+    }
+  } catch (e) {
+    client = db;
+    mustRelease = false;
+  }
+
+  try {
+    await client.query('BEGIN');
+    await client.query(`CREATE TEMP TABLE tmp_pois (
+      titulo text,
+      latitud double precision,
+      longitud double precision,
+      descripcion text,
+      relevancia numeric,
+      opening_hours jsonb,
+      website text,
+      imagenes jsonb,
+      category text
+    ) ON COMMIT DROP;`);
+
+    const vals = [];
+    const placeholders = [];
+    for (let i=0;i<norm.length;i++){
+      const idx = i*9;
+      placeholders.push(`($${idx+1},$${idx+2},$${idx+3},$${idx+4},$${idx+5},$${idx+6}::jsonb,$${idx+7},$${idx+8}::jsonb,$${idx+9})`);
+      const c = norm[i];
+      vals.push(
+        c.titulo,
+        c.latitud,
+        c.longitud,
+        c.descripcion,
+        c.relevancia || 5,
+        c.opening_hours ? JSON.stringify(c.opening_hours) : null,
+        c.website || null,
+        c.imagenes ? JSON.stringify(c.imagenes) : null,
+        c.category || null
+      );
+    }
+    const insertTmpSql = `INSERT INTO tmp_pois (titulo, latitud, longitud, descripcion, relevancia, opening_hours, website, imagenes, category) VALUES ${placeholders.join(',')};`;
+    await client.query(insertTmpSql, vals);
+
+    const updateByTitleSql = `
+      WITH updated AS (
+        UPDATE locations l
+        SET
+          descripcion = COALESCE(l.descripcion, t.descripcion),
+          latitud = COALESCE(l.latitud, t.latitud),
+          longitud = COALESCE(l.longitud, t.longitud),
+          opening_hours = COALESCE(l.opening_hours, t.opening_hours),
+          website = COALESCE(l.website, t.website),
+          imagenes = COALESCE(l.imagenes, t.imagenes),
+          relevancia = GREATEST(COALESCE(l.relevancia,0), COALESCE(t.relevancia,5)),
+          category = COALESCE(l.category, t.category),
+          country = COALESCE(l.country, $1::text),
+          city = COALESCE(l.city, $2::text)
+        FROM tmp_pois t
+        WHERE lower(l.titulo) = lower(t.titulo)
+          AND coalesce(l.country,'') = coalesce($1::text,'')
+          AND coalesce(l.city,'') = coalesce($2::text,'')
+        RETURNING l.id
+      )
+      SELECT COUNT(*) as cnt FROM updated;
+    `;
+    await client.query(updateByTitleSql, [country || null, city || null]);
+
+    const updateByProxSql = `
+      WITH updated AS (
+        UPDATE locations l
+        SET
+          descripcion = COALESCE(l.descripcion, t.descripcion),
+          latitud = COALESCE(l.latitud, t.latitud),
+          longitud = COALESCE(l.longitud, t.longitud),
+          opening_hours = COALESCE(l.opening_hours, t.opening_hours),
+          website = COALESCE(l.website, t.website),
+          imagenes = COALESCE(l.imagenes, t.imagenes),
+          relevancia = GREATEST(COALESCE(l.relevancia,0), COALESCE(t.relevancia,5)),
+          category = COALESCE(l.category, t.category),
+          country = COALESCE(l.country, $3::text),
+          city = COALESCE(l.city, $4::text)
+        FROM tmp_pois t
+        WHERE l.latitud IS NOT NULL AND l.longitud IS NOT NULL
+          AND abs(l.latitud - t.latitud) < $1::double precision AND abs(l.longitud - t.longitud) < $1::double precision
+          AND coalesce(l.country,'') = coalesce($3::text,'')
+          AND coalesce(l.city,'') = coalesce($4::text,'')
+        RETURNING l.id
+      )
+      SELECT COUNT(*) as cnt FROM updated;
+    `;
+    await client.query(updateByProxSql, [LAT_LNG_EPS, /*unused*/null, country || null, city || null]);
+
+    const insertSql = `
+      WITH ins AS (
+        INSERT INTO locations (
+          titulo, fk_interest, descripcion, latitud, longitud, imagenes, relevancia, country, city,
+          opening_hours, website, category
+        )
+        SELECT
+          t.titulo, NULL, t.descripcion, t.latitud, t.longitud, t.imagenes, COALESCE(t.relevancia,5), $1::text, $2::text,
+          t.opening_hours, t.website, t.category
+        FROM tmp_pois t
+        WHERE NOT EXISTS (
+          SELECT 1 FROM locations l
+          WHERE (lower(l.titulo) = lower(t.titulo) AND coalesce(l.country,'') = coalesce($1::text,'') AND coalesce(l.city,'') = coalesce($2::text,''))
+             OR (l.latitud IS NOT NULL AND l.longitud IS NOT NULL AND abs(l.latitud - t.latitud) < $3::double precision AND abs(l.longitud - t.longitud) < $3::double precision AND coalesce(l.country,'') = coalesce($1::text,'') AND coalesce(l.city,'') = coalesce($2::text,''))
+        )
+        RETURNING id
+      )
+      SELECT COUNT(*) as inserted_count FROM ins;
+    `;
+    await client.query(insertSql, [country || null, city || null, LAT_LNG_EPS]);
+
+    await client.query('COMMIT');
+
+    const tituloList = norm.map(n => (n.titulo || '').toLowerCase()).filter(Boolean);
+    if (!tituloList.length) return [];
+    const fetchSql = `SELECT id, titulo, latitud, longitud, imagenes, relevancia, country, city, opening_hours, website, category FROM locations WHERE lower(titulo) = ANY($1) LIMIT 70;`;
+    const fetchRes = await client.query(fetchSql, [tituloList]);
+    const rows = (fetchRes.rows || []).map(r => ({
+      id: r.id,
+      titulo: r.titulo,
+      latitud: r.latitud,
+      longitud: r.longitud,
+      imagenes: r.imagenes || null,
+      relevancia: r.relevancia || 5,
+      country: r.country || country || null,
+      city: r.city || city || null
+    }));
+    return rows;
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (e) {}
+    console.warn('persistOpenTripMapCandidatesToDb (bulk) failed:', err?.message || err);
+    return [];
+  } finally {
+    if (mustRelease && client && typeof client.release === 'function') client.release();
   }
 }
 
@@ -636,6 +1041,7 @@ async function getCandidates(options = {}) {
             relevancia: c.relevancia || 0,
             source: c.source || 'db',
             osm: c.osm || null,
+            opentripmap: c.opentripmap || null,
             isMust,
             combined_score: combined,
             distance_to_center: distanceToCenter
@@ -728,40 +1134,51 @@ async function getCandidates(options = {}) {
     });
   }
 
-  // 3) Query OSM when needed (only if dbCandidates insufficient or explicitMusts)
-  let osmCandidates = [];
+  // 3) Query OpenTripMap when needed (only if dbCandidates insufficient or explicitMusts)
+  let otmCandidates = [];
   const needExtra = dbCandidates.length < Math.min(limit, 60) || explicitMusts.length > 0 || !geo;
-  if (geo && (needExtra || dbCandidates.length === 0)) {
-    const nameRegexes = explicitMusts.map(s => escapeRegex(s)).slice(0, 10);
+  
+  if (geo && geo.lat && geo.lon && (needExtra || dbCandidates.length === 0)) {
     try {
-      const bbox = geo.bbox;
-      if (bbox && bbox.length === 4) {
-        osmCandidates = await queryOverpassByBBox(bbox, nameRegexes, Math.max(100, limit - dbCandidates.length), interestSlugs);
-      } else {
-        const delta = 0.25;
-        const bbox2 = [geo.lat - delta, geo.lon - delta, geo.lat + delta, geo.lon + delta];
-        osmCandidates = await queryOverpassByBBox(bbox2, nameRegexes, Math.max(50, limit - dbCandidates.length), interestSlugs);
+      // Calculate radius based on bbox or use default
+      let radius = 10000; // Default 10km
+      if (Array.isArray(geo.bbox) && geo.bbox.length === 4) {
+        const [s, w, n, e] = geo.bbox;
+        const diagonal = haversineMeters(s, w, n, e);
+        radius = Math.max(5000, Math.min(20000, Math.round(diagonal / 2))); // 5-20km
       }
+      
+      const needed = Math.max(50, limit - dbCandidates.length);
+      console.info(`OpenTripMap: Fetching POIs for lat=${geo.lat}, lon=${geo.lon}, radius=${radius}m, limit=${needed}`);
+      
+      const otmPOIs = await fetchOpenTripMapPOIs(geo.lat, geo.lon, radius, needed);
+      
+      // Convert to candidate format
+      otmCandidates = otmPOIs.map(poi => ({
+        id: `otm-${poi.opentripmap?.xid || Date.now()}`,
+        titulo: poi.titulo,
+        fk_interest: null,
+        lat: poi.latitud,
+        lng: poi.longitud,
+        imagenes: poi.imagenes,
+        relevancia: poi.relevancia || 5,
+        source: 'opentripmap',
+        opentripmap: poi.opentripmap || null,
+        _raw: poi._raw
+      }));
+
+      console.info(`OpenTripMap: Retrieved ${otmCandidates.length} candidates`);
     } catch (err) {
-      console.warn('Overpass bbox query failed:', err?.message || err);
-      osmCandidates = [];
-    }
-  } else if (!geo) {
-    if (dbCandidates.length) {
-      const c = dbCandidates[0];
-      if (c.lat && c.lng) {
-        const delta = 0.25;
-        try {
-          osmCandidates = await queryOverpassByBBox([c.lat - delta, c.lng - delta, c.lat + delta, c.lng + delta], [], 100, interestSlugs);
-        } catch (err) { osmCandidates = []; }
-      }
+      console.warn('OpenTripMap query failed:', err?.message || err);
+      otmCandidates = [];
     }
   }
 
-  // Persist new OSM candidates into DB (so next request will pick them from DB)
-  if (Array.isArray(osmCandidates) && osmCandidates.length && db) {
+  // Persist new OpenTripMap candidates into DB (so next request will pick them from DB)
+  if (Array.isArray(otmCandidates) && otmCandidates.length && db) {
     try {
-      const insertedRows = await persistOsmCandidatesToDb(osmCandidates, db, countryGuess, geo && geo.raw && geo.raw.display_name ? (geo.raw.display_name.split(',')[0] || null) : null);
+      const cityName = geo && geo.raw && geo.raw.display_name ? (geo.raw.display_name.split(',')[0] || null) : null;
+      const insertedRows = await persistOpenTripMapCandidatesToDb(otmCandidates, db, countryGuess, cityName);
       if (insertedRows && insertedRows.length) {
         const normInserted = insertedRows.map(r => ({
           id: r.id,
@@ -772,7 +1189,52 @@ async function getCandidates(options = {}) {
           imagenes: r.imagenes || null,
           relevancia: r.relevancia || 5,
           country: r.country || countryGuess || null,
-          city: r.city || null,
+          city: r.city || cityName || null,
+          source: 'db+opentripmap'
+        }));
+        for (const ni of normInserted) {
+          if (!dbCandidatesAll.find(x => String(x.id) === String(ni.id))) dbCandidatesAll.push(ni);
+        }
+      }
+    } catch (err) {
+      console.warn('persistOpenTripMapCandidatesToDb failed:', err?.message || err);
+    }
+  }
+
+  // 4) Fallback to OSM/Overpass if OpenTripMap didn't provide enough results (optional)
+  let osmCandidates = [];
+  const stillNeedMore = (dbCandidates.length + otmCandidates.length) < Math.min(limit, 60);
+  if (stillNeedMore && geo && geo.bbox) {
+    const nameRegexes = explicitMusts.map(s => escapeRegex(s)).slice(0, 10);
+    try {
+      const bbox = geo.bbox;
+      if (bbox && bbox.length === 4) {
+        const remaining = Math.max(20, limit - dbCandidates.length - otmCandidates.length);
+        osmCandidates = await queryOverpassByBBox(bbox, nameRegexes, remaining, interestSlugs);
+        console.info(`Overpass fallback: Retrieved ${osmCandidates.length} additional candidates`);
+      }
+    } catch (err) {
+      console.warn('Overpass fallback query failed:', err?.message || err);
+      osmCandidates = [];
+    }
+  }
+
+  // Persist OSM fallback candidates if any
+  if (Array.isArray(osmCandidates) && osmCandidates.length && db) {
+    try {
+      const cityName = geo && geo.raw && geo.raw.display_name ? (geo.raw.display_name.split(',')[0] || null) : null;
+      const insertedRows = await persistOsmCandidatesToDb(osmCandidates, db, countryGuess, cityName);
+      if (insertedRows && insertedRows.length) {
+        const normInserted = insertedRows.map(r => ({
+          id: r.id,
+          titulo: r.titulo,
+          fk_interest: null,
+          lat: r.latitud !== null && r.latitud !== undefined ? Number(r.latitud) : null,
+          lng: r.longitud !== null && r.longitud !== undefined ? Number(r.longitud) : null,
+          imagenes: r.imagenes || null,
+          relevancia: r.relevancia || 5,
+          country: r.country || countryGuess || null,
+          city: r.city || cityName || null,
           source: 'db+osm'
         }));
         for (const ni of normInserted) {
@@ -780,14 +1242,15 @@ async function getCandidates(options = {}) {
         }
       }
     } catch (err) {
-      console.warn('persistOsmCandidatesToDb failed:', err?.message || err);
+      console.warn('persistOsmCandidatesToDb (fallback) failed:', err?.message || err);
     }
   }
 
-  // 4) Merge & dedupe DB + OSM candidates
-  let candidates = dedupeMerge(dbCandidates, osmCandidates, 75);
+  // 5) Merge & dedupe DB + OpenTripMap + OSM candidates
+  let candidates = dedupeMerge(dbCandidates, otmCandidates, 75);
+  candidates = dedupeMerge(candidates, osmCandidates, 75);
 
-  // 5) Ensure explicit mustVisits are included (try Overpass again for missing named musts)
+  // 6) Ensure explicit mustVisits are included (try Overpass again for missing named musts)
   if (explicitMusts.length && geo) {
     for (const mv of explicitMusts) {
       const present = candidates.find(c => c.titulo && c.titulo.toLowerCase().includes(mv.toLowerCase()));
@@ -801,7 +1264,7 @@ async function getCandidates(options = {}) {
     }
   }
 
-  // 6) Use DB relevancia as primary signal; filter out items without coords (pref) and compute combined_score
+  // 7) Use DB relevancia as primary signal; filter out items without coords (pref) and compute combined_score
   candidates = candidates.filter(c => c && c.lat !== null && c.lng !== null);
 
   if (!candidates.length) {
@@ -816,6 +1279,7 @@ async function getCandidates(options = {}) {
       relevancia: c.relevancia || 0,
       source: c.source || 'db',
       osm: c.osm || null,
+      opentripmap: c.opentripmap || null,
       isMust: (explicitMusts.length && c.titulo) ? explicitMusts.some(mv => c.titulo.toLowerCase().includes(mv.toLowerCase())) : false,
       combined_score: c.relevancia || 0,
       distance_to_center: (geo && geo.lat && c.lat && c.lng) ? Math.round(haversineMeters(geo.lat, geo.lon, c.lat, c.lng)) : null
@@ -853,6 +1317,22 @@ async function getCandidates(options = {}) {
       const amenOrTour = (c.osm.tags.amenity || c.osm.tags.tourism || c.osm.tags.leisure || '').toString().toLowerCase();
       if (interestTags.has(amenOrTour)) interestMatch = true;
     }
+    if (!interestMatch && c.opentripmap && c.opentripmap.kinds) {
+      // Check if any OpenTripMap kind matches our interests
+      for (const kind of c.opentripmap.kinds) {
+        const kindBase = kind.split('_')[0].toLowerCase();
+        if (interestTags.has(kindBase)) {
+          interestMatch = true;
+          break;
+        }
+        // Also check mapped interests
+        const mappedInterest = OPENTRIPMAP_KINDS_TO_INTEREST[kind];
+        if (mappedInterest && interestTags.has(mappedInterest)) {
+          interestMatch = true;
+          break;
+        }
+      }
+    }
     const interestBoost = interestMatch ? 0.35 : 0.0;
     const mustBoost = isMust ? 0.5 : 0.0;
 
@@ -872,6 +1352,7 @@ async function getCandidates(options = {}) {
       relevancia: c.relevancia || 0,
       source: c.source || 'db',
       osm: c.osm || null,
+      opentripmap: c.opentripmap || null,
       isMust,
       combined_score: combined,
       distance_to_center: distanceToCenter
