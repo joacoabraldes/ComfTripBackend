@@ -3,6 +3,7 @@
 
 const express = require('express');
 const pool = require('../db');
+const auth = require('../middleware/auth');
 const router = express.Router();
 
 /**
@@ -100,6 +101,72 @@ router.get('/trip/:uuid', async (req, res) => {
     res.status(500).json({ message: 'Error' });
   }
 });
+
+//GET /share/by-me/:friendId
+router.get('/by-me/:friendId', auth, async (req, res) => {
+    try {
+        const ownerId = req.user.id;
+        const friendId = Number(req.params.friendId);
+
+        const result = await pool.query(`
+      SELECT
+        t.id,
+        t.destination,
+        t.start_date,
+        t.end_date,
+        ts.created_at
+      FROM trip_shares ts
+      JOIN trips t ON t.id = ts.trip_id
+      WHERE ts.shared_by = $1
+        AND ts.shared_with = $2
+        AND (ts.expires_at IS NULL OR ts.expires_at > now())
+      ORDER BY t.start_date DESC
+    `, [ownerId, friendId]);
+
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'Error' });
+    }
+});
+
+// GET /share/trip/:tripId/users
+// Devuelve los usuarios con los que el owner compartió el viaje
+router.get('/trip/:tripId/users', auth, async (req, res) => {
+    try {
+        const ownerId = req.user.id;
+        const { tripId } = req.params;
+
+        // Verificar que el viaje sea del usuario
+        const tripRes = await pool.query(
+            `SELECT id FROM trips WHERE id = $1 AND user_id = $2`,
+            [tripId, ownerId]
+        );
+
+        if (!tripRes.rows.length) {
+            return res.status(403).json({ message: 'No sos el dueño del viaje' });
+        }
+
+        // Obtener usuarios con los que está compartido
+        const result = await pool.query(
+            `
+      SELECT u.id, u.name, u.email
+      FROM trip_shares ts
+      JOIN users u ON u.id = ts.shared_with
+      WHERE ts.trip_id = $1
+        AND (ts.expires_at IS NULL OR ts.expires_at > now())
+      ORDER BY ts.created_at DESC
+      `,
+            [tripId]
+        );
+
+        res.json(result.rows);
+    } catch (err) {
+        console.error('GET /share/trip/:tripId/users error:', err);
+        res.status(500).json({ message: 'Error' });
+    }
+});
+
 
 // DELETE /share/trip/:uuid/leave
 // El usuario deja de tener acceso al viaje compartido

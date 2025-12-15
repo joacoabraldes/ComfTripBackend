@@ -499,4 +499,46 @@ router.post('/posts/:id/comments', auth, async (req, res) => {
   }
 });
 
+/**
+ * DELETE /social/comments/:id
+ * Elimina un comentario propio
+ */
+router.delete('/comments/:id', auth, async (req, res) => {
+    const userId = getUserIdFromReq(req);
+    if (!userId) {
+        return res.status(401).json({ message: 'No autenticado' });
+    }
+
+    try {
+        const commentId = parseInt(req.params.id, 10);
+
+        const existing = await pool.query(
+            `SELECT user_id FROM social_post_comments WHERE id = $1`,
+            [commentId]
+        );
+
+        if (!existing.rows.length) {
+            return res.status(404).json({ message: 'Comentario no encontrado' });
+        }
+
+        if (existing.rows[0].user_id !== userId) {
+            return res.status(403).json({ message: 'No autorizado' });
+        }
+
+        await pool.query(
+            `DELETE FROM social_post_comments WHERE id = $1`,
+            [commentId]
+        );
+
+        return res.json({ message: 'Comentario eliminado' });
+    } catch (err) {
+        console.error('DELETE /social/comments/:id error:', err?.message || err);
+        return res.status(500).json({
+            message: 'Error en el servidor',
+            detail: err?.message || String(err),
+        });
+    }
+});
+
+
 module.exports = router;
