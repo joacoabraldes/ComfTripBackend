@@ -125,21 +125,31 @@ async function getPlaceDetails(placeId, languageCode) {
   });
 }
 
-function normalizeTop3Reviews(placeDetails) {
-  const reviews = Array.isArray(placeDetails?.reviews) ? placeDetails.reviews : [];
-  return reviews.slice(0, 3).map((r) => ({
-    rating: r?.rating ?? null,
-    text: r?.text?.text ?? null,
-    languageCode: r?.text?.languageCode ?? r?.originalLanguageCode ?? null,
-    publishTime: r?.publishTime ?? null,
-    relativeTime: r?.relativePublishTimeDescription ?? null,
-    author: {
-      name: r?.authorAttribution?.displayName ?? null,
-      uri: r?.authorAttribution?.uri ?? null,
-      photoUri: r?.authorAttribution?.photoUri ?? null,
-    },
-  }));
+function normalizeTop3Reviews(placeDetails, preferredLang = "es") {
+    const reviews = Array.isArray(placeDetails?.reviews) ? placeDetails.reviews : [];
+
+    const getLang = (r) =>
+        (r?.text?.languageCode || r?.originalLanguageCode || "").toString().toLowerCase();
+
+    // Prefer reviews whose *returned* text is in Spanish (often includes translations)
+    const preferred = reviews.filter((r) => getLang(r).startsWith(preferredLang.toLowerCase()));
+
+    const chosen = (preferred.length ? preferred : reviews).slice(0, 3);
+
+    return chosen.map((r) => ({
+        rating: r?.rating ?? null,
+        text: r?.text?.text ?? null,
+        languageCode: r?.text?.languageCode ?? r?.originalLanguageCode ?? null,
+        publishTime: r?.publishTime ?? null,
+        relativeTime: r?.relativePublishTimeDescription ?? null,
+        author: {
+            name: r?.authorAttribution?.displayName ?? null,
+            uri: r?.authorAttribution?.uri ?? null,
+            photoUri: r?.authorAttribution?.photoUri ?? null,
+        },
+    }));
 }
+
 
 /**
  * GET /api/google/reviews?name=...&city=...&country=...&q=...&lang=es
@@ -180,7 +190,7 @@ router.get('/reviews', async (req, res) => {
         userRatingCount: details?.userRatingCount ?? null,
         googleMapsUri: details?.googleMapsUri ?? null,
       },
-      reviews: normalizeTop3Reviews(details),
+      reviews: normalizeTop3Reviews(details, languageCode),
     };
 
     cacheSet(cacheKey, payload);
