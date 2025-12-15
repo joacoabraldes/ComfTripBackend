@@ -16,6 +16,7 @@ const communityController = require('./controllers/community.controller');
 const shareController = require('./controllers/share.controller');
 const flightController = require('./controllers/flight.controller');
 const socialRouter = require('./controllers/social.controller');
+const googlePlacesController = require('./controllers/googlePlaces.controller');
 
 const app = express();
 
@@ -53,6 +54,7 @@ app.use('/api/friends', communityController);
 app.use('/api/share', shareController);
 app.use('/api/flights', flightController);
 app.use('/api/social', socialRouter);
+app.use('/api/google', googlePlacesController);
 
 const PORT = process.env.PORT || 5432;
 
