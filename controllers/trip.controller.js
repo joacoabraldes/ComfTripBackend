@@ -1521,7 +1521,7 @@ router.delete('/:id', auth, async (req, res) => {
     if (!ownerRes.rows.length) return res.status(404).json({ message: 'No encontrado' });
     if (ownerRes.rows[0].user_id !== userId) return res.status(403).json({ message: 'No autorizado' });
 
-    await client.query('BEGIN');
+    await client.query('BEGIN'); 
 
     // Eliminar todas las tablas relacionadas primero
     await client.query('DELETE FROM trip_reviews WHERE trip_id = $1', [id]);
