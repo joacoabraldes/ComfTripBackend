@@ -1565,6 +1565,10 @@ router.delete('/:id', auth, async (req, res) => {
 
     await client.query('BEGIN');
 
+    // Eliminar todas las tablas relacionadas primero
+    await client.query('DELETE FROM trip_reviews WHERE trip_id = $1', [id]);
+    await client.query('DELETE FROM trip_shares WHERE trip_id = $1', [id]);
+    await client.query('DELETE FROM itinerary_generations WHERE trip_id = $1', [id]);
     await client.query('DELETE FROM trip_places WHERE fk_trips = $1', [id]);
     await client.query('DELETE FROM trips WHERE id = $1 AND user_id = $2', [id, userId]);
 
