@@ -603,7 +603,13 @@ async function handleItinerary(req, res) {
     let idx = 1;
 
     if (destCountry) {
-      candidateSQL += ` WHERE country IS NOT NULL AND LOWER(country) LIKE $${idx}`;
+      candidateSQL += `
+  WHERE country IS NOT NULL
+    AND translate(LOWER(country),
+      'áéíóúüñÁÉÍÓÚÜÑ',
+      'aeiouunAEIOUUN'
+    ) LIKE $${idx}
+`;
       queryValues.push(`%${normalizeStr(destCountry)}%`);
       idx++;
       candidateSQL += ` ORDER BY relevancia DESC NULLS LAST, titulo ASC LIMIT $${idx}`;
