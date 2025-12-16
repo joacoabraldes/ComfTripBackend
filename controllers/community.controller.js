@@ -7,9 +7,15 @@ const auth = require('../middleware/auth');
 const router = express.Router();
 
 /**
+ * Nota importante:
+ * Este controller se monta en server.js como:
+ *   app.use('/api/friends', communityController);
+ */
+
+/**
  * POST /
  * Send a friend request.
- * Body: { email } OR { username } (keeps { addressee_id } for backward compatibility)
+ * Body: { addressee_id } OR { email } OR { username }
  */
 router.post('/', auth, async (req, res) => {
   try {
@@ -36,9 +42,10 @@ router.post('/', auth, async (req, res) => {
       addresseeId = u.rows[0].id;
     }
 
-    if (!addresseeId) return res.status(400).json({ message: 'email o username requerido' });
+    if (!addresseeId) return res.status(400).json({ message: 'addressee_id, email o username requerido' });
     if (Number(addresseeId) === requesterId) return res.status(400).json({ message: 'No puedes agregarte a ti mismo' });
 
+    // check if exists reverse or already accepted
     const existing = await pool.query(
       `SELECT id, status, requester_id, addressee_id
        FROM friend_requests
@@ -53,6 +60,7 @@ router.post('/', auth, async (req, res) => {
         return res.status(400).json({ message: 'Ya son amigos', request: ex });
       }
       if (ex.status === 'pending') {
+        // If reverse pending (addressee sent request to me), accept directly
         if (ex.requester_id === addresseeId && ex.addressee_id === requesterId) {
           await pool.query('UPDATE friend_requests SET status=$1 WHERE id=$2', ['accepted', ex.id]);
           return res.status(200).json({
@@ -62,10 +70,13 @@ router.post('/', auth, async (req, res) => {
         }
         return res.status(400).json({ message: 'Ya existe una solicitud pendiente', request: ex });
       }
+      // for rejected or other statuses, allow creating a new one (we proceed below)
     }
 
     const ins = await pool.query(
-      'INSERT INTO friend_requests (requester_id, addressee_id, status) VALUES ($1,$2,$3) RETURNING id, requester_id, addressee_id, status, created_at',
+      `INSERT INTO friend_requests (requester_id, addressee_id, status)
+       VALUES ($1,$2,$3)
+       RETURNING id, requester_id, addressee_id, status, created_at`,
       [requesterId, addresseeId, 'pending']
     );
 
@@ -78,26 +89,38 @@ router.post('/', auth, async (req, res) => {
 
 /**
  * GET /requests
+ * List incoming friend requests (to the logged user) and outgoing
  */
 router.get('/requests', auth, async (req, res) => {
   try {
     const userId = req.user.id;
+
     const incoming = await pool.query(
-      `SELECT fr.id, fr.requester_id, u.name as requester_name, u.username as requester_username, u.email as requester_email, fr.created_at
+      `SELECT fr.id, fr.requester_id,
+              u.name as requester_name,
+              u.username as requester_username,
+              u.email as requester_email,
+              fr.created_at
        FROM friend_requests fr
        JOIN users u ON u.id = fr.requester_id
        WHERE fr.addressee_id = $1 AND fr.status = 'pending'
        ORDER BY fr.created_at DESC`,
       [userId]
     );
+
     const outgoing = await pool.query(
-      `SELECT fr.id, fr.addressee_id, u.name as addressee_name, u.username as addressee_username, u.email as addressee_email, fr.status, fr.created_at
+      `SELECT fr.id, fr.addressee_id,
+              u.name as addressee_name,
+              u.username as addressee_username,
+              u.email as addressee_email,
+              fr.status, fr.created_at
        FROM friend_requests fr
        JOIN users u ON u.id = fr.addressee_id
        WHERE fr.requester_id = $1
        ORDER BY fr.created_at DESC`,
       [userId]
     );
+
     res.json({ incoming: incoming.rows, outgoing: outgoing.rows });
   } catch (err) {
     console.error('GET /requests error:', err);
@@ -105,6 +128,9 @@ router.get('/requests', auth, async (req, res) => {
   }
 });
 
+/**
+ * POST /accept
+ */
 router.post('/accept', auth, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -144,6 +170,9 @@ router.post('/accept', auth, async (req, res) => {
   }
 });
 
+/**
+ * POST /:id/accept (compat)
+ */
 router.post('/:id/accept', auth, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -162,6 +191,9 @@ router.post('/:id/accept', auth, async (req, res) => {
   }
 });
 
+/**
+ * POST /reject
+ */
 router.post('/reject', auth, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -201,6 +233,9 @@ router.post('/reject', auth, async (req, res) => {
   }
 });
 
+/**
+ * POST /:id/reject (compat)
+ */
 router.post('/:id/reject', auth, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -221,7 +256,7 @@ router.post('/:id/reject', auth, async (req, res) => {
 
 /**
  * DELETE /:userId
- * Remove friendship AND revoke shares between both.
+ * Remove friendship + revoke shared trips
  */
 router.delete('/:userId', auth, async (req, res) => {
   const client = await pool.connect();
@@ -270,7 +305,7 @@ router.delete('/:userId', auth, async (req, res) => {
 
 /**
  * GET /
- * List accepted friends (now includes username)
+ * List accepted friends (includes username)
  */
 router.get('/', auth, async (req, res) => {
   try {
@@ -293,6 +328,9 @@ router.get('/', auth, async (req, res) => {
   }
 });
 
+/**
+ * GET /:friendId
+ */
 router.get('/:friendId', auth, async (req, res) => {
   const userId = req.user?.id || req.user?.userId;
   const friendId = Number(req.params.friendId);
@@ -319,9 +357,9 @@ router.get('/:friendId', auth, async (req, res) => {
 
   const u = await pool.query(
     `
-      SELECT id, name, username, email, phone, nationality, birthdate
-      FROM users
-      WHERE id = $1
+    SELECT id, name, username, email, phone, nationality, birthdate
+    FROM users
+    WHERE id = $1
     `,
     [friendId]
   );
