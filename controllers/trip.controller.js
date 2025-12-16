@@ -188,9 +188,42 @@ function estimateTravelMinutes(a, b, mode = 'fast') {
   return (km / speedKmh) * 60;
 }
 
+const DAY_MAX_MIN = 23 * 60 + 59;
+const DAY_LAST_START_MIN = 23 * 60 + 30; // stop starting new visits after 23:30
+
+function toNumOrNull(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function getCoords(obj) {
+  const lat = toNumOrNull(obj?.lat ?? obj?.latitud);
+  const lng = toNumOrNull(obj?.lng ?? obj?.longitud);
+  if (lat == null || lng == null) return null;
+  return { lat, lng };
+}
+
+function safeTravelMinutes(a, b) {
+  const ca = getCoords(a);
+  const cb = getCoords(b);
+
+  // if we don't have real coords, don't blow up the day
+  if (!ca || !cb) return 15;
+
+  const mins = estimateTravelMinutes(ca, cb);
+  if (!Number.isFinite(mins) || mins < 0) return 15;
+
+  // cap to avoid insane jumps even with weird data
+  return Math.min(180, Math.max(1, Math.round(mins)));
+}
+
 function minutesToTimeStr(mins) {
+  if (!Number.isFinite(mins)) return null;
+  mins = Math.round(mins);
+  if (mins < 0) mins = 0;
+  if (mins > DAY_MAX_MIN) mins = DAY_MAX_MIN;
   const h = Math.floor(mins / 60);
-  const m = Math.round(mins % 60);
+  const m = mins % 60;
   return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:00`;
 }
 
@@ -869,28 +902,41 @@ async function handleItinerary(req, res) {
         const p = finalPlaces[i];
         if (!p) continue;
         const isG = isGastronomia(p);
-        if (scheduled.length > 0) {
-          const last = scheduled[scheduled.length-1];
-          const travelMin = estimateTravelMinutes({lat: Number(last.lat), lng: Number(last.lng)}, {lat: Number(p.latitud || p.lat), lng: Number(p.longitud || p.lng)});
-          currentMin += Math.round(travelMin) + 10;
-        }
+if (scheduled.length > 0) {
+  const last = scheduled[scheduled.length - 1];
+  const travelMin = safeTravelMinutes(
+    { lat: last.lat, lng: last.lng },
+    { latitud: p.latitud, longitud: p.longitud, lat: p.lat, lng: p.lng }
+  );
+  currentMin += travelMin + 10;
+}
 
-        let preferredMin = null;
-        if (lunchPlace && String(lunchPlace.id) === String(p.id)) preferredMin = mealSlots.lunch;
-        if (meriendaPlace && String(meriendaPlace.id) === String(p.id)) preferredMin = mealSlots.merienda;
-        if (dinnerPlace && String(dinnerPlace.id) === String(p.id)) preferredMin = mealSlots.dinner;
+// don't schedule beyond the day
+const duration = isG ? 60 : 90;
+const endMin = currentMin + duration;
+if (currentMin > DAY_LAST_START_MIN || endMin > DAY_MAX_MIN) {
+  break;
+}
 
-        if (preferredMin != null && preferredMin > currentMin + 30) {
-          currentMin = preferredMin - (isG ? 10 : 30);
-        }
+const startStr = minutesToTimeStr(currentMin);
+const endStr = minutesToTimeStr(endMin);
 
-        const duration = isG ? 60 : 90;
-        const startStr = minutesToTimeStr(currentMin);
-        const endStr = minutesToTimeStr(currentMin + duration);
+// store null coords if missing (never 0,0)
+const coords = getCoords({ latitud: p.latitud, longitud: p.longitud, lat: p.lat, lng: p.lng });
 
-        scheduled.push({ id: p.id, titulo: p.titulo, lat: Number(p.latitud || p.lat || 0), lng: Number(p.longitud || p.lng || 0), category: p.category, relevance: p.relevancia, start_hour: startStr, end_hour: endStr });
+scheduled.push({
+  id: p.id,
+  titulo: p.titulo,
+  lat: coords ? coords.lat : null,
+  lng: coords ? coords.lng : null,
+  category: p.category,
+  relevance: p.relevancia,
+  start_hour: startStr,
+  end_hour: endStr
+});
 
-        currentMin += duration + 15;
+currentMin = endMin + 15;
+
       }
 
       itineraryDays.push({ date, places: scheduled });
@@ -2021,9 +2067,12 @@ const computeBestOrderForIndices = (indices) => {
         currentMin = preferredMin - (isG ? 15 : 30);
       }
 
-      const duration = isG ? 60 : 90;
-      const startStr = minutesToTimeStr(currentMin);
-      const endStr = minutesToTimeStr(currentMin + duration);
+const duration = isG ? 60 : 90;
+const endMin = currentMin + duration;
+if (currentMin > DAY_LAST_START_MIN || endMin > DAY_MAX_MIN) break;
+
+const startStr = minutesToTimeStr(currentMin);
+const endStr = minutesToTimeStr(endMin);
 
       scheduled.push({
         loc_id: placeObj.id,
