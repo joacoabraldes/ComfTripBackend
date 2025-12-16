@@ -183,7 +183,7 @@ router.delete('/trip/:tripId/user/:userId', auth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Error' });
-  }
+  } 
 }); 
 
 module.exports = router; 
